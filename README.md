@@ -8,7 +8,7 @@ If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by d
 - (Kali) Linux
 - Windows 11
 
-![tcp_geo_map_demo](https://github.com/jclauzel/R001D00rs/tree/main/pictures/tcp_geo_map_demo.gif)
+![til](https://github.com/jclauzel/R001D00rs/tree/main/pictures/tcp_geo_map_demo.gif)
 
 # Contributors & Attribution
 
