@@ -1,21 +1,8 @@
 #!/usr/bin/env python3
 
-# R001D00rs tcp_geo_map
+# R001D00rs tcp_geo_map https://github.com/jclauzel/R001D00rs/
 
-"""
-(kali) linux install using venv:
-
-git clone https://github.com/jclauzel/R001D00rs
-python3 -m venv ./venv
-source venv/bin/activate
-pip3 install pyside6 requests maxminddb pandas 
-python3 tcp_geo_map.py
-
-Windows:
-pip3 install pyside6 requests maxminddb pandas 
-"""
-
-# pip install psutil, maxminddb, PySide6, folium, pandas
+# pip install psutil, maxminddb, PySide6, folium
 
 # using https://github.com/pointhi/leaflet-color-markers for colored map markers
 # using https://github.com/sapics/ip-location-db/tree/main/geolite2-city this script is using the MaxMind GeoLite2 database and is attributed accordingly for its usage.
@@ -40,7 +27,7 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
 
     - Using this application requires that YOU FULLY AGREE AND ACCEPT:
     
-            MaxMind / GeoLite, folium, leaflet, OpenStreetMap, pandas, pyside licensing terms.
+            MaxMind / GeoLite, folium, leaflet, OpenStreetMap, pyside licensing terms.
         
                 as well as licensing terms of all contributing libraries to this script even though you use the --accept_eula startup option.
 
@@ -49,12 +36,19 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
 
     - Settings are persisted on applicaton end in a file called by default settings.json (defined in SETTINGS_FILE_NAME) that will be loaded next time the application start up. To reset settings simply delete the generated settings.json file.
 
+    (kali) linux install using venv:
+
+    git clone https://github.com/jclauzel/R001D00rs
+    python3 -m venv ./venv
+    source venv/bin/activate
+    pip3 install pyside6 requests maxminddb pandas 
+    python3 tcp_geo_map.py
+
+    Windows:
+    pip3 install pyside6 requests maxminddb 
 """
 
-
-# gptc
-
-import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, pandas as pd
+import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
@@ -63,9 +57,9 @@ from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-VERSION = "2.7.5" # Current script version
+VERSION = "2.7.7" # Current script version
 
-assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, pandas, maxminddb, psutil...
+assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
 DATABASE_EXPIRE_AFTER_DAYS = 7 # Databases expiration time in days from download date, default 7 days (1 week)
 DB_DIR = "databases" # Database location are contained in this subdirectory under the main script directory
@@ -76,13 +70,13 @@ C2_TRACKER_DB_PATH = os.path.join(DB_DIR, "all.txt")
 SETTINGS_FILE_NAME = "settings.json"
 
 """ 
-You can pass --accept_eula as a startup parametter to the script to automate download and refresh 
-the Geolite and c2 tracker databases howver this means you fully agree to their licensing terms
+    You can pass --accept_eula as a startup parametter to the script to automate download and refresh 
+    the Geolite and c2 tracker databases howver this means you fully agree to their licensing terms
 """
 ACCEPT_EULA = "--accept_eula" in sys.argv
 
 
-PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = True # set to True to turn on and speedup application start time, False to disable. However this will keep track on disk to what IP addresses machine was connected to.
+PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False # set to True to turn on and speedup application start time, False to disable. However this will keep track on disk to what IP addresses machine was connected to.
 IP_DNS_NAME_CACHE_FILE = "ip_cache.json" # if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the application will save and load to disk the IP DNS Name resolution made as name resolution is slow from the database sub folder. Next time the application start it will reload this cache to speed up startup time of the application
 
 CONNECTION_TABLE_MIN_WIDTH = 700
@@ -384,9 +378,6 @@ class TCPConnectionViewer(QMainWindow):
                 self.status_label.setText("Warning: failed to save ip_cache.")
             except Exception:
                 pass
-
-
-
             
     def reverse_dns(self, ips):
         """
@@ -483,73 +474,6 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
-
-    # def reverse_dns(self, ips):
-    #     """
-    #     Fast, thread-safe reverse DNS with local caching.
-
-    #     - Uses the shared `ip_cache` protected by `cache_lock`.
-    #     - Avoids work for already-cached addresses.
-    #     - Executes lookups in a ThreadPoolExecutor with a bounded worker count.
-    #     - Updates cache from worker threads to minimize post-processing allocations.
-    #     - Returns a dict mapping only resolved IP -> hostname.
-    #     """
-    #     if isinstance(ips, str):
-    #         ips = [ips]
-
-    #     # normalize input and filter falsy entries early
-    #     ips = [ip for ip in ips if ip]
-
-    #     if not ips:
-    #         return {}
-
-    #     # Local references to globals to reduce attribute lookups
-    #     global ip_cache, cache_lock
-
-    #     results = {}
-    #     to_resolve = []
-
-    #     # Fast path: check cache under lock and build list of addresses that need lookup
-    #     with cache_lock:
-    #         for ip in ips:
-    #             if ip in ip_cache:
-    #                 host = ip_cache[ip]
-    #                 if host:
-    #                     results[ip] = host
-    #             else:
-    #                 to_resolve.append(ip)
-
-    #     if not to_resolve:
-    #         return results
-
-    #     # Choose a sensible worker count (avoid oversubscription)
-    #     max_workers = min(32, max(4, len(to_resolve)))
-
-    #     def _lookup_and_cache(ip_addr):
-    #         """Worker function: resolve ip and atomically store result in cache."""
-    #         try:
-    #             hostname = socket.gethostbyaddr(ip_addr)[0]
-    #         except Exception:
-    #             hostname = None
-
-    #         # update cache immediately under lock (store None for negative answers)
-    #         with cache_lock:
-    #             ip_cache[ip_addr] = hostname
-    #         return ip_addr, hostname
-
-    #     # Submit lookups and collect resolved hostnames
-    #     with ThreadPoolExecutor(max_workers=max_workers) as exe:
-    #         futures = {exe.submit(_lookup_and_cache, ip): ip for ip in to_resolve}
-    #         for fut in concurrent.futures.as_completed(futures):
-    #             try:
-    #                 ip_addr, hostname = fut.result()
-    #             except Exception:
-    #                 # defensive: skip on unexpected worker exception
-    #                 continue
-    #             if hostname:
-    #                 results[ip_addr] = hostname
-
-    #     return results
 
     def on_header_clicked(self, index):
         """
@@ -651,7 +575,11 @@ class TCPConnectionViewer(QMainWindow):
             self.stop_capture_btn.setVisible(False)
             self.toggle_button.setVisible(True)
 
-        self.slider.setToolTip(f"Map time: {self.connection_list[value]['datetime']}")
+        if self.connection_list: 
+           idx = min(value, len(self.connection_list) - 1)
+           self.slider.setToolTip(f"Map time: {self.connection_list[idx]['datetime']}") 
+        else: 
+            self.slider.setToolTip("")
 
     def update_reverse_dns(self):
         global do_reverse_dns
@@ -891,214 +819,6 @@ class TCPConnectionViewer(QMainWindow):
             self.stop_capture_btn.setVisible(False)             
 
 
-    # def init_ui(self):
-    #     self.connection_list = []
-    #     self.connection_list_counter = 0
-
-    #     # Use a horizontal splitter so the user can resize left/right panels with the mouse
-    #     self.splitter = QSplitter(Qt.Horizontal)
-
-    #     # Main layout
-    #     main_layout = QHBoxLayout()
-    #     self.timer = QTimer(self)
-    #     self.timer_replay_connections = QTimer(self)
-
-    #     # Left panel for connection list
-    #     self.left_panel = QGroupBox("Active Connections")
-    #     self.left_layout = QVBoxLayout()
-
-    #     # Right panel for map
-    #     self.right_panel = QGroupBox("Network Connections Map")
-    #     self.right_layout = QVBoxLayout()
-
-    #     self.slider = QSlider(Qt.Horizontal)
-    #     self.slider_value_label = QLabel(TIME_SLIDER_TEXT + "0")
-        
-    #     # Save Button
-    #     self.save_connections_btn = QPushButton("Save connection list to CSV file")
-    #     self.save_connections_btn.clicked.connect(self.save_all_connection_list_to_csv)
-        
-    #     self.save_connections_btn.setVisible(True)
-
-    #     # Refresh button
-    #     self.start_capture_btn = QPushButton(START_CAPTURE_BUTTON_TEXT)
-    #     self.start_capture_btn.clicked.connect(self.refresh_connections)
-        
-    #     self.start_capture_btn.setVisible(False)
-
-    #     self.stop_capture_btn = QPushButton(STOP_CAPTURE_BUTTON_TEXT)
-    #     self.stop_capture_btn.clicked.connect(self.stop_capture_connections)
-        
-    #     self.stop_capture_btn.setVisible(True)        
-        
-    #     # Connection table
-    #     self.connection_table = QTableWidget(0, LOCATION_LON_ROW_INDEX+1)
-    #     self.connection_table.setHorizontalHeaderLabels([
-    #         "Process", "PID", "C2", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon"
-    #     ])
-
-    #     # Connect the header clicked signal to a custom sort function
-    #     self.connection_table.horizontalHeader().sectionClicked.connect(self.on_header_clicked)        
-    #     self.connection_table.setMinimumSize(CONNECTION_TABLE_MIN_WIDTH, CONNECTION_TABLE_MIN_HEIGHT)
-    #     self.connection_table.setEditTriggers(QTableWidget.NoEditTriggers)
-    #     self.connection_table.setSelectionBehavior(QTableWidget.SelectRows)
-    #     self.connection_table.cellClicked.connect(self.on_table_cell_clicked)
-
-    #     self.left_layout.addWidget(self.connection_table)
-        
-    #     # Respect minimum sizes and set sensible initial sizes for the splitter children
-    #     self.left_panel.setMinimumWidth(CONNECTION_TABLE_MIN_WIDTH)
-    #     self.right_panel.setMinimumWidth(MAP_TABLE_MIN_WIDTH)
-    #     self.splitter.setSizes([int(self.width() * 0.35), int(self.width() * 0.65)])  # initial ratio
-    #     self.splitter.setHandleWidth(6)
-
-    #     self.left_panel.setLayout(self.left_layout)
-
-    #     self.splitter.addWidget(self.left_panel)
-    #     self.splitter.addWidget(self.right_panel)
-        
-    #     # Map view
-    #     self.map_view = QWebEngineView()
-    #     self.map_view.setMinimumSize(MAP_TABLE_MIN_WIDTH, MAP_TABLE_MIN_HEIGHT)
-    #     self.map_view.setHtml("<html><body><h2>Loading map...</h2></body></html>")
-    #     self.map_redraw = True
-    #     self.map_objects = 0
-    #     self.map_initialized = False
-
-    #     # Pulse indicator - small green circle that fades in/out on refresh
-    #     self.pulse_indicator = QFrame()
-    #     self.pulse_indicator.setFixedSize(14, 14)
-    #     self.pulse_indicator.setStyleSheet("background-color: #33cc33; border-radius: 7px;")
-    #     self.pulse_indicator.setVisible(False)
-    #     self.pulse_indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-    #     self.pulse_indicator.setToolTip("Refreshing...")
-
-    #     # opacity effect + animation
-    #     self._pulse_opacity = QGraphicsOpacityEffect(self.pulse_indicator)
-    #     self.pulse_indicator.setGraphicsEffect(self._pulse_opacity)
-    #     self._pulse_anim = QPropertyAnimation(self._pulse_opacity, b"opacity", self)
-    #     self._pulse_anim.setDuration(800)  # total pulse duration (ms)
-    #     # fade in quickly, hold, then fade out
-    #     self._pulse_anim.setKeyValueAt(0.0, 0.0)
-    #     self._pulse_anim.setKeyValueAt(0.12, 1.0)
-    #     self._pulse_anim.setKeyValueAt(0.88, 1.0)
-    #     self._pulse_anim.setKeyValueAt(1.0, 0.0)
-    #     self._pulse_anim.finished.connect(lambda: self.pulse_indicator.setVisible(False))
-
-
-    #     self.right_layout.addWidget(self.map_view)
-
-    #     # Create a fixed-size container for the pulse using a QGridLayout so its size is reserved.
-    #     self.pulse_container = QWidget()
-    #     # choose a height that fits the pulse and a small margin; width will stretch with the layout
-    #     self.pulse_container.setFixedHeight(36)
-    #     pulse_layout = QGridLayout(self.pulse_container)
-    #     pulse_layout.setContentsMargins(0, 0, 6, 0)  # right margin so indicator sits inset
-    #     pulse_layout.addWidget(self.pulse_indicator, 0, 0, Qt.AlignRight | Qt.AlignTop)
-
-    #     # add the fixed container to the layout (it always occupies space, so children below won't move)
-    #     self.right_layout.addWidget(self.pulse_container)
-
-
-
-
-    #     self.right_layout.addWidget(self.start_capture_btn)
-    #     self.right_layout.addWidget(self.stop_capture_btn)
-
-    #     # Create slider
-        
-    #     self.slider.setMinimum(0)
-    #     self.slider.setMaximum(0)  # Adjust based on your needs
-    #     self.slider.setValue(0)  # Default position   
-        
-    #     self.right_layout.addWidget(self.slider)
-
-    #     self.right_layout.addWidget(self.slider_value_label)
-
-    #     self.slider.valueChanged.connect(self.update_slider_value)
-
-    #     # Add play/pause button
-    #     self.toggle_button = QToolButton()
-        
-    #     self.toggle_button.setVisible(False)
-    #     self.refresh_action = self.toggle_button.addAction(QIcon('play.png'), 'Play')
-    #     self.pause_action = self.toggle_button.addAction(QIcon('pause.png'), 'Pause')
-        
-    #     self.toggle_action = QAction("Replay connections", self)
-    #     self.toggle_action.setCheckable(True)
-    #     self.toggle_action.toggled.connect(self.toggle_auto_refresh_replay_connections)  # Add this method
-        
-    #     self.toggle_button.setDefaultAction(self.toggle_action)
-    #     self.right_layout.addWidget(self.toggle_button)      
-        
-    #     self.refresh_interval_combo_box = QComboBox()
-    #     self.refresh_interval_combo_box.setToolTip("Select map refresh interval in milliseconds")
-    #     self.refresh_interval_combo_box.addItems(["2000", "5000", "10000", "20000", "30000", "40000", "50000", "120000", "300000", "600000", "1200000", "180000000"])
-    #     self.refresh_interval_combo_box.currentIndexChanged.connect(self.update_refresh_interval)
-    #     self.update_refresh_interval()
-    #     self.right_layout.addWidget(self.refresh_interval_combo_box)
-
-    #     # Status label
-    #     self.status_label = QLabel("Auto-refreshing connections.")
-    #     self.right_layout.addWidget(self.status_label)
-    #     self.status_label.setAlignment(Qt.AlignTop)
-
-    #     self.right_layout.addWidget(self.save_connections_btn)
-    #     self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
-
-    #     # DNS resolution time label
-    #     self.dns_resolution_time = QLabel("DNS lookups took : N/A")
-    #     self.right_layout.addWidget(self.dns_resolution_time)
-    #     self.dns_resolution_time.setAlignment(Qt.AlignTop)
-    #     self.dns_resolution_time.setVisible(False)
-
-    #     # Reverse DNS checkbox
-    #     self.reverse_dns_check = QCheckBox("Perform Reverse DNS Lookup on captured IPs")
-    #     self.reverse_dns_check.setChecked(False)
-    #     self.right_layout.addWidget(self.reverse_dns_check)    
-    #     self.reverse_dns_check.stateChanged.connect(self.update_reverse_dns)
-
-    #     # C2 Check checkbox
-    #     self.c2_check = QCheckBox("Perform C2 checks against C2-TRACKER database")
-    #     self.c2_check.setChecked(False)
-    #     self.right_layout.addWidget(self.c2_check)    
-    #     self.c2_check.stateChanged.connect(self.update_c2_check)
-    #     self.c2_check.setChecked(True)
-
-    #     # Only show new connections
-    #     self.only_show_new_connections = QCheckBox("Only show new connections")
-    #     self.only_show_new_connections.setChecked(False)
-    #     self.right_layout.addWidget(self.only_show_new_connections)    
-    #     self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)  
- 
-    #     self.reset_connections_btn = QPushButton("Reset connections")
-    #     self.reset_connections_btn.clicked.connect(self.reset_connections)
-    #     self.right_layout.addWidget(self.reset_connections_btn)  
-
-    #     self.right_panel.setLayout(self.right_layout)    
-        
-    #     # Add panels to main layout
-    #     main_layout.addWidget(self.left_panel, 1)
-    #     main_layout.addWidget(self.right_panel, 2)
-        
-    #     # central_widget = QWidget()
-    #     # central_widget.setLayout(main_layout)
-    #     # self.setCentralWidget(central_widget)
-
-
-
-    #     # Put splitter inside central widget to preserve your existing central widget setup
-    #     central_widget = QWidget()
-    #     central_layout = QHBoxLayout(central_widget)
-    #     central_layout.setContentsMargins(0, 0, 0, 0)
-    #     central_layout.addWidget(self.splitter)
-    #     self.setCentralWidget(central_widget)
-
-
-
-        
-    #     # Connect the web view's load finished signal
-    #     self.map_view.loadFinished.connect(self.on_map_loaded)
 
     def init_ui(self):
         self.connection_list = []
@@ -1164,8 +884,6 @@ class TCPConnectionViewer(QMainWindow):
 
         self.connection_table.horizontalHeader().setMinimumSectionSize(SUSPECT_COLUMN_SIZE)
 
-
-
         self.left_layout.addWidget(self.connection_table)
         
         # Respect minimum sizes and set sensible initial sizes for the splitter children
@@ -1207,11 +925,6 @@ class TCPConnectionViewer(QMainWindow):
         self._pulse_anim.setKeyValueAt(1.0, 0.0)
         self._pulse_anim.finished.connect(lambda: self.pulse_indicator.setVisible(False))
 
-        #
-        # NEW: Create a vertical splitter inside the right panel so the top area is the map
-        # and the bottom area holds controls (pulse indicator, buttons, slider, checkboxes).
-        # This allows the user to resize the vertical space allocated to the map.
-        #
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.setHandleWidth(6)
 
@@ -1279,7 +992,7 @@ class TCPConnectionViewer(QMainWindow):
 
         # Reverse DNS checkbox
         self.reverse_dns_check = QCheckBox("Perform Reverse DNS Lookup on captured IPs")
-        self.reverse_dns_check.setChecked(False)
+        self.reverse_dns_check.setChecked(True)
         self.controls_layout.addWidget(self.reverse_dns_check)    
         self.reverse_dns_check.stateChanged.connect(self.update_reverse_dns)
 
@@ -1325,14 +1038,13 @@ class TCPConnectionViewer(QMainWindow):
 
         # Connect the web view's load finished signal
         self.map_view.loadFinished.connect(self.on_map_loaded)
-
         
     def load_databases(self):
         try:
             # Ensure database directory exists
             if not os.path.exists(DB_DIR):
                 os.makedirs(DB_DIR)
-                
+
             # Check each database file
             self._check_and_download_database(IPV4_DB_PATH, "IPv4", GEOLITE2_IPV4_DOWNLOAD_URL, GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TITLE, GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT)
             self._check_and_download_database(IPV6_DB_PATH, "IPv6", GEOLITE2_IPV6_DOWNLOAD_URL, GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TITLE, GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT)
@@ -1341,21 +1053,34 @@ class TCPConnectionViewer(QMainWindow):
             # Open databases
             self.reader_ipv4 = maxminddb.open_database(IPV4_DB_PATH)
             self.reader_ipv6 = maxminddb.open_database(IPV6_DB_PATH)
-            self.reader_c2_tracker = pd.read_csv(C2_TRACKER_DB_PATH, sep="\t", names=["ip", "type", "info"], comment="#", dtype=str)    
+
+            # Load C2-TRACKER into a simple dict
+            self.reader_c2_tracker = {}
+            if os.path.exists(C2_TRACKER_DB_PATH):
+                with open(C2_TRACKER_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split("\t")
+                        ip = parts[0]
+                        typ = parts[1] if len(parts) > 1 else ""
+                        info = parts[2] if len(parts) > 2 else ""
+                        self.reader_c2_tracker[ip] = (typ, info)
 
         except Exception as e:
             QMessageBox.critical(self, "Database Error", f"Failed to load databases: {str(e)}, nothing may show on map.")
-
     
     def check_ip_is_present_in_c2_tracker(self, ip_address):
         """Check if an IP address is present in the C2-TRACKER database"""
         try:
-            if self.reader_c2_tracker is not None:
-                match = self.reader_c2_tracker[self.reader_c2_tracker['ip'] == ip_address]
-                if not match.empty:
-                    return True, match.iloc[0]['type'], match.iloc[0]['info']
+            table = self.reader_c2_tracker
+            if table:
+                entry = table.get(ip_address)
+                if entry:
+                    return True, entry[0], entry[1]
             return False, None, None
-        except Exception as e:
+        except Exception:
             return False, None, None
 
     def download_database(self, db_path, url):
@@ -1409,7 +1134,6 @@ class TCPConnectionViewer(QMainWindow):
 
     def _prompt_to_download(self, db_type, db_path, download_url, about_title="", about_text=""):
 
-
         if ACCEPT_EULA:
             try:
                 self.download_database(db_path, download_url)
@@ -1446,7 +1170,7 @@ class TCPConnectionViewer(QMainWindow):
                         
                         # Get local and remote addresses
                         local_addr = f"{conn.laddr.ip}:{conn.laddr.port}"
-                        remote_addr = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "N/A"
+                        remote_addr = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else ""
                         
                         # Determine IP type
                         ip_type = ""
@@ -1457,7 +1181,7 @@ class TCPConnectionViewer(QMainWindow):
                         
                         connections.append({
                             'process': process_name,
-                            'pid': str(conn.pid) if conn.pid else "N/A",
+                            'pid': str(conn.pid) if conn.pid else "",
                             'suspect': '',
                             'local': local_addr,
                             'remote': remote_addr,
@@ -1490,149 +1214,6 @@ class TCPConnectionViewer(QMainWindow):
                 return True
         return False
         
-    # def get_active_tcp_connections(self, position_timeline=None):
-    #     connections = []
-    #     c2_connections = []
-    #     #new_connections = []
-        
-    #     # Get all connections from psutil
-    #     all_connections = psutil.net_connections(kind='inet')
-    #     # Filter for TCP connections that are established and not local loop
-    #     end_time_dns_resolution=0.0
-    
-    #     # Collect all remote IPs for DNS resolution
-    #     ips_to_resolve = set()
-    #     for conn in all_connections:
-    #         if conn.status == psutil.CONN_ESTABLISHED :
-    #             if conn.raddr.ip not in ('127.0.0.1', '::1', None):
-    #                 ips_to_resolve.add(conn.raddr.ip)
-                
-    #     # Resolve all IPs at once
-    #     ip_hostnames = {}
-    #     if do_reverse_dns:
-    #         start_time_dns_resolution = time.time()
-
-    #         ip_hostnames = self.reverse_dns(list(ips_to_resolve))
-    #         end_time_dns_resolution = time.time() - start_time_dns_resolution
-        
-    #     if position_timeline is None:
-    #         current_connections = all_connections
-    #     else:
-    #         # Get connections from the specified timeline position
-    #         timeline_index = min(position_timeline, len(self.connection_list) - 1)
-    #         return self.connection_list[timeline_index]['connection_list']   
-
-    #     for conn in current_connections:
-    #         if conn.status == psutil.CONN_ESTABLISHED:
-    #             try:
-    #                 # Get process information
-    #                 process = psutil.Process(conn.pid) if conn.pid else None
-    #                 process_name = process.name() if process else "Unknown"
-                    
-    #                 # Get local and remote addresses
-    #                 local_addr = f"{conn.laddr.ip}"
-    #                 remote_addr = f"{conn.raddr.ip}" if conn.raddr else "N/A"
-                    
-    #                 # Determine IP type
-    #                 ip_type = ""
-    #                 if conn.family == socket.AF_INET:
-    #                     ip_type = "IPv4"
-    #                 elif conn.family == socket.AF_INET6:
-    #                     ip_type = "IPv6"
-
-    #                 lat, lng = None, None
-    #                 name = ""
-                    
-    #                 # Get coordinates for map
-    #                 if ip_type == "IPv4":
-    #                     ip = remote_addr.split(':')[0] if ':' in remote_addr else remote_addr
-    #                 else:
-    #                     ip = remote_addr
-
-    #                 if ip not in ('127.0.0.1','::1'):
-    #                     lat, lng = self.get_coordinates(ip, ip_type)
-
-    #                     if do_reverse_dns:
-                            
-    #                         hostname = ip_hostnames.get(ip if ip else "N/A", None)
-
-    #                         if hostname:                    
-    #                             remote_addr += f" ({hostname})"
-    #                             name = hostname
-                    
-    #                 if self.reader_c2_tracker is not None and do_c2_check:
-    #                     is_c2, c2_type, c2_info = self.check_ip_is_present_in_c2_tracker(ip)
-    #                     if  is_c2:
-    #                         c2_connections.append({
-    #                             'process': process_name,
-    #                             'pid': str(conn.pid) if conn.pid else "N/A",
-    #                             'suspect': 'Yes',
-    #                             'local': local_addr,
-    #                             'localport': str(conn.laddr.port) if conn.laddr else "N/A",
-    #                             'remote': remote_addr,
-    #                             'remoteport': str(conn.raddr.port) if conn.raddr else "N/A",
-    #                             'name': name,
-    #                             'ip_type': ip_type,
-    #                             'lat': lat,
-    #                             'lng': lng,                                  
-    #                             'connection': conn,
-    #                             'icon': 'redIcon'
-    #                         })
-
-    #                 connections.append({
-    #                     'process': process_name,
-    #                     'pid': str(conn.pid) if conn.pid else "N/A",
-    #                     'suspect': '',
-    #                     'local': local_addr,
-    #                     'localport': str(conn.laddr.port) if conn.laddr else "N/A",
-    #                     'remote': remote_addr,
-    #                     'remoteport': str(conn.raddr.port) if conn.raddr else "N/A",
-    #                     'name': name,
-    #                     'ip_type': ip_type,
-    #                     'lat': lat,
-    #                     'lng': lng,                                  
-    #                     'connection': conn,
-    #                     'icon': 'greenIcon'
-    #                 })
-
-    #                 if len(self.connection_list) > 0 :
-    #                     # Check if connection is already in the list
-    #                     if not self.is_connection_in_list(connections[-1], self.connection_list[-1]['connection_list']):
-    #                         connections[-1]['icon'] = 'blueIcon'  # Mark as new connection
-
-
-    #             except (psutil.NoSuchProcess, psutil.AccessDenied):
-    #                 # Skip connections that can't be accessed
-    #                 continue
-
-    #     if position_timeline is None:
-    #         if len(c2_connections) > 0:
-    #             c2_connections.extend(connections)
-    #             connections = c2_connections
-            
-    #         current_time = datetime.datetime.now()
-
-    #         # Add another connection as a dictionary with the current time and connection list
-
-    #         another_connection = {
-    #             "datetime": datetime.datetime.now(),
-    #             "connection_list": connections
-    #         }
-
-    #         self.connection_list_counter = len(self.connection_list) 
-    #         self.slider.setMaximum(self.connection_list_counter)
-    #         self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)))
-
-    #         # make sure we don't exceed max size to protect memory
-    #         if self.connection_list_counter >= CONNECTION_LIST_MAX_SIZE:
-    #             self.connection_list.pop(0)
-
-    #         self.connection_list.append(another_connection)
-
-    #     if do_reverse_dns:
-    #         self.dns_resolution_time.setText(f"DNS lookups took : {end_time_dns_resolution:.4f} seconds")
-
-    #     return connections
 
     def get_active_tcp_connections(self, position_timeline=None):
         """
@@ -1657,14 +1238,6 @@ class TCPConnectionViewer(QMainWindow):
                 raddr_ip = getattr(c.raddr, "ip", None)
                 if raddr_ip and raddr_ip not in ('127.0.0.1', '::1'):
                     ips_to_resolve.add(raddr_ip)
-
-        # ip_hostnames = {}
-        # if do_reverse_dns and ips_to_resolve:
-        #     start_time_dns = time.time()
-        #     ip_hostnames = self.reverse_dns(list(ips_to_resolve))
-        #     end_time_dns = time.time() - start_time_dns
-        # else:
-        #     end_time_dns = 0.0
 
         ip_hostnames = {}
         if do_reverse_dns and ips_to_resolve:
@@ -1710,11 +1283,11 @@ class TCPConnectionViewer(QMainWindow):
                 laddr = getattr(conn, "laddr", None)
                 raddr = getattr(conn, "raddr", None)
 
-                local_addr = f"{laddr.ip}" if laddr else "N/A"
-                local_port = str(getattr(laddr, "port", "N/A")) if laddr else "N/A"
+                local_addr = f"{laddr.ip}" if laddr else ""
+                local_port = str(getattr(laddr, "port", "")) if laddr else ""
 
-                remote_addr = f"{raddr.ip}" if raddr else "N/A"
-                remote_port = str(getattr(raddr, "port", "N/A")) if raddr else "N/A"
+                remote_addr = f"{raddr.ip}" if raddr else ""
+                remote_port = str(getattr(raddr, "port", "")) if raddr else ""
 
                 # Determine IP type
                 family = getattr(conn, "family", None)
@@ -1756,7 +1329,7 @@ class TCPConnectionViewer(QMainWindow):
                             if is_c2:
                                 c2_connections.append({
                                     'process': process_name,
-                                    'pid': str(pid) if pid else "N/A",
+                                    'pid': str(pid) if pid else "",
                                     'suspect': 'Yes',
                                     'local': local_addr,
                                     'localport': local_port,
@@ -1776,7 +1349,7 @@ class TCPConnectionViewer(QMainWindow):
                 # append standard connection entry
                 connections.append({
                     'process': process_name,
-                    'pid': str(pid) if pid else "N/A",
+                    'pid': str(pid) if pid else "",
                     'suspect': '',
                     'local': local_addr,
                     'localport': local_port,
@@ -1839,7 +1412,6 @@ class TCPConnectionViewer(QMainWindow):
                 pass
 
         return connections
-
     
     def get_coordinates(self, ip_address, ip_type):
         """Get coordinates for an IP address"""
@@ -1885,12 +1457,46 @@ class TCPConnectionViewer(QMainWindow):
             # defensive: ignore if animations not ready yet
             pass
 
+    def _call_update_js(self, js, connection_data=None, force_show_tooltip=False, retries=10, delay_ms=200):
+        """
+        Safely call JS updater by first checking that `window.updateConnections` is defined.
+        Retries a few times with a delay; if exhausted, force a reload of the map HTML and retry.
+        """
+        try:
+            check_expr = "typeof window.updateConnections === 'function';"
+
+            def _on_check(result, retries=retries):
+                if result:
+                    try:
+                        self.map_view.page().runJavaScript(js)
+                        self._pulse_map_indicator()
+                    except Exception:
+                        # best-effort; if run fails, attempt a reload to recover
+                        self.map_initialized = False
+                        self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
+                        QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
+                else:
+                    if retries <= 0:
+                        # give up and reinit the page once
+                        self.map_initialized = False
+                        self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
+                        QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
+                    else:
+                        # schedule another existence check
+                        QTimer.singleShot(delay_ms, lambda: self._call_update_js(js, connection_data, force_show_tooltip, retries - 1, delay_ms))
+
+            # run the check asynchronously; _on_check will be called with the boolean result
+            self.map_view.page().runJavaScript(check_expr, _on_check)
+        except Exception:
+            # fallback: reinitialize the page and retry update_map
+            self.map_initialized = False
+            self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
+            QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
 
     def update_map(self, connection_data, force_show_tooltip=False):
         """
-        Load map HTML once and afterwards update markers via injected JavaScript
-        using QWebEnginePage.runJavaScript(). Ensure we only call the updater after
-        the page has finished loading to avoid "updateConnections is not defined".
+        Load map HTML once and afterwards update markers via injected JavaScript.
+        Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
         """
         data_json = json.dumps(connection_data)
         js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()});"
@@ -1960,13 +1566,11 @@ class TCPConnectionViewer(QMainWindow):
                 # run update if the page loaded successfully
                 if ok:
                     try:
-                        # call the updater now that the JS context is ready
-                        self.map_view.page().runJavaScript(js)
-                        # show pulse now that we sent the update
-                        self._pulse_map_indicator()
+                        # use safe caller that waits for the JS function to exist
+                        self._call_update_js(js, connection_data, force_show_tooltip)
                     except Exception:
                         pass
-                # mark initialized and disconnect this one-shot handler
+                # mark initialized (we will still verify function existence before calling in _call_update_js)
                 try:
                     self.map_view.loadFinished.disconnect(_on_loaded)
                 except Exception:
@@ -1977,11 +1581,9 @@ class TCPConnectionViewer(QMainWindow):
             self.map_view.loadFinished.connect(_on_loaded)
             return
 
-        # If already initialized, call the JS updater directly
+        # If already initialized, call the JS updater using safe caller
         try:
-            self.map_view.page().runJavaScript(js)
-            # pulse after attempting to send the update
-            self._pulse_map_indicator()
+            self._call_update_js(js, connection_data, force_show_tooltip)
         except Exception:
             # fallback: force reinitialize on failure
             self.map_initialized = False
@@ -2003,7 +1605,6 @@ class TCPConnectionViewer(QMainWindow):
         else:
             self.refresh_connections(self, 0)
             self.timer_replay_connections.stop()
-
         
         self.slider.setValue(slider_position)    
             
@@ -2020,14 +1621,6 @@ class TCPConnectionViewer(QMainWindow):
             self.toggle_button.setVisible(True)
 
     def refresh_connections(self, slider_position=None):
-
-        # if not self.timer.isActive():
-        #     self.toggle_button.setVisible(False)
-        #     self.stop_capture_btn.setVisible(True)
-
-        # Get connections
-        
-        # Restart timer if it was a manual refresh triggerd by button
 
         force_tooltip = show_tooltip
 
@@ -2052,8 +1645,6 @@ class TCPConnectionViewer(QMainWindow):
             self.map_objects = len(self.connections)
             
             self.left_panel.setTitle(f"Active Connections - {self.map_objects} connections")
-            
-
         
         # Update table
         self.connection_table.setRowCount(0)
@@ -2079,10 +1670,9 @@ class TCPConnectionViewer(QMainWindow):
                 self.connection_table.setItem(row, REMOTE_PORT_ROW_INDEX, QTableWidgetItem(conn['remoteport']))
                 self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
                 self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
-
-
                 
                 lat, lng = None, None
+
                 # Get coordinates for map
                 if conn['ip_type'] == 'IPv4':
                     ip = conn['remote'].split(':')[0]# if ':' in conn['remote'] else conn['remote']
@@ -2101,11 +1691,9 @@ class TCPConnectionViewer(QMainWindow):
                         self.connection_table.setItem(row, LOCATION_LAT_ROW_INDEX, QTableWidgetItem(f"{lat}"))
                         self.connection_table.setItem(row, LOCATION_LON_ROW_INDEX, QTableWidgetItem(f"{lng}"))
                     else:
-                        self.connection_table.setItem(row, LOCATION_LAT_ROW_INDEX, QTableWidgetItem("N/A"))
-                        self.connection_table.setItem(row, LOCATION_LON_ROW_INDEX, QTableWidgetItem("N/A"))
+                        self.connection_table.setItem(row, LOCATION_LAT_ROW_INDEX, QTableWidgetItem(""))
+                        self.connection_table.setItem(row, LOCATION_LON_ROW_INDEX, QTableWidgetItem(""))
                 
-                # location = f"{lat}, {lng}" if lat is not None else "N/A"
-                # self.connection_table.setItem(row, LOCATION_ROW_INDEX, QTableWidgetItem(location))
                 if conn['suspect'] == "Yes":
                     for col in range(self.connection_table.columnCount()):
                         self.connection_table.item(row, col).setForeground(Qt.red)
@@ -2114,7 +1702,6 @@ class TCPConnectionViewer(QMainWindow):
                     self.status_label.setText("Warning: Suspect C2 connections detected!")
                 
                 connections_to_show_on_map.append(conn)
-
             
         # Update map with connection data
         self.update_map(connections_to_show_on_map, force_tooltip)
@@ -2135,21 +1722,12 @@ class TCPConnectionViewer(QMainWindow):
         if row < self.connection_table.rowCount():
             ip_hostnames = {}
             name = ""
-            
 
-            # Get all items in the source row
-            # row_items = []
-            # for col in range(self.connection_table.columnCount()):
-            #     item = self.connection_table.item(row, col).text()
-
-                # if item:
-                #     row_items.append(item.text())            
             # Extract data from table cells based on predefined columns
             remote_address = self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX).text()
             process_name = self.connection_table.item(row, PROCESS_ROW_INDEX).text()
             pid = self.connection_table.item(row, PID_ROW_INDEX).text()
             local_address = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX).text()
-
             
             # Process IP and hostname
             ip = remote_address
@@ -2161,7 +1739,6 @@ class TCPConnectionViewer(QMainWindow):
 
                 if do_reverse_dns:
                     hostname = self.connection_table.item(row, NAME_ROW_INDEX).text()
-
             
             # Check if the connection is marked as suspect
             suspect = (self.connection_table.item(row, SUSPECT_ROW_INDEX).text() == 'Yes')
