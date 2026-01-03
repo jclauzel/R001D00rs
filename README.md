@@ -20,13 +20,13 @@ When prompted for download and agreed the script will fetch the following two fi
 
 Accepting GeoLite2 the licensing terms for GeoLite is a requirement for this application to work.
 
-GeoLite2 is created by MaxMind. The license of GeoLite2 is written in GEOLITE2_LICENSE and End User License Agreement (EULA) is written in GEOLITE2_EULA. Please carefully read the GEOLITE2_LICENSE and GEOLITE2_EULA files, if you use these database. This package comes with certain restrictions and obligations, most notably:
+GeoLite2 is created by MaxMind. The license of GeoLite2 is written in GEOLITE2_LICENSE and End User License Agreement (EULA) is written in GEOLITE2_EULA. Please carefully read the GEOLITE2_LICENSE and GEOLITE2_EULA files, if you use these databases. This package comes with certain restrictions and obligations, most notably:
 
 You cannot prevent the library from updating the databases.
 You cannot use the GeoLite2 data:
 for FCRA purposes,
 to identify specific households or individuals.
-You can read the latest version of GeoLite2 EULA here https://www.maxmind.com/en/geolite2/eula. GeoLite2 databse is provided under CC BY-SA 4.0 by MaxMind.
+You can read the latest version of GeoLite2 EULA here https://www.maxmind.com/en/geolite2/eula. GeoLite2 database is provided under CC BY-SA 4.0 by MaxMind.
 
 * C2_TRACKER 
 C2 Tracker is a free-to-use-community-driven IOC feed that uses Shodan searches to collect IP addresses of known malware/botnet/C2 infrastructure.
