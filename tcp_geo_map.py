@@ -57,7 +57,7 @@ from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-VERSION = "2.7.7" # Current script version
+VERSION = "2.7.8" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -117,6 +117,7 @@ STOP_CAPTURE_BUTTON_TEXT = "Stop capture live connections"
 show_tooltip = False # Show tooltips on map markers
 map_refresh_interval = 120000  # Map refresh time in milliseconds
 show_only_new_active_connections = False # Show only new connections in the table
+show_only_remote_connections = False # Hide local connections (ie 127.0.0.1 ::1)
 table_column_sort_index = -1  # Default column index to sort the table by the index
 table_column_sort_reverse = False  # Default sort order
 do_reverse_dns = False  # Set to True to enable reverse DNS lookups
@@ -253,6 +254,7 @@ class TCPConnectionViewer(QMainWindow):
         settings = {
             'do_c2_check' : do_c2_check,
 		    'show_only_new_active_connections': show_only_new_active_connections,
+            'show_only_remote_connections': show_only_remote_connections,
 		    'do_reverse_dns': do_reverse_dns,
 		    'map_refresh_interval': map_refresh_interval,
 		    'table_column_sort_index': table_column_sort_index,
@@ -274,10 +276,11 @@ class TCPConnectionViewer(QMainWindow):
                     settings = json.load(f)
 
                     # Apply loaded settings
-                    global do_c2_check, show_only_new_active_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
+                    global do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
 
                     do_c2_check = settings.get('do_c2_check', do_c2_check)
                     show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
+                    show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
                     do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
 
                     map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
@@ -288,6 +291,7 @@ class TCPConnectionViewer(QMainWindow):
 		                
                     # Update UI elements if needed
                     self.only_show_new_connections.setChecked(show_only_new_active_connections)
+                    self.only_show_remote_connections.setChecked(show_only_remote_connections)
                     self.reverse_dns_check.setChecked(do_reverse_dns)
                     self.c2_check.setChecked(do_c2_check)
 
@@ -617,6 +621,19 @@ class TCPConnectionViewer(QMainWindow):
             self.setStyleSheet("") # Reset any previous styles
 
         self.refresh_connections()
+
+    def only_show_remote_connections_changed(self):
+        global show_only_remote_connections
+
+        new_state = self.only_show_remote_connections.isChecked()
+        if new_state == True:
+            show_only_remote_connections = True
+        else:
+            show_only_remote_connections = False
+            self.setStyleSheet("") # Reset any previous styles
+
+        self.refresh_connections()
+
     
     def update_refresh_interval(self):
         global map_refresh_interval
@@ -1007,7 +1024,13 @@ class TCPConnectionViewer(QMainWindow):
         self.only_show_new_connections = QCheckBox("Only show new connections")
         self.only_show_new_connections.setChecked(False)
         self.controls_layout.addWidget(self.only_show_new_connections)    
-        self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)  
+        self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)
+        
+        # Hide remote local connections
+        self.only_show_remote_connections = QCheckBox("Hide local connections")
+        self.only_show_remote_connections.setChecked(False)
+        self.controls_layout.addWidget(self.only_show_remote_connections)    
+        self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)  
 
         self.reset_connections_btn = QPushButton("Reset connections")
         self.reset_connections_btn.clicked.connect(self.reset_connections)
@@ -1493,13 +1516,14 @@ class TCPConnectionViewer(QMainWindow):
             self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
             QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
 
-    def update_map(self, connection_data, force_show_tooltip=False):
+    def update_map(self, connection_data, force_show_tooltip=False, stats_text=""):
         """
         Load map HTML once and afterwards update markers via injected JavaScript.
         Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
         """
         data_json = json.dumps(connection_data)
-        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()});"
+        # Send stats_text to JS via setStats(...) helper
+        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}); setStats({json.dumps(stats_text)});"
 
         # If not initialized, load the full HTML and wait for loadFinished before calling JS
         if not getattr(self, "map_initialized", False):
@@ -1510,16 +1534,22 @@ class TCPConnectionViewer(QMainWindow):
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-                <style> html, body { height:100%; margin:0; } #map { height:100%; width:100%; } </style>
+                <style> html, body { height:100%; margin:0; } #map { height:100%; width:100%; } 
+                       /* stats overlay at top center */ 
+                       #map-stats { position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:1000; 
+                                    background:rgba(255,255,255,0.85); padding:6px 10px; border-radius:6px; 
+                                    font-family:Arial, sans-serif; font-size:14px; pointer-events:none; }
+                </style>
             </head>
             <body>
                 <div id="map"></div>
+                <div id="map-stats"></div>
                 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
                 <script>
                     const iconDefinitions = {
                         'redIcon': new L.Icon({iconUrl:'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png', iconSize:[25,41], iconAnchor:[12,41]}),
                         'greenIcon': new L.Icon({iconUrl:'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png', iconSize:[25,41], iconAnchor:[12,41]}),
-                        'blueIcon': new L.Icon({iconUrl:'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png', iconSize:[25,41], iconAnchor:[12,41]})
+                        'blueIcon': new L.Icon({iconUrl:'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png', iconSize:[25,41], iconAnchor:[12,41]}),
                     };
 
                     var map = L.map('map').setView([20, 0], 2);
@@ -1554,7 +1584,16 @@ class TCPConnectionViewer(QMainWindow):
                         });
                     }
 
+                    // helper to set one-line stats at top of map
+                    function setStats(s) {
+                        try {
+                            var el = document.getElementById('map-stats');
+                            if (el) { el.innerText = s || ''; }
+                        } catch(e) {}
+                    }
+
                     window.updateConnections = updateConnections;
+                    window.setStats = setStats;
                 </script>
             </body>
             </html>
@@ -1588,8 +1627,7 @@ class TCPConnectionViewer(QMainWindow):
             # fallback: force reinitialize on failure
             self.map_initialized = False
             self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
-            QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
-
+            QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip, stats_text))
     def replay_connections(self):
 
         slider_position = self.slider.value()
@@ -1650,6 +1688,10 @@ class TCPConnectionViewer(QMainWindow):
         self.connection_table.setRowCount(0)
 
         connections_to_show_on_map = []
+
+        resolved_addresses = 0
+        unresolved_addresses = 0
+        local_addresses = 0
         
         for conn in self.connections:
             # Add to table
@@ -1658,18 +1700,7 @@ class TCPConnectionViewer(QMainWindow):
                 if conn['icon'] == 'blueIcon':
                     force_tooltip = True
                 
-                row = self.connection_table.rowCount()
-                self.connection_table.insertRow(row)
-                
-                self.connection_table.setItem(row, PROCESS_ROW_INDEX, QTableWidgetItem(conn['process']))
-                self.connection_table.setItem(row, PID_ROW_INDEX , QTableWidgetItem(conn['pid']))
-                self.connection_table.setItem(row, SUSPECT_ROW_INDEX, QTableWidgetItem(conn['suspect']))
-                self.connection_table.setItem(row, LOCAL_ADDRESS_ROW_INDEX, QTableWidgetItem(conn['local']))
-                self.connection_table.setItem(row, LOCAL_PORT_ROW_INDEX, QTableWidgetItem(conn['localport']))
-                self.connection_table.setItem(row, REMOTE_ADDRESS_ROW_INDEX, QTableWidgetItem(conn['remote']))
-                self.connection_table.setItem(row, REMOTE_PORT_ROW_INDEX, QTableWidgetItem(conn['remoteport']))
-                self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
-                self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
+
                 
                 lat, lng = None, None
 
@@ -1679,6 +1710,26 @@ class TCPConnectionViewer(QMainWindow):
                     ip = ip.split(' (')[0]  # Remove any appended hostname
                 else:
                     ip = conn['remote']
+
+
+
+                row = self.connection_table.rowCount()
+
+                if not (show_only_remote_connections and ip in ('127.0.0.1','::1')):
+                    self.connection_table.insertRow(row)
+                
+                    self.connection_table.setItem(row, PROCESS_ROW_INDEX, QTableWidgetItem(conn['process']))
+                    self.connection_table.setItem(row, PID_ROW_INDEX , QTableWidgetItem(conn['pid']))
+                    self.connection_table.setItem(row, SUSPECT_ROW_INDEX, QTableWidgetItem(conn['suspect']))
+                    self.connection_table.setItem(row, LOCAL_ADDRESS_ROW_INDEX, QTableWidgetItem(conn['local']))
+                    self.connection_table.setItem(row, LOCAL_PORT_ROW_INDEX, QTableWidgetItem(conn['localport']))
+                    self.connection_table.setItem(row, REMOTE_ADDRESS_ROW_INDEX, QTableWidgetItem(conn['remote']))
+                    self.connection_table.setItem(row, REMOTE_PORT_ROW_INDEX, QTableWidgetItem(conn['remoteport']))
+                    self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
+                    self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
+
+
+
 
                 if ip not in ('127.0.0.1','::1'):
 
@@ -1690,9 +1741,13 @@ class TCPConnectionViewer(QMainWindow):
                     if lat is not None and lng is not None:
                         self.connection_table.setItem(row, LOCATION_LAT_ROW_INDEX, QTableWidgetItem(f"{lat}"))
                         self.connection_table.setItem(row, LOCATION_LON_ROW_INDEX, QTableWidgetItem(f"{lng}"))
+                        resolved_addresses+=1
                     else:
                         self.connection_table.setItem(row, LOCATION_LAT_ROW_INDEX, QTableWidgetItem(""))
                         self.connection_table.setItem(row, LOCATION_LON_ROW_INDEX, QTableWidgetItem(""))
+                        unresolved_addresses+=1
+                else:
+                    local_addresses+=1
                 
                 if conn['suspect'] == "Yes":
                     for col in range(self.connection_table.columnCount()):
@@ -1703,8 +1758,9 @@ class TCPConnectionViewer(QMainWindow):
                 
                 connections_to_show_on_map.append(conn)
             
-        # Update map with connection data
-        self.update_map(connections_to_show_on_map, force_tooltip)
+        # Build single-line stats string and update map with it
+        stats_line = f"Resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses}"
+        self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line)
 
         if table_column_sort_index>-1:
             self.column_resort(table_column_sort_index)  
