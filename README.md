@@ -62,6 +62,30 @@ IP_DNS_NAME_CACHE_FILE = "ip_cache.json" # if PERSIST_LOCAL_DNS_CACHE_NAME_RESOL
 
 Markers can be clicked for additional details, map can be zoomed...
 
+# Install
+- (kali) linux install using venv:
+
+git clone https://github.com/jclauzel/R001D00rs
+
+python3 -m venv ./venv
+
+source venv/bin/activate
+
+pip3 install pyside6 requests maxminddb pandas 
+
+python3 tcp_geo_map.py
+
+- Windows:
+Install a recent python interpreter from https://www.python.org/ if not done yet.
+Download source or git clone https://github.com/jclauzel/R001D00rs
+
+Install required packages:
+
+pip3 install pyside6 requests maxminddb
+
+  
+- Execute script : python tcp_geo_map.py
+
 # Warranty, Disclaimer of Warranty, Limitation of Liability.
 THE SCRIPT SOFTWARE IS PROVIDED "AS IS." THE AUTHOR MAKES NO WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SCRIPT SOFTWARE WHICH MAY CONTAIN THIRD PARTY COMMERCIAL SOFTWARE. 
 IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR FOR DIRECT, SPECIAL, INDIRECT, CONSEQUENTIAL, INCIDENTAL OR PUNITIVE DAMAGES HOWEVER CAUSED AND REGARDLESS OF THE THEORY OF LIABILITY ARISING OUT OF THE USE OF OR INABILITY TO USE THE SCRIPT SOFTWARE, EVEN IF THE AUTHOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
