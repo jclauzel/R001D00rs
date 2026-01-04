@@ -54,10 +54,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayo
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView) 
 from PySide6.QtGui import QIcon, QAction
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-VERSION = "2.7.8" # Current script version
+VERSION = "2.7.9" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -253,13 +253,26 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
         settings = {
             'do_c2_check' : do_c2_check,
-		    'show_only_new_active_connections': show_only_new_active_connections,
+            'show_only_new_active_connections': show_only_new_active_connections,
             'show_only_remote_connections': show_only_remote_connections,
-		    'do_reverse_dns': do_reverse_dns,
-		    'map_refresh_interval': map_refresh_interval,
-		    'table_column_sort_index': table_column_sort_index,
+            'do_reverse_dns': do_reverse_dns,
+            'map_refresh_interval': map_refresh_interval,
+            'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
-	    }
+        }
+
+        # Save splitter states (Base64) if available
+        try:
+            settings['splitter_state'] = None
+            settings['right_splitter_state'] = None
+            if hasattr(self, 'splitter') and self.splitter is not None:
+                settings['splitter_state'] = self.splitter.saveState().toBase64().data().decode('ascii')
+            if hasattr(self, 'right_splitter') and self.right_splitter is not None:
+                settings['right_splitter_state'] = self.right_splitter.saveState().toBase64().data().decode('ascii')
+        except Exception:
+            # don't fail saving other settings for splitter issues
+            pass
+
         try:
             with open(SETTINGS_FILE_NAME, 'w') as f:
                 json.dump(settings, f, indent=4)
@@ -288,12 +301,29 @@ class TCPConnectionViewer(QMainWindow):
 
                     table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                     table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
-		                
+                        
                     # Update UI elements if needed
                     self.only_show_new_connections.setChecked(show_only_new_active_connections)
                     self.only_show_remote_connections.setChecked(show_only_remote_connections)
                     self.reverse_dns_check.setChecked(do_reverse_dns)
                     self.c2_check.setChecked(do_c2_check)
+
+                    # Restore splitter states if saved (Base64)
+                    try:
+                        split_state = settings.get('splitter_state')
+                        if split_state and hasattr(self, 'splitter'):
+                            ba = QByteArray.fromBase64(split_state.encode('ascii'))
+                            self.splitter.restoreState(ba)
+                    except Exception:
+                        pass
+
+                    try:
+                        right_state = settings.get('right_splitter_state')
+                        if right_state and hasattr(self, 'right_splitter'):
+                            ba = QByteArray.fromBase64(right_state.encode('ascii'))
+                            self.right_splitter.restoreState(ba)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 QMessageBox.critical(self, "Error loading settings", f"Error: {e}")
@@ -668,7 +698,6 @@ class TCPConnectionViewer(QMainWindow):
             self.update_map(self.connections)
             self.start_capture_btn.setVisible(True)
             self.stop_capture_btn.setVisible(False)         
-        
 
     def save_connection_list_to_csv(self):
         """
@@ -1815,7 +1844,7 @@ class TCPConnectionViewer(QMainWindow):
                 'lat': lat,
                 'lng': lng,
                 'connection': {},  # Placeholder if needed
-                'icon': icon  # Default icon; change as needed based on conditions
+                'icon': icon  # default icon; change as needed based on conditions
             }]
 
             # Additional logic for C2 checks can be integrated here if required
