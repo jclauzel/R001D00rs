@@ -83,6 +83,8 @@ Install required packages:
 
 pip3 install pyside6 requests maxminddb
 
+- Execute script : python tcp_geo_map.py
+
 # Settings
 
 Settings are persisted in a local file called settings.json and are saved when closing the script.
@@ -110,7 +112,11 @@ Sample settings.json with explanations:
     "right_splitter_state": "AAAA/wAAAAEAAAACAAADggAAAAABAAAABgEAAAACAA==" // Vertical spliter position
     
 
-- Execute script : python tcp_geo_map.py
+Other settings that you may tweak in the script itself:
+
+PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False # set to True to turn on and speedup application start time, False to disable. However this will keep track on disk to what IP addresses machine was connected to.
+IP_DNS_NAME_CACHE_FILE = "ip_cache.json" # if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the application will save and load to disk the IP DNS Name resolution made as name resolution is slow from the database sub folder. Next time the application start it will reload this cache to speed up startup time of the application
+
 
 # Warranty, Disclaimer of Warranty, Limitation of Liability.
 THE SCRIPT SOFTWARE IS PROVIDED "AS IS." THE AUTHOR MAKES NO WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SCRIPT SOFTWARE WHICH MAY CONTAIN THIRD PARTY COMMERCIAL SOFTWARE. 
