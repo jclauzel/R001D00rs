@@ -118,7 +118,7 @@ Other settings that you may tweak in the script itself:
 * PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False 
 Set to True to turn on and speedup application start time, False to disable. However this will keep track on disk to what IP addresses machine was connected to.
 
-IP_DNS_NAME_CACHE_FILE = "ip_cache.json"
+* IP_DNS_NAME_CACHE_FILE = "ip_cache.json"
 If PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the script will save and load to disk the IP DNS Name resolution made as name resolution is slow from the database sub folder. Next time the application start it will reload this cache to speed up startup time and name resolution of the script.
 
 
