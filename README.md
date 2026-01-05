@@ -89,18 +89,26 @@ Settings are persisted in a local file called settings.json and are saved when c
 To reset them either change the various options in the UI or simply delete the settings.json file that will be recreated at next execution.
 
 Sample settings.json with explanations:
-{
-    "do_c2_check": true, // Perfom C2 checks
-    "show_only_new_active_connections": false, // Only show new active connections (at the next refersh interval) on the map.
-    "show_only_remote_connections": true, // Only show remote connections made (at the next refersh interval) on the table, when selecting these remote IP addresses of 127.0.0.1 or ::1 will not be shown in the table. Local connections are not shown on the map anyway.
-    "do_reverse_dns": true, // Perform reverse DNS lookups on remote IP addresses. Since this is time consuming this is performed by a background worker thread so when the script start it may take a little while for the "Name" column to be populated. When the dns name resolution is sucessfull and remote location can be resolved the dns name will be shown as well when clicking on the marker on the map.
-    "map_refresh_interval": 2000, // "netstat" connection refresh interval in milliseconds
-    "table_column_sort_index": -1, // Left table ordering column number (-1 means no ordering is made on any table column)
-    "table_column_sort_reverse": false, // Left table ordering (ascending / descending)
-    "splitter_state": "AAAA/wAAAAEAAAACAAAAAAAABdwBAAAABgEAAAABAA==", // Horizontal spliter position
-    "right_splitter_state": "AAAA/wAAAAEAAAACAAADggAAAAABAAAABgEAAAACAA==" // Vertical spliter position
-}
 
+
+    "do_c2_check": true, // Perfom C2 checks
+    
+    "show_only_new_active_connections": false, // Only show new active connections (at the next refersh interval) on the map.
+    
+    "show_only_remote_connections": true, // Only show remote connections made (at the next refersh interval) on the table, when selecting these remote IP addresses of 127.0.0.1 or ::1 will not be shown in the table. Local connections are not shown on the map anyway.
+    
+    "do_reverse_dns": true, // Perform reverse DNS lookups on remote IP addresses. Since this is time consuming this is performed by a background worker thread so when the script start it may take a little while for the "Name" column to be populated. When the dns name resolution is sucessfull and remote location can be resolved the dns name will be shown as well when clicking on the marker on the map.
+    
+    "map_refresh_interval": 2000, // "netstat" connection refresh interval in milliseconds
+    
+    "table_column_sort_index": -1, // Left table ordering column number (-1 means no ordering is made on any table column)
+    
+    "table_column_sort_reverse": false, // Left table ordering (ascending / descending)
+    
+    "splitter_state": "AAAA/wAAAAEAAAACAAAAAAAABdwBAAAABgEAAAABAA==", // Horizontal spliter position
+    
+    "right_splitter_state": "AAAA/wAAAAEAAAACAAADggAAAAABAAAABgEAAAACAA==" // Vertical spliter position
+    
 
 - Execute script : python tcp_geo_map.py
 
