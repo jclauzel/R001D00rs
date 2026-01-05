@@ -57,7 +57,7 @@ from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-VERSION = "2.7.9" # Current script version
+VERSION = "2.8.1" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -251,6 +251,10 @@ class TCPConnectionViewer(QMainWindow):
 
     def save_settings(self):
         """Save current settings to a JSON file"""
+
+        # Apply loaded settings
+        global do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
+
         settings = {
             'do_c2_check' : do_c2_check,
             'show_only_new_active_connections': show_only_new_active_connections,
@@ -541,54 +545,59 @@ class TCPConnectionViewer(QMainWindow):
         global table_column_sort_index
         global table_column_sort_reverse
 
-        for row in range(self.connection_table.rowCount()):
-            self.sort_table_by_column(index, table_column_sort_reverse)
+        self.sort_table_by_column(index, table_column_sort_reverse)
+
+        # for row in range(self.connection_table.rowCount()):
+        #     self.sort_table_by_column(index, table_column_sort_reverse)
 
     def sort_table_by_column(self, column_index, reverse=False):
         """
-        Sorts the table based on the specified column index.
-        
-        Args:
-            column_index (int): The column to sort by.
-            reverse (bool): If True, sorts in descending order; otherwise ascending.
-        """
-        # Get all items from the specified column
-        items = []
-        for row in range(self.connection_table.rowCount()):
-            item = self.connection_table.item(row, column_index)
-            if item is not None:
-                items.append((item.text(), row))
-        
-        # Sort the items based on their text (case-sensitive)
-        items.sort(key=lambda x: x[0], reverse=reverse)  # Change to True for descending
-        
-        # Reorder the rows according to the sorted items
-        for new_row, (_, original_row) in enumerate(items):
-            if new_row != original_row:
-                self.rearrange_rows(original_row, new_row)
+        Sort the connection_table robustly.
 
-    def rearrange_rows(self, source_row, destination_row):
+        - Snapshot every row as a list of strings.
+        - Detect numeric values for numeric sort (ints/floats).
+        - Fall back to case-insensitive string comparison.
+        - Rebuild the table from the sorted snapshot (stable).
         """
-        Moves a row from source_row to destination_row.
-        
-        Args:
-            source_row (int): The current position of the row.
-            destination_row (int): The target position for the row.
-        """
-        # Get all items in the source row
-        row_items = []
-        for col in range(self.connection_table.columnCount()):
-            item = self.connection_table.item(source_row, col)
-            if item:
-                row_items.append(item.text())
-        
-        # Remove the source row from the table
-        self.connection_table.removeRow(source_row)
-        
-        # Insert the items into the destination row
-        self.connection_table.insertRow(destination_row)
-        for col in range(len(row_items)):
-            self.connection_table.setItem(destination_row, col, QTableWidgetItem(row_items[col]))    
+        # collect snapshot of all rows
+        rows = []
+        row_count = self.connection_table.rowCount()
+        col_count = self.connection_table.columnCount()
+
+        for r in range(row_count):
+            row_values = []
+            for c in range(col_count):
+                item = self.connection_table.item(r, c)
+                row_values.append(item.text() if item is not None else "")
+            # determine key from the sort column
+            raw_key = row_values[column_index] if column_index < len(row_values) else ""
+            # try numeric conversion (int then float)
+            sort_key = raw_key
+            try:
+                if raw_key != "":
+                    if raw_key.isdigit():
+                        sort_key = int(raw_key)
+                    else:
+                        # attempt float parsing after removing common thousands separators
+                        normalized = raw_key.replace(",", "")
+                        sort_key = float(normalized)
+                else:
+                    sort_key = ""  # keep empty strings sorted consistently
+            except Exception:
+                # fallback to case-insensitive string
+                sort_key = raw_key.lower()
+            rows.append((sort_key, row_values))
+
+        # stable sort by computed key
+        rows.sort(key=lambda x: x[0], reverse=reverse)
+
+        # repopulate table from sorted snapshot
+        self.connection_table.setRowCount(0)
+        for _, row_values in rows:
+            new_row = self.connection_table.rowCount()
+            self.connection_table.insertRow(new_row)
+            for c, text in enumerate(row_values):
+                self.connection_table.setItem(new_row, c, QTableWidgetItem(text))
 
      # Update connection list when slider changes
     def update_slider_value(self, value):
@@ -1056,7 +1065,7 @@ class TCPConnectionViewer(QMainWindow):
         self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)
         
         # Hide remote local connections
-        self.only_show_remote_connections = QCheckBox("Hide local connections")
+        self.only_show_remote_connections = QCheckBox("Hide local connections on left table")
         self.only_show_remote_connections.setChecked(False)
         self.controls_layout.addWidget(self.only_show_remote_connections)    
         self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)  
