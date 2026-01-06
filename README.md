@@ -98,7 +98,8 @@ This is not an extensive cover up of all features but here is a top list.
 - Settings can be rest by simply deleting the settings.json file stored in the same directory.
 - The application on the left shows the connection table collected at the time of the refrsh. Map is shown on the right. There is a vertical slider that can be grabbed between the two to adjust the size and the map can be set fully horizontal.
 - Bellow the map are located the various buttons and settings. There is also an horizontal slider that can be grabbed between these two parts of the screen. By comining the two sliders you can have the map full screen.
-- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live you of your connections on a seperate monitor for example. 
+- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live you of your connections on a seperate monitor for example.
+- MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases will be considered stale/obsolete after 7 days by default. When this occurs the application will prompt for new download of the database. Process is eased and automated though the UI when accepting the licensing rights. When --accept_eula is passed as a startup parameter since it means you agree with their licensing terms, the download of the databases will be done automaticaly.
   
 # Settings
 
@@ -143,6 +144,8 @@ Set to True to turn on and speedup application start time, False to disable. How
 * IP_DNS_NAME_CACHE_FILE = "ip_cache.json"
 If PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the script will save and load to disk the IP DNS Name resolution made as name resolution is slow from the database sub folder. Next time the application start it will reload this cache to speed up startup time and name resolution of the script.
 
+* DATABASE_EXPIRE_AFTER_DAYS = 7
+Databases expiration time in days from download date, default 7 days (1 week)
 
 # Warranty, Disclaimer of Warranty, Limitation of Liability.
 THE SCRIPT SOFTWARE IS PROVIDED "AS IS." THE AUTHOR MAKES NO WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SCRIPT SOFTWARE WHICH MAY CONTAIN THIRD PARTY COMMERCIAL SOFTWARE. 
