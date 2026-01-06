@@ -86,6 +86,17 @@ pip3 install pyside6 requests maxminddb
 
 - Execute script : python tcp_geo_map.py
 
+# Features
+This is not an extensive cover up of all features but here is a top list.
+- When C2 detection is enabled if a remote connection to such a host defined in https://github.com/montysecurity/C2-Tracker/ database the UI will turn red and spew a warning.
+- Remote IP location that can be resolved using MaxMind GeoLite2 will be displayed at every refresh on the OpenStreetMap. Note this IP geolocation is inherently imprecise you can read more about this at: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/ but gives a great starting point to who your machine is communicating with.
+- As the connections are refreshed based on a timer it is no case exhaustive and if a connection is opened and closed between two "netstat" collections it will not be collected however as stated above it is a good starting point. To avoid possobly skipping connections keep the refresh time small (by default 2000 milliseconds so 2 seconds).
+- Once connections have been captured you can use at any given point in time the time slider to revisit the connections or use the "Replay button" option.
+- Connections lists can be saved to disk.
+- Map can be moved, zommed.
+- UI state (screen full size, maximized) and settings are persisted to settings.json on script/application close. As a result next time the script is started it restores its state as it was when leaving.
+- Settings can be rest by simply deleting the settings.json file stored in the same directory.
+  
 # Settings
 
 Settings are persisted in a local file called settings.json and are saved when closing the script.
