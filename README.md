@@ -94,8 +94,11 @@ This is not an extensive cover up of all features but here is a top list.
 - Once connections have been captured you can use at any given point in time the time slider to revisit the connections or use the "Replay button" option.
 - Connections lists can be saved to disk.
 - Map can be moved, zommed.
-- UI state (screen full size, maximized) and settings are persisted to settings.json on script/application close. As a result next time the script is started it restores its state as it was when leaving.
+- UI state (screen full size, maximized) and settings are persisted to settings.json on script/application close. As a result next time the script is started it restores its state as it was when leaving. F11 can be used to toggle on and off full screen.
 - Settings can be rest by simply deleting the settings.json file stored in the same directory.
+- The application on the left shows the connection table collected at the time of the refrsh. Map is shown on the right. There is a vertical slider that can be grabbed between the two to adjust the size and the map can be set fully horizontal.
+- Bellow the map are located the various buttons and settings. There is also an horizontal slider that can be grabbed between these two parts of the screen. By comining the two sliders you can have the map full screen.
+- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live you of your connections on a seperate monitor for example. 
   
 # Settings
 
