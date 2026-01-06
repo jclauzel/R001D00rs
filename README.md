@@ -93,7 +93,8 @@ To reset them either change the various options in the UI or simply delete the s
 
 Sample settings.json with explanations:
 
-
+    "max_connection_list_filo_buffer_size": 1000, // At each refesh intervals the connection list is maintained in memory and added to a First In First Out item type buffer. When the buffer is full it will evict one at the time older connection list. The purpose of this is to allow to go back in time using the time slider or to replay connections.
+    
     "do_c2_check": true, // Perfom C2 checks
     
     "show_only_new_active_connections": false, // Only show new active connections (at the next refersh interval) on the map.
@@ -111,6 +112,13 @@ Sample settings.json with explanations:
     "splitter_state": "AAAA/wAAAAEAAAACAAAAAAAABdwBAAAABgEAAAABAA==", // Horizontal spliter position
     
     "right_splitter_state": "AAAA/wAAAAEAAAACAAADggAAAAABAAAABgEAAAACAA==" // Vertical spliter position
+
+    "is_fullscreen": false, // Allows to restore full screen on startup - setting will be applied/reset after every closing of the app
+    
+    "is_maximized": true, // Allows to restore maximized screen on startup (it is either fullscreen or maximized) - setting will be applied/reset after every closing of the app
+    
+    "fullscreen_screen_name": "MyScreenName" // Allows to restore the application UI back on to the right screen - setting will be applied/reset after every closing of the app
+    
     
 
 Other settings that you may tweak in the script itself:
