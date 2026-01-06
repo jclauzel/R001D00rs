@@ -57,7 +57,7 @@ from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-VERSION = "2.8.1" # Current script version
+VERSION = "2.8.2" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -108,14 +108,14 @@ SUSPECT_COLUMN_SIZE = 30
 PORTS_COLUMN_SIZE = 70
 IP_TYPE_COLUMN_SIZE = 20
 
-CONNECTION_LIST_MAX_SIZE = 1000  # Maximum number of connection snapshots to keep in memory
 TIME_SLIDER_TEXT = "Time slider position: "
 
 START_CAPTURE_BUTTON_TEXT = "Start capture live connections"
 STOP_CAPTURE_BUTTON_TEXT = "Stop capture live connections" 
 
+max_connection_list_filo_buffer_size = 1000  # Maximum number of connection snapshots to keep in memory. The larger this value the more memory will be used. When the max size is reached the oldest connection snapshot will be removed from memory.
 show_tooltip = False # Show tooltips on map markers
-map_refresh_interval = 120000  # Map refresh time in milliseconds
+map_refresh_interval = 2000  # Map refresh time in milliseconds
 show_only_new_active_connections = False # Show only new connections in the table
 show_only_remote_connections = False # Hide local connections (ie 127.0.0.1 ::1)
 table_column_sort_index = -1  # Default column index to sort the table by the index
@@ -212,6 +212,8 @@ class TCPConnectionViewer(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"TCP Geo Map - R001D00rs - v {VERSION}")
         self.setGeometry(100, 100, 1200, 800)
+        # pending restore info will be applied on first showEvent to avoid races
+        self._pending_restore = None
         
         # Initialize database readers
         self.reader_ipv4 = None
@@ -249,13 +251,82 @@ class TCPConnectionViewer(QMainWindow):
         self.timer.start(map_refresh_interval)  # Refresh every 5 seconds
         self.timer_replay_connections.timeout.connect(self.replay_connections)
 
+    def _toggle_fullscreen(self):
+        """Toggle between fullscreen and normal state (defensive)."""
+        try:
+            win_state = self.windowState()
+            is_fs = bool(win_state & Qt.WindowFullScreen) or self.isFullScreen()
+            if is_fs:
+                # leave fullscreen -> restore normal / maximized as appropriate
+                self.showNormal()
+            else:
+                self.showFullScreen()
+        except Exception:
+            pass
+
+    def _go_fullscreen_on_screen(self, screen):
+        """Move window to `screen` and enter fullscreen (defensive)."""
+        try:
+            # set the QWindow's screen if possible so fullscreen happens on the target monitor
+            try:
+                wh = self.windowHandle()
+                if wh is not None:
+                    wh.setScreen(screen)
+            except Exception:
+                pass
+
+            # move the window top-left to the target screen origin (helps some WM/OS combos)
+            try:
+                geom = screen.geometry()
+                self.move(geom.x(), geom.y())
+            except Exception:
+                pass
+
+            # finally request fullscreen; fall back to show() if it fails
+            try:
+                self.showFullScreen()
+            except Exception:
+                try:
+                    self.show()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _go_maximized_on_screen(self, screen):
+        """Move window to `screen` and enter maximized state (defensive)."""
+        try:
+            try:
+                wh = self.windowHandle()
+                if wh is not None:
+                    wh.setScreen(screen)
+            except Exception:
+                pass
+
+            try:
+                geom = screen.geometry()
+                self.move(geom.x(), geom.y())
+            except Exception:
+                pass
+
+            try:
+                self.showMaximized()
+            except Exception:
+                try:
+                    self.show()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def save_settings(self):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
 
         settings = {
+            'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
             'do_c2_check' : do_c2_check,
             'show_only_new_active_connections': show_only_new_active_connections,
             'show_only_remote_connections': show_only_remote_connections,
@@ -278,6 +349,26 @@ class TCPConnectionViewer(QMainWindow):
             pass
 
         try:
+            # record fullscreen / maximized info so we can restore on the same monitor
+            # prefer explicit window state bitmask check over isFullScreen() alone
+            win_state = self.windowState()
+            is_fs = bool(win_state & Qt.WindowFullScreen) or self.isFullScreen()
+            is_max = bool(win_state & Qt.WindowMaximized) or self.isMaximized()
+
+            settings['is_fullscreen'] = is_fs
+            settings['is_maximized'] = is_max
+            settings['fullscreen_screen_name'] = None
+            try:
+                wh = self.windowHandle()
+                if wh is not None and wh.screen() is not None:
+                    settings['fullscreen_screen_name'] = wh.screen().name()
+            except Exception:
+                # ignore if windowHandle not available
+                pass
+        except Exception:
+            pass
+
+        try:
             with open(SETTINGS_FILE_NAME, 'w') as f:
                 json.dump(settings, f, indent=4)
         except Exception as e:
@@ -293,8 +384,9 @@ class TCPConnectionViewer(QMainWindow):
                     settings = json.load(f)
 
                     # Apply loaded settings
-                    global do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
+                    global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
 
+                    max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
                     do_c2_check = settings.get('do_c2_check', do_c2_check)
                     show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
                     show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
@@ -329,6 +421,54 @@ class TCPConnectionViewer(QMainWindow):
                     except Exception:
                         pass
 
+                    # Restore fullscreen or maximized state if saved
+                    try:
+                        is_fs = settings.get('is_fullscreen', False)
+                        is_max = settings.get('is_maximized', False)
+                        screen_name = settings.get('fullscreen_screen_name')
+
+                        restored = False
+
+                        # Only attempt fullscreen when it was explicitly saved
+                        if is_fs:
+                            # existing fullscreen restore (prefer exact match)
+                            if screen_name:
+                                target = None
+                                for s in QApplication.screens():
+                                    try:
+                                        if s.name() == screen_name:
+                                            target = s
+                                            break
+                                    except Exception:
+                                        continue
+                                if target:
+                                    # schedule pending fullscreen on that screen by name
+                                    self._pending_restore = {'type': 'fullscreen', 'screen_name': target.name()}
+                                    restored = True
+                            else:
+                                self._pending_restore = {'type': 'fullscreen', 'screen_name': None}
+                                restored = True
+
+                        # if fullscreen not restored and maximize was saved, restore maximize on saved screen if possible
+                        if not restored and is_max:
+                            if screen_name:
+                                target = None
+                                for s in QApplication.screens():
+                                    try:
+                                        if s.name() == screen_name:
+                                            target = s
+                                            break
+                                    except Exception:
+                                        continue
+                                if target:
+                                    self._pending_restore = {'type': 'maximized', 'screen_name': target.name()}
+                                else:
+                                    self._pending_restore = {'type': 'maximized', 'screen_name': None}
+                            else:
+                                self._pending_restore = {'type': 'maximized', 'screen_name': None}
+                    except Exception:
+                        pass
+
             except Exception as e:
                 QMessageBox.critical(self, "Error loading settings", f"Error: {e}")
 
@@ -348,7 +488,6 @@ class TCPConnectionViewer(QMainWindow):
             self.reader_ipv6.close()
         self.save_ip_cache()
         event.accept()
-
 
     def load_ip_cache(self):
         """
@@ -547,9 +686,6 @@ class TCPConnectionViewer(QMainWindow):
 
         self.sort_table_by_column(index, table_column_sort_reverse)
 
-        # for row in range(self.connection_table.rowCount()):
-        #     self.sort_table_by_column(index, table_column_sort_reverse)
-
     def sort_table_by_column(self, column_index, reverse=False):
         """
         Sort the connection_table robustly.
@@ -602,7 +738,7 @@ class TCPConnectionViewer(QMainWindow):
      # Update connection list when slider changes
     def update_slider_value(self, value):
 
-        # Update your connection list here
+        # Update your connection list 
         self.slider.setMaximum(self.connection_list_counter)
 
         self.timer.stop()
@@ -611,7 +747,7 @@ class TCPConnectionViewer(QMainWindow):
         if value >= self.connection_list_counter:
             value = self.connection_list_counter
         
-        self.slider_value_label.setText(TIME_SLIDER_TEXT + str(value) + "/" + str(len(self.connection_list) -1))
+        self.slider_value_label.setText(TIME_SLIDER_TEXT + str(value) + "/" + str(len(self.connection_list) ))
         self.refresh_connections(slider_position=value)
         if not self.timer_replay_connections.isActive():
             self.start_capture_btn.setVisible(True)
@@ -630,10 +766,8 @@ class TCPConnectionViewer(QMainWindow):
         new_state = self.reverse_dns_check.isChecked()
         if new_state == True:
             do_reverse_dns = True
-            self.dns_resolution_time.setVisible(True)
         else:
             do_reverse_dns = False
-            self.dns_resolution_time.setVisible(False)
 
         self.refresh_connections()
         
@@ -672,7 +806,6 @@ class TCPConnectionViewer(QMainWindow):
             self.setStyleSheet("") # Reset any previous styles
 
         self.refresh_connections()
-
     
     def update_refresh_interval(self):
         global map_refresh_interval
@@ -701,7 +834,6 @@ class TCPConnectionViewer(QMainWindow):
             self.connection_list.clear()
             self.connections = []
             self.connection_list_counter = 0
-            self.slider_value_label = QLabel(TIME_SLIDER_TEXT + "0")
             self.slider.setMaximum(self.connection_list_counter)
             self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)))
             self.update_map(self.connections)
@@ -775,6 +907,7 @@ class TCPConnectionViewer(QMainWindow):
 
         Note: the `timeline_index` parameter is ignored (kept for compatibility with UI).
         """
+
         try:
             if not self.connection_list:
                 QMessageBox.information(self, "No data", "No timeline data available to save.")
@@ -857,6 +990,7 @@ class TCPConnectionViewer(QMainWindow):
         if enabled:
             if self.timer_replay_connections.isActive():
                 return  # Already running
+
             self.status_label.setText("Replaying connections.")
             
             # Start refresh timer or process here
@@ -872,8 +1006,6 @@ class TCPConnectionViewer(QMainWindow):
             self.timer_replay_connections.stop()
             self.start_capture_btn.setVisible(True)
             self.stop_capture_btn.setVisible(False)             
-
-
 
     def init_ui(self):
         self.connection_list = []
@@ -896,7 +1028,7 @@ class TCPConnectionViewer(QMainWindow):
         self.right_layout = QVBoxLayout()
 
         self.slider = QSlider(Qt.Horizontal)
-        self.slider_value_label = QLabel(TIME_SLIDER_TEXT + "0")
+        self.slider_value_label = QLabel(TIME_SLIDER_TEXT)
         
         # Save Button
         self.save_connections_btn = QPushButton("Save connection list to CSV file")
@@ -973,6 +1105,7 @@ class TCPConnectionViewer(QMainWindow):
         self.pulse_indicator.setGraphicsEffect(self._pulse_opacity)
         self._pulse_anim = QPropertyAnimation(self._pulse_opacity, b"opacity", self)
         self._pulse_anim.setDuration(800)  # total pulse duration (ms)
+
         # fade in quickly, hold, then fade out
         self._pulse_anim.setKeyValueAt(0.0, 0.0)
         self._pulse_anim.setKeyValueAt(0.12, 1.0)
@@ -1039,12 +1172,6 @@ class TCPConnectionViewer(QMainWindow):
         self.controls_layout.addWidget(self.save_connections_btn)
         self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
 
-        # DNS resolution time label
-        self.dns_resolution_time = QLabel("DNS lookups took : N/A")
-        self.dns_resolution_time.setAlignment(Qt.AlignTop)
-        self.dns_resolution_time.setVisible(False)
-        self.controls_layout.addWidget(self.dns_resolution_time)
-
         # Reverse DNS checkbox
         self.reverse_dns_check = QCheckBox("Perform Reverse DNS Lookup on captured IPs")
         self.reverse_dns_check.setChecked(True)
@@ -1077,6 +1204,7 @@ class TCPConnectionViewer(QMainWindow):
         # Put map and controls into the vertical splitter (map on top, controls below)
         self.right_splitter.addWidget(self.map_view)
         self.right_splitter.addWidget(self.controls_widget)
+
         # Give the map more initial stretch so it's larger by default
         self.right_splitter.setStretchFactor(0, 8)
         self.right_splitter.setStretchFactor(1, 2)
@@ -1096,6 +1224,24 @@ class TCPConnectionViewer(QMainWindow):
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.addWidget(self.splitter)
         self.setCentralWidget(central_widget)
+
+        # keyboard shortcuts for fullscreen / exit-fullscreen
+        try:
+            act_toggle_fs = QAction("Toggle Fullscreen", self)
+            # F11 commonly toggles fullscreen on Windows/Linux; Ctrl+Meta+F for macOS
+            act_toggle_fs.setShortcuts(["F11", "Ctrl+Meta+F"])
+            act_toggle_fs.setShortcutContext(Qt.ApplicationShortcut)
+            act_toggle_fs.triggered.connect(self._toggle_fullscreen)
+            self.addAction(act_toggle_fs)
+
+            # Escape should leave fullscreen (defensive: only act when fullscreen)
+            act_escape = QAction(self)
+            act_escape.setShortcut("Escape")
+            act_escape.setShortcutContext(Qt.ApplicationShortcut)
+            act_escape.triggered.connect(lambda: (self.showNormal() if (bool(self.windowState() & Qt.WindowFullScreen) or self.isFullScreen()) else None))
+            self.addAction(act_escape)
+        except Exception:
+            pass
 
         # Connect the web view's load finished signal
         self.map_view.loadFinished.connect(self.on_map_loaded)
@@ -1274,7 +1420,6 @@ class TCPConnectionViewer(QMainWindow):
             if self.are_connections_identical(conn, connection):
                 return True
         return False
-        
 
     def get_active_tcp_connections(self, position_timeline=None):
         """
@@ -1286,6 +1431,7 @@ class TCPConnectionViewer(QMainWindow):
         - Build ip collection and perform reverse DNS in batches only when enabled.
         - Write to `self.connection_list` with minimum temporary allocations.
         """
+
         connections = []
         c2_connections = []
 
@@ -1317,7 +1463,6 @@ class TCPConnectionViewer(QMainWindow):
                         ip_hostnames[ip] = host
         else:
             ip_hostnames = {}
-
 
         # Use local references for speed
         reader_ipv4 = self.reader_ipv4
@@ -1454,23 +1599,22 @@ class TCPConnectionViewer(QMainWindow):
             # append while ensuring we maintain the list size cap
             self.connection_list.append(another_connection)
             self.connection_list_counter = len(self.connection_list)
-            # keep slider in sync
-            self.slider.setMaximum(self.connection_list_counter)
-            self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)))
 
-            if self.connection_list_counter > CONNECTION_LIST_MAX_SIZE:
+            if self.connection_list_counter >= max_connection_list_filo_buffer_size:
                 # pop oldest until within limit
-                excess = self.connection_list_counter - CONNECTION_LIST_MAX_SIZE
+                excess = self.connection_list_counter - max_connection_list_filo_buffer_size
                 for _ in range(excess):
                     self.connection_list.pop(0)
                 self.connection_list_counter = len(self.connection_list)
 
-        # update DNS timing metric
-        if do_reverse_dns:
-            try:
-                self.dns_resolution_time.setText(f"DNS lookups took : {end_time_dns:.4f} seconds")
-            except Exception:
-                pass
+            # keep slider in sync
+            self.slider.setMaximum(self.connection_list_counter)
+            self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)))
+
+            if self.timer.isActive():
+                self.slider.valueChanged.disconnect(self.update_slider_value)
+                self.slider.setValue(self.connection_list_counter)
+                self.slider.valueChanged.connect(self.update_slider_value)
 
         return connections
     
@@ -1482,9 +1626,6 @@ class TCPConnectionViewer(QMainWindow):
                 # Get coordinates from the database
                 result = self.reader_ipv4.get(ip_address)
                 if result is not None:
-
-                # if result and 'location' in result and result['location']:
-                #     return result['location']['latitude'], result['location']['longitude']
                     return result['latitude'], result['longitude']                     
             except:
                 pass
@@ -1496,9 +1637,6 @@ class TCPConnectionViewer(QMainWindow):
                 # Get coordinates from the database
                 result = self.reader_ipv6.get(ip_address)
                 if result is not None:
-
-                # if result and 'location' in result and result['location']:
-                #     return result['location']['latitude'], result['location']['longitude']
                     return result['latitude'], result['longitude']                     
             except:
                 pass
@@ -1510,6 +1648,7 @@ class TCPConnectionViewer(QMainWindow):
             
     def _pulse_map_indicator(self):
         """Show and start the pulse animation (non-blocking)."""
+
         try:
             self.pulse_indicator.setVisible(True)
             self._pulse_anim.stop()
@@ -1523,6 +1662,7 @@ class TCPConnectionViewer(QMainWindow):
         Safely call JS updater by first checking that `window.updateConnections` is defined.
         Retries a few times with a delay; if exhausted, force a reload of the map HTML and retry.
         """
+
         try:
             check_expr = "typeof window.updateConnections === 'function';"
 
@@ -1559,6 +1699,7 @@ class TCPConnectionViewer(QMainWindow):
         Load map HTML once and afterwards update markers via injected JavaScript.
         Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
         """
+
         data_json = json.dumps(connection_data)
         # Send stats_text to JS via setStats(...) helper
         js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}); setStats({json.dumps(stats_text)});"
@@ -1666,15 +1807,18 @@ class TCPConnectionViewer(QMainWindow):
             self.map_initialized = False
             self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
             QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip, stats_text))
+
     def replay_connections(self):
 
         slider_position = self.slider.value()
 
         if len(self.connection_list) > 0:
 
-            if slider_position >= self.connection_list_counter - 1:
-                slider_position = 0
+            if slider_position >= self.connection_list_counter:
+                slider_position = -1
+
             self.refresh_connections(slider_position)
+
             slider_position +=1
             self.slider.setValue(slider_position)
 
@@ -1683,10 +1827,6 @@ class TCPConnectionViewer(QMainWindow):
             self.timer_replay_connections.stop()
         
         self.slider.setValue(slider_position)    
-            
-        # for conn in self.connection_list[slider_position]['connection_list'] :
-        #     print(conn)
-            #TODO implement replay logic here from refresh_connections
             
     def stop_capture_connections(self):
         if self.timer.isActive():
@@ -1738,8 +1878,6 @@ class TCPConnectionViewer(QMainWindow):
                 if conn['icon'] == 'blueIcon':
                     force_tooltip = True
                 
-
-                
                 lat, lng = None, None
 
                 # Get coordinates for map
@@ -1748,8 +1886,6 @@ class TCPConnectionViewer(QMainWindow):
                     ip = ip.split(' (')[0]  # Remove any appended hostname
                 else:
                     ip = conn['remote']
-
-
 
                 row = self.connection_table.rowCount()
 
@@ -1765,9 +1901,6 @@ class TCPConnectionViewer(QMainWindow):
                     self.connection_table.setItem(row, REMOTE_PORT_ROW_INDEX, QTableWidgetItem(conn['remoteport']))
                     self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
                     self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
-
-
-
 
                 if ip not in ('127.0.0.1','::1'):
 
@@ -1797,7 +1930,7 @@ class TCPConnectionViewer(QMainWindow):
                 connections_to_show_on_map.append(conn)
             
         # Build single-line stats string and update map with it
-        stats_line = f"Resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses}"
+        stats_line = f"Geo resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses}"
         self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line)
 
         if table_column_sort_index>-1:
@@ -1805,9 +1938,55 @@ class TCPConnectionViewer(QMainWindow):
     
     def on_map_loaded(self, success):
         if not success:
-            #self.status_label.setText("Map loaded successfully")
-        #else:
             self.status_label.setText("Error loading map")
+
+    def showEvent(self, event):
+        """Apply pending fullscreen/maximize restore on first real show.
+
+        This avoids races where windowHandle() or native windowing hasn't associated
+        the QWindow with a QScreen yet. We perform a single-shot deferred apply
+        to give the window system a moment to finish mapping.
+        """
+        try:
+            super().showEvent(event)
+        except Exception:
+            pass
+
+        try:
+            pr = getattr(self, '_pending_restore', None)
+            if not pr:
+                return
+
+            # clear pending to avoid repeat
+            self._pending_restore = None
+
+            stype = pr.get('type')
+            sname = pr.get('screen_name')
+
+            target = None
+            if sname:
+                for s in QApplication.screens():
+                    try:
+                        if s.name() == sname:
+                            target = s
+                            break
+                    except Exception:
+                        continue
+
+            # schedule shortly to ensure native mapping done
+            if stype == 'fullscreen':
+                if target:
+                    QTimer.singleShot(50, lambda t=target: self._go_fullscreen_on_screen(t))
+                else:
+                    QTimer.singleShot(50, self.showFullScreen)
+
+            elif stype == 'maximized':
+                if target:
+                    QTimer.singleShot(50, lambda t=target: self._go_maximized_on_screen(t))
+                else:
+                    QTimer.singleShot(50, self.showMaximized)
+        except Exception:
+            pass
     
     def on_table_cell_clicked(self, row, column):
         # Get the connection data for the clicked row
@@ -1855,8 +2034,6 @@ class TCPConnectionViewer(QMainWindow):
                 'connection': {},  # Placeholder if needed
                 'icon': icon  # default icon; change as needed based on conditions
             }]
-
-            # Additional logic for C2 checks can be integrated here if required
 
             if lat is not None or lng is not None:
                 self.update_map(focused_data)
