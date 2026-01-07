@@ -1,8 +1,10 @@
 # Summary
+
 tcp_geo_map.py is a python desktop tool that enumerates active TCP connections (via `psutil`), resolves geolocation using (MaxMind GeoLite2) and optional can perform reverse DNS/C2 checks. 
 "Live snapshots" of the outbound tcp connections are then displayed in a Qt GUI (`PySide6`) with a Leaflet map using OpenStreetMap giving a graphical representation of where the current machine connects to.
-If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by default) user will be warned if the machine running the script connects to a suspected remote IP address.
-"Live snapshots" refresh times can be customized, connections can be replayed and saved...
+If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by default) users will be warned if the machine running the script connects to a suspected remote IP address. 
+
+"Live network connection snapshots" refresh times can be customized, connections can be replayed and saved...
 
 # Tested on
 - (Kali) Linux
@@ -23,13 +25,11 @@ Accepting GeoLite2 the licensing terms for GeoLite is a requirement for this app
 GeoLite2 is created by MaxMind. The license of GeoLite2 is written in GEOLITE2_LICENSE and End User License Agreement (EULA) is written in GEOLITE2_EULA. Please carefully read the GEOLITE2_LICENSE and GEOLITE2_EULA files, if you use these databases. This package comes with certain restrictions and obligations, most notably:
 
 You cannot prevent the library from updating the databases.
-You cannot use the GeoLite2 data:
-for FCRA purposes,
-to identify specific households or individuals.
+You cannot use the GeoLite2 data: for FCRA purposes, to identify specific households or individuals.
 You can read the latest version of GeoLite2 EULA here https://www.maxmind.com/en/geolite2/eula. GeoLite2 database is provided under CC BY-SA 4.0 by MaxMind.
 
 * C2_TRACKER 
-C2 Tracker is a free-to-use-community-driven IOC feed that uses Shodan searches to collect IP addresses of known malware/botnet/C2 infrastructure.
+C2 Tracker is a free-to-use-community-driven IOC feed that searches to collect IP addresses of known malware/botnet/C2 infrastructure.
 
 When prompted for download and agreed the script will fetch the following file containing the list of C2 Suspect IP addresses and save it in the database subfolder:
 - https://github.com/montysecurity/C2-Tracker/raw/refs/heads/main/data/all.txt
@@ -40,7 +40,7 @@ When prompted for download and agreed the script will fetch the following file c
 * folium / OpenStreetMap
 * https://github.com/pointhi/leaflet-color-markers
 
-When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process making such a call will be tagged in red and "C2" column will mark "Yes".
+When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process performing such a call will be tagged in red and "C2" column will mark "Yes".
 
 Databases are considered as obsolete after a week and you will be prompted to refresh it.
 
@@ -52,9 +52,9 @@ When --accept_eula is passed the databases will be downloaded automatically when
 When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img so internet access is required.
 
 # Persistent IP DNS reverse cache file
-PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False set to True to turn on and speedup application start time, False to disable. However this will keep track on disk to what IP addresses machine was connected to.
+PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False set to True to turn on and speedup the script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
 
-IP_DNS_NAME_CACHE_FILE = "ip_cache.json" if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the application will save and load to disk the IP DNS Name resolution made as name resolution is slow from the database sub folder. Next time the application start it will reload this cache to speed up startup time of the application
+IP_DNS_NAME_CACHE_FILE = "ip_cache.json" if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the application will save and load from the disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application start it will reload this cache to speed up startup time of the script.
 
 # Map marker colors
 - Green icon - Connection that is available since the last refresh
@@ -87,65 +87,63 @@ pip3 install pyside6 requests maxminddb
 - Execute script : python tcp_geo_map.py
 
 # Features overview
-- Download and install of the MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases are made easy using a driven step by step process.
+- Download and install of the MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases are made easy using a driven step-by-step process.
 - When C2 detection is enabled if a remote connection to such a host defined in https://github.com/montysecurity/C2-Tracker/ database the UI will turn red and spew a warning.
-- Remote IP location that can be resolved using MaxMind GeoLite2 will be displayed at every refresh on the OpenStreetMap. Note this IP geolocation is inherently imprecise you can read more about this at: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/ but gives a great starting point to who your machine is communicating with.
-- As the connections are refreshed based on a timer it is no case exhaustive and if a connection is opened and closed between two "netstat" collections it will not be collected however as stated above it is a good starting point. To avoid possobly skipping connections keep the refresh time small (by default 2000 milliseconds so 2 seconds).
-- Once connections have been captured you can use at any given point in time the time slider to revisit the connections or use the "Replay button" option.
+- Remote IP location that can be resolved using MaxMind GeoLite2 will be displayed at every refresh on the OpenStreetMap. Note this IP geolocation is inherently imprecise and you can read more about this at: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/ but gives a great starting point to whom your machine is communicating with.
+- As the connections are refreshed based on a timer it is no case exhaustive and if a connection is opened and closed between two "netstat" collections it will not be collected, however, as stated above it is a good starting point. To avoid possible skipping connections keep the refresh time small (by default 2000 milliseconds so 2 seconds).
+- Once connections have been captured you can use at any given point in time the time slider to revisit the connections or use the "replay" buttonoption.
 - Connections lists can be saved to disk.
-- Map can be moved, zommed.
-- UI state (screen full size, maximized) and settings are persisted to settings.json on script/application close. As a result next time the script is started it restores its state as it was when leaving. F11 can be used to toggle on and off full screen.
-- Settings can be rest by simply deleting the settings.json file stored in the same directory.
-- The application on the left shows the connection table collected at the time of the refrsh. Map is shown on the right. There is a vertical slider that can be grabbed between the two to adjust the size and the map can be set fully horizontal.
-- Bellow the map are located the various buttons and settings. There is also an horizontal slider that can be grabbed between these two parts of the screen. By comining the two sliders you can have the map full screen.
-- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live you of your connections on a seperate monitor for example.
-- MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases will be considered stale/obsolete after 7 days by default. When this occurs the application will prompt for new download of the database. Process is eased and automated though the UI when accepting the licensing rights. When --accept_eula is passed as a startup parameter since it means you agree with their licensing terms, the download of the databases will be done automaticaly.
-  
+- Maps can be moved, zommed.
+- UI state (screen full size, maximized) and settings are persisted to settings.json on script close. As a result next time the script is started, it restores its state as it was when leaving. F11 can be used to toggle on and off full-screen display.
+- Settings can be rested by simply deleting the settings.json file stored in the same directory.
+- The UI on the left shows the connection table collected at the time of the refresh and the map is shown on the right. There is a vertical slider that can be grabbed between the two to adjust the size and the map can be set fully horizontally.
+- Bellow the map is located buttons and settings. There is also a horizontal slider that can be grabbed between these two parts of the screen. By combining the two sliders, you can have the map full screen.
+- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live you of your connections on a separate monitor, for example.
+- MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases will be considered stale/obsolete after 7 days by default. When this occurs the application will prompt for a new download of the database. The process is eased and automated through the UI when accepting the licensing rights. When --accept_eula is passed as a startup parameter since it means you agree with their licensing terms, the download of the databases will be done automatically.
+
 # Settings
 
 Settings are persisted in a local file called settings.json and are saved when closing the script.
-To reset them either change the various options in the UI or simply delete the settings.json file that will be recreated at next execution.
+To reset them either change the various options in the UI or simply delete the settings.json file that will be recreated at the next execution.
 
 Sample settings.json with explanations:
 
-    "max_connection_list_filo_buffer_size": 1000, // At each refesh intervals the connection list is maintained in memory and added to a First In First Out item type buffer. When the buffer is full it will evict one at the time older connection list. The purpose of this is to allow to go back in time using the time slider or to replay connections.
-    
-    "do_c2_check": true, // Perfom C2 checks
-    
-    "show_only_new_active_connections": false, // Only show new active connections (at the next refersh interval) on the map.
-    
-    "show_only_remote_connections": true, // Only show remote connections made (at the next refersh interval) on the table, when selecting these remote IP addresses of 127.0.0.1 or ::1 will not be shown in the table. Local connections are not shown on the map anyway.
-    
-    "do_reverse_dns": true, // Perform reverse DNS lookups on remote IP addresses. Since this is time consuming this is performed by a background worker thread so when the script start it may take a little while for the "Name" column to be populated. When the dns name resolution is sucessfull and remote location can be resolved the dns name will be shown as well when clicking on the marker on the map.
-    
-    "map_refresh_interval": 2000, // "netstat" connection refresh interval in milliseconds
-    
-    "table_column_sort_index": -1, // Left table ordering column number (-1 means no ordering is made on any table column)
-    
-    "table_column_sort_reverse": false, // Left table ordering (ascending / descending)
-    
-    "splitter_state": "AAAA/wAAAAEAAAACAAAAAAAABdwBAAAABgEAAAABAA==", // Horizontal spliter position
-    
-    "right_splitter_state": "AAAA/wAAAAEAAAACAAADggAAAAABAAAABgEAAAACAA==" // Vertical spliter position
+"max_connection_list_filo_buffer_size": 1000, // At each refresh intervals the connection list is maintained in memory and added to a First In First Out item type buffer. When the buffer is full, it will evict one at the time older connection list. The purpose of this is to allow you to go back in time using the time slider or to replay connections.
 
-    "is_fullscreen": false, // Allows to restore full screen on startup - setting will be applied/reset after every closing of the app
-    
-    "is_maximized": true, // Allows to restore maximized screen on startup (it is either fullscreen or maximized) - setting will be applied/reset after every closing of the app
-    
-    "fullscreen_screen_name": "MyScreenName" // Allows to restore the application UI back on to the right screen - setting will be applied/reset after every closing of the app
-    
-    
+"do_c2_check": true, // Perfom C2 checks
+
+"show_only_new_active_connections": false, // Only show new active connections (at the next refresh interval) on the map.
+
+"show_only_remote_connections": true, // Only show remote connections made (at the next refresh interval) on the table, when selecting these remote IP addresses of 127.0.0.1 or ::1 will not be shown in the table. Local connections are not shown on the map anyway.
+
+"do_reverse_dns": true, // Perform reverse DNS (Domain Name Service) lookups on remote IP addresses. Since this task is time consuming, this action is performed by a background worker thread when the script starts. Therefore, it may take a little while for the "Name" column to be populated. When the DNS name resolution is successful and remote location can be resolved, the DNS name will be shown as well when clicking on the marker on the map.
+
+"map_refresh_interval": 2000, // "netstat" connection refresh interval in milliseconds
+
+"table_column_sort_index": -1, // Left table ordering column number (-1 means no ordering is made on any table column)
+
+"table_column_sort_reverse": false, // Left table ordering (ascending / descending)
+
+"splitter_state": "AAAA/wAAAAEAAAACAAAAAAAABdwBAAAABgEAAAABAA==", // Horizontal splitter position
+
+"right_splitter_state": "AAAA/wAAAAEAAAACAAADggAAAAABAAAABgEAAAACAA==" // Vertical splitter position
+
+"is_fullscreen": false, // Allows restoring full-screen on startups - setting will be applied/reset after every closing of the script.
+
+"is_maximized": true, // Allows restoring maximized screen on startups (it is either full-screen or maximized) - setting will be applied/reset after every closing of the script
+
+"fullscreen_screen_name": "MyScreenName" // Allows restoring the application UI back on to the right screen - setting will be applied/reset after every closing of the script.
 
 Other settings that you may tweak in the script itself:
 
 * PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False 
-Set to True to turn on and speedup application start time, False to disable. However this will keep track on disk to what IP addresses machine was connected to.
+Set to True to turn on and speedup script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
 
 * IP_DNS_NAME_CACHE_FILE = "ip_cache.json"
-If PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the script will save and load to disk the IP DNS Name resolution made as name resolution is slow from the database sub folder. Next time the application start it will reload this cache to speed up startup time and name resolution of the script.
+If PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the script will save and load from disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application start it will reload this cache to speed up startup time and name resolution of the script.
 
 * DATABASE_EXPIRE_AFTER_DAYS = 7
-Databases expiration time in days from download date, default 7 days (1 week)
+Databases expiration time in days from the last download date, default 7 days (1 week)
 
 # Warranty, Disclaimer of Warranty, Limitation of Liability.
 THE SCRIPT SOFTWARE IS PROVIDED "AS IS." THE AUTHOR MAKES NO WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SCRIPT SOFTWARE WHICH MAY CONTAIN THIRD PARTY COMMERCIAL SOFTWARE. 
