@@ -57,7 +57,7 @@ from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-VERSION = "2.8.3" # Current script version
+VERSION = "2.8.4" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -1475,7 +1475,10 @@ class TCPConnectionViewer(QMainWindow):
             current_connections = all_connections
         else:
             idx = min(position_timeline, len(self.connection_list) - 1)
-            return self.connection_list[idx]['connection_list']
+            if idx >= 0:
+                return self.connection_list[idx]['connection_list']
+            else:
+                return []
 
         for conn in current_connections:
             if conn.status != psutil.CONN_ESTABLISHED:
