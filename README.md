@@ -1,6 +1,6 @@
 # Summary
 
-tcp_geo_map.py is a python desktop tool that enumerates active TCP connections (via `psutil`), resolves geolocation using (MaxMind GeoLite2) and optional can perform reverse DNS/C2 checks. 
+tcp_geo_map.py is a python desktop tool that enumerates active TCP connections (via `psutil` like a "netstat"), resolves geolocation using (MaxMind GeoLite2) and optional can perform reverse DNS/C2 checks. 
 "Live snapshots" of the outbound tcp connections are then displayed in a Qt GUI (`PySide6`) with a Leaflet map using OpenStreetMap giving a graphical representation of where the current machine connects to.
 If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by default) users will be warned if the machine running the script connects to a suspected remote IP address. 
 
@@ -102,6 +102,8 @@ pip3 install pyside6 requests maxminddb
 - Settings can be rested by simply deleting the settings.json file stored in the same directory.
 - The UI on the left shows the connection table collected at the time of the refresh and the map is shown on the right. There is a vertical slider that can be grabbed between the two to adjust the size and the map can be set fully horizontally.
 - Bellow the map is located buttons and settings. There is also a horizontal slider that can be grabbed between these two parts of the screen. By combining the two sliders, you can have the map full screen.
+- On the left table, connections are listed and can be selected. When clicked if the geo is resolved the map will show this unique remite address for clarity.
+- Each table column can be sorted by clicking on the corresponding table header for example "Process".
 - The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live you of your connections on a separate monitor, for example.
 - MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases will be considered stale/obsolete after 7 days by default. When this occurs the application will prompt for a new download of the database. The process is eased and automated through the UI when accepting the licensing rights. When --accept_eula is passed as a startup parameter since it means you agree with their licensing terms, the download of the databases will be done automatically.
 
