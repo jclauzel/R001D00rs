@@ -1,7 +1,7 @@
 # Summary
 
-tcp_geo_map.py is a python desktop tool that enumerates active TCP connections (via `psutil` like a "netstat"), resolves geolocation using (MaxMind GeoLite2) and optional can perform reverse DNS/C2 checks. 
-"Live snapshots" of the outbound tcp connections are then displayed in a Qt GUI (`PySide6`) with a Leaflet map using OpenStreetMap giving a graphical representation of where the current machine connects to.
+tcp_geo_map.py is a python desktop tool that enumerates active TCP connections (via `psutil` like a "netstat") per process, resolves geolocation using (MaxMind GeoLite2) and optionally can perform reverse DNS/C2 checks. 
+"Live snapshots" of the outbound TCP connections are then displayed in a Qt GUI (`PySide6`) with a Leaflet map using OpenStreetMap giving a graphical representation of where the current machine connects to.
 If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by default) users will be warned if the machine running the script connects to a suspected remote IP address. 
 
 "Live network connection snapshots" refresh times can be customized, connections can be replayed and saved...
@@ -46,10 +46,10 @@ When prompted for download and agreed the script will fetch the following file c
 
 When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process performing such a call will be tagged in red and "C2" column will mark "Yes".
 
-Databases are considered as obsolete after a week and you will be prompted to refresh it.
+Databases are considered as obsolete after a week, and you will be prompted to refresh it.
 
 # Avoiding prompts
-You can start the script by passing --accept_eula this means you agree, approve to follow all the licensing terms of all contributors and attributions including GeoLite2/MaxMind, C2_TRACKER, PySide6, psutil, folium / OpenStreetMap. 
+You can start the script by passing --accept_eula (Accept End User License Agreement) this means you agree, approve to follow all the licensing terms of all contributors and attributions including GeoLite2/MaxMind, C2_TRACKER, PySide6, psutil, folium / OpenStreetMap. 
 When --accept_eula is passed the databases will be downloaded automatically when they expire (by default every 7 days).
 
 # Telemetry/Internet Access
@@ -58,7 +58,7 @@ When starting the application will download leaflet/OpenStreetMap marker icons f
 # Persistent IP DNS reverse cache file
 PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False set to True to turn on and speedup the script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
 
-IP_DNS_NAME_CACHE_FILE = "ip_cache.json" if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the application will save and load from the disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application start it will reload this cache to speed up startup time of the script.
+IP_DNS_NAME_CACHE_FILE = "ip_cache.json" if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the application will save and load from the disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application starts it will reload this cache to speed up startup time of the script.
 
 # Map marker colors
 - Green icon - Connection that is available since the last refresh
@@ -95,16 +95,16 @@ pip3 install pyside6 requests maxminddb
 - When C2 detection is enabled if a remote connection to such a host defined in https://github.com/montysecurity/C2-Tracker/ database the UI will turn red and spew a warning.
 - Remote IP location that can be resolved using MaxMind GeoLite2 will be displayed at every refresh on the OpenStreetMap. Note this IP geolocation is inherently imprecise and you can read more about this at: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/ but gives a great starting point to whom your machine is communicating with.
 - As the connections are refreshed based on a timer it is no case exhaustive and if a connection is opened and closed between two "netstat" collections it will not be collected, however, as stated above it is a good starting point. To avoid possible skipping connections keep the refresh time small (by default 2000 milliseconds so 2 seconds).
-- Once connections have been captured you can use at any given point in time the time slider to revisit the connections or use the "replay" buttonoption.
+- Once connections have been captured you can use at any given point in time the time slider to revisit the connections or use the "replay" button option.
 - Connections lists can be saved to disk.
-- Maps can be moved, zommed.
+- Maps can be moved, zoommed.
 - UI state (screen full size, maximized) and settings are persisted to settings.json on script close. As a result next time the script is started, it restores its state as it was when leaving. F11 can be used to toggle on and off full-screen display.
 - Settings can be rested by simply deleting the settings.json file stored in the same directory.
 - The UI on the left shows the connection table collected at the time of the refresh and the map is shown on the right. There is a vertical slider that can be grabbed between the two to adjust the size and the map can be set fully horizontally.
-- Bellow the map is located buttons and settings. There is also a horizontal slider that can be grabbed between these two parts of the screen. By combining the two sliders, you can have the map full screen.
+- Bellow the map are located buttons and settings. There is also a horizontal slider that can be grabbed between these two parts of the screen. By combining the two sliders, you can have the map full screen.
 - On the left table, connections are listed and can be selected. When clicked if the geo is resolved the map will show this unique remite address for clarity.
 - Each table column can be sorted by clicking on the corresponding table header for example "Process".
-- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live you of your connections on a separate monitor, for example.
+- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live view of your connections on a separate monitor, for example.
 - MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases will be considered stale/obsolete after 7 days by default. When this occurs the application will prompt for a new download of the database. The process is eased and automated through the UI when accepting the licensing rights. When --accept_eula is passed as a startup parameter since it means you agree with their licensing terms, the download of the databases will be done automatically.
 
 # Settings
