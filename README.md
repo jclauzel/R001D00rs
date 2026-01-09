@@ -72,25 +72,40 @@ Markers can be clicked for additional details, map can be zoomed...
 
 git clone https://github.com/jclauzel/R001D00rs
 
-python3 -m venv ./venv
+python3 -m venv ./R001D00rs
 
-source venv/bin/activate
+source R001D00rs/bin/activate
 
 pip3 install pyside6 requests maxminddb
+
 or
+
 pip install -r REQUIREMENTS.txt
 
 python3 tcp_geo_map.py
 
 - Windows:
+
 Install a recent python interpreter from https://www.python.org/ if not done yet.
-Download source or git clone https://github.com/jclauzel/R001D00rs
+
+Download source from latest "release" located on the right side of https://github.com/jclauzel/R001D00rs or git clone https://github.com/jclauzel/R001D00rs
 
 Install required packages:
 
 pip3 install pyside6 requests maxminddb
+
 or
+
 pip install -r REQUIREMENTS.txt
+
+Note: as a best practice it is always best to create an vistual environement here is how to do so:
+
+python -m venv R001D00rs
+
+source R001D00rs\Scripts\activate
+
+pip install -r requirements.txt
+
 
 - Execute script : python tcp_geo_map.py
 
