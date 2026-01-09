@@ -76,7 +76,9 @@ python3 -m venv ./venv
 
 source venv/bin/activate
 
-pip3 install pyside6 requests maxminddb pandas 
+pip3 install pyside6 requests maxminddb
+or
+pip install -r REQUIREMENTS.txt
 
 python3 tcp_geo_map.py
 
@@ -87,6 +89,8 @@ Download source or git clone https://github.com/jclauzel/R001D00rs
 Install required packages:
 
 pip3 install pyside6 requests maxminddb
+or
+pip install -r REQUIREMENTS.txt
 
 - Execute script : python tcp_geo_map.py
 
