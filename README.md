@@ -54,6 +54,7 @@ When --accept_eula is passed the databases will be downloaded automatically when
 
 # Telemetry/Internet Access
 When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img so internet access is required.
+Calls to tile.openstreetmap.org are also perfomed.
 
 # Persistent IP DNS reverse cache file
 PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False set to True to turn on and speedup the script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
