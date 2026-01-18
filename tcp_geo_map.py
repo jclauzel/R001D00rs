@@ -41,7 +41,7 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
     git clone https://github.com/jclauzel/R001D00rs
     python3 -m venv ./venv
     source venv/bin/activate
-    pip3 install pyside6 requests maxminddb pandas 
+    pip3 install pyside6 requests maxminddb 
     python3 tcp_geo_map.py
 
     Windows:
@@ -52,12 +52,12 @@ import requests, datetime, sys, os, concurrent, threading, time, socket, csv, ps
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView) 
+                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit) 
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-VERSION = "2.8.4" # Current script version
+VERSION = "2.8.5" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -122,6 +122,7 @@ table_column_sort_index = -1  # Default column index to sort the table by the in
 table_column_sort_reverse = False  # Default sort order
 do_reverse_dns = False  # Set to True to enable reverse DNS lookups
 do_c2_check = False    # Set to True to enable C2-TRACKER checks
+USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
  
 
@@ -242,9 +243,7 @@ class TCPConnectionViewer(QMainWindow):
         self.load_databases()
         self.init_ui()
         self.load_settings()
-
-        #self.refresh_connections()
-        
+       
         # Set up timer to refresh connections periodically
 
         self.timer.timeout.connect(self.refresh_connections)
@@ -838,7 +837,7 @@ class TCPConnectionViewer(QMainWindow):
             self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)))
             self.update_map(self.connections)
             self.start_capture_btn.setVisible(True)
-            self.stop_capture_btn.setVisible(False)         
+            self.stop_capture_btn.setVisible(False)        
 
     def save_connection_list_to_csv(self):
         """
@@ -1715,7 +1714,9 @@ class TCPConnectionViewer(QMainWindow):
             <head>
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+                <!-- Try CDN first; if it fails we inject a local fallback (resources/leaflet/) -->
+                <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+                      onerror="try{injectLocalLeaflet(true)}catch(e){}" />
                 <style> html, body { height:100%; margin:0; } #map { height:100%; width:100%; } 
                        /* stats overlay at top center */ 
                        #map-stats { position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:1000; 
@@ -1726,56 +1727,157 @@ class TCPConnectionViewer(QMainWindow):
             <body>
                 <div id="map"></div>
                 <div id="map-stats"></div>
-                <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
                 <script>
-                    const iconDefinitions = {
-                        'redIcon': new L.Icon({iconUrl:'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png', iconSize:[25,41], iconAnchor:[12,41]}),
-                        'greenIcon': new L.Icon({iconUrl:'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png', iconSize:[25,41], iconAnchor:[12,41]}),
-                        'blueIcon': new L.Icon({iconUrl:'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png', iconSize:[25,41], iconAnchor:[12,41]}),
-                    };
-
-                    var map = L.map('map').setView([20, 0], 2);
-                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                        attribution: '&copy; OpenStreetMap contributors'
-                    }).addTo(map);
-
-                    var liveMarkers = [];
-
-                    function updateConnections(conns, showTooltip) {
-                        for (var i=0; i<liveMarkers.length; i++) {
-                            try { map.removeLayer(liveMarkers[i]); } catch(e) {}
-                        }
-                        liveMarkers = [];
-
-                        if (!conns || !Array.isArray(conns)) { return; }
-
-                        conns.forEach(function(conn) {
-                            if (conn.lat && conn.lng) {
-                                var iconName = conn.icon || 'greenIcon';
-                                var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
-                                var marker = L.marker([conn.lat, conn.lng], { icon: icon }).addTo(map);
-                                var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
-                                marker.bindTooltip(conn.process || '', tooltipOptions);
-                                var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
-                                                "PID: " + (conn.pid || '') + "<br>" +
-                                                "Remote: " + (conn.remote || '') + "<br>" +
-                                                "Local: " + (conn.local || '') + "<br>";
-                                marker.bindPopup(popupHtml);
-                                liveMarkers.push(marker);
-                            }
-                        });
-                    }
-
-                    // helper to set one-line stats at top of map
-                    function setStats(s) {
+                    // injectLocalLeaflet(true) => also try local CSS + set marker resources path
+                    function injectLocalLeaflet(includeCss) {
                         try {
-                            var el = document.getElementById('map-stats');
-                            if (el) { el.innerText = s || ''; }
-                        } catch(e) {}
+                            if (includeCss) {
+                                if (!document.getElementById('leaflet-local-css')) {
+                                    var link = document.createElement('link');
+                                    link.rel = 'stylesheet';
+                                    link.href = 'resources/leaflet/leaflet.css';
+                                    link.id = 'leaflet-local-css';
+                                    document.head.appendChild(link);
+                                }
+                            }
+                            if (!document.getElementById('leaflet-local-js')) {
+                                var s = document.createElement('script');
+                                s.src = 'resources/leaflet/leaflet.js';
+                                s.id = 'leaflet-local-js';
+                                document.head.appendChild(s);
+                            }
+                            // expose local resource base for marker fallbacks
+                            window._local_leaflet_resources = 'resources/leaflet/';
+                        } catch(e) {
+                            // ignore: waitForLeaflet will show message if nothing loads
+                        }
+                    }
+                </script>
+
+                <!-- CDN script with onerror fallback to local bundle -->
+                <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+                        onerror="try{injectLocalLeaflet(true);}catch(e){}"></script>
+
+                <script>
+                    // Try to resolve an image URL; fall back to local if remote unavailable
+                    function resolveImageUrl(remoteUrl, localUrl, cb, timeoutMs) {
+                        timeoutMs = timeoutMs || 2000;
+                        try {
+                            var img = new Image();
+                            var done = false;
+                            var t = setTimeout(function(){
+                                if (done) return;
+                                done = true;
+                                cb(localUrl);
+                            }, timeoutMs);
+                            img.onload = function(){ if (done) return; done = true; clearTimeout(t); cb(remoteUrl); };
+                            img.onerror = function(){ if (done) return; done = true; clearTimeout(t); cb(localUrl); };
+                            img.src = remoteUrl;
+                        } catch(e) {
+                            try { cb(localUrl); } catch(_) {}
+                        }
                     }
 
-                    window.updateConnections = updateConnections;
-                    window.setStats = setStats;
+                    // Wait for Leaflet (L) to be available before initializing map code.
+                    // Increased retries/delay for slow/blocked networks and clearer error messages.
+                    function waitForLeaflet(cb, retries=200, delay=200) {
+                        try {
+                            if (typeof L !== 'undefined') { cb(); return; }
+                            if (retries <= 0) {
+                                try {
+                                    var el = document.getElementById('map-stats');
+                                    if (el) {
+                                        el.innerText = 'Error: Leaflet did not load. Check network or ensure local files exist at resources/leaflet/';
+                                    }
+                                } catch(e){}
+                                return;
+                            }
+                            setTimeout(function(){ waitForLeaflet(cb, retries-1, delay); }, delay);
+                        } catch(e){}
+                    }
+
+                    waitForLeaflet(function() {
+                        // Prepare remote and local icon URLs
+                        var localBase = (window._local_leaflet_resources ? window._local_leaflet_resources : 'resources/leaflet/');
+                        var iconsToResolve = {
+                            red: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+                                local: localBase + 'marker-icon-2x-red.png'
+                            },
+                            green: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png',
+                                local: localBase + 'marker-icon-2x-green.png'
+                            },
+                            blue: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png',
+                                local: localBase + 'marker-icon-2x-blue.png'
+                            }
+                        };
+
+                        // Resolve all icon URLs in parallel, then init map
+                        var resolved = {};
+                        var remaining = Object.keys(iconsToResolve).length;
+                        Object.keys(iconsToResolve).forEach(function(k){
+                            var info = iconsToResolve[k];
+                            resolveImageUrl(info.remote, info.local, function(finalUrl){
+                                resolved[k] = finalUrl;
+                                remaining--;
+                                if (remaining === 0) {
+                                    // create icon definitions using resolved URLs
+                                    const iconDefinitions = {
+                                        'redIcon': new L.Icon({iconUrl: resolved.red, iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'greenIcon': new L.Icon({iconUrl: resolved.green, iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'blueIcon': new L.Icon({iconUrl: resolved.blue, iconSize:[25,41], iconAnchor:[12,41]}),
+                                    };
+
+                                    // initialize map AFTER icons resolved
+                                    var map = L.map('map').setView([20, 0], 2);
+                                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                                        attribution: '&copy; OpenStreetMap contributors'
+                                    }).addTo(map);
+
+                                    var liveMarkers = [];
+
+                                    function updateConnections(conns, showTooltip) {
+                                        for (var i=0; i<liveMarkers.length; i++) {
+                                            try { map.removeLayer(liveMarkers[i]); } catch(e) {}
+                                        }
+                                        liveMarkers = [];
+
+                                        if (!conns || !Array.isArray(conns)) { return; }
+
+                                        conns.forEach(function(conn) {
+                                            if (conn.lat && conn.lng) {
+                                                var iconName = conn.icon || 'greenIcon';
+                                                var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
+                                                var marker = L.marker([conn.lat, conn.lng], { icon: icon }).addTo(map);
+                                                var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
+                                                marker.bindTooltip(conn.process || '', tooltipOptions);
+                                                var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
+                                                                "PID: " + (conn.pid || '') + "<br>" +
+                                                                "Remote: " + (conn.remote || '') + "<br>" +
+                                                                "Local: " + (conn.local || '') + "<br>";
+                                                marker.bindPopup(popupHtml);
+                                                liveMarkers.push(marker);
+                                            }
+                                        });
+                                    }
+
+                                    function setStats(s) {
+                                        try {
+                                            var el = document.getElementById('map-stats');
+                                            if (el) { el.innerText = s || ''; }
+                                        } catch(e) {}
+                                    }
+
+                                    // expose to the host Python code
+                                    window.updateConnections = updateConnections;
+                                    window.setStats = setStats;
+                                }
+                            }, 3000);
+                        });
+                    });
                 </script>
             </body>
             </html>
@@ -1858,6 +1960,7 @@ class TCPConnectionViewer(QMainWindow):
         number_of_previous_objects = self.map_objects
         
         self.connections = self.get_active_tcp_connections(slider_position)
+
         
         if len(self.connections) != number_of_previous_objects:
             self.map_redraw = True
