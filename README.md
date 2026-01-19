@@ -32,6 +32,8 @@ You cannot prevent the library from updating the databases.
 You cannot use the GeoLite2 data: for FCRA purposes, to identify specific households or individuals.
 You can read the latest version of GeoLite2 EULA here https://www.maxmind.com/en/geolite2/eula. GeoLite2 database is provided under CC BY-SA 4.0 by MaxMind.
 
+THe map is rendered using OpenStreetMap.org engine. OpenStreetMap data is available under the Open Database License (ODbL) v1.0 for further details please visit: https://www.openstreetmap.org/copyright/ and https://opendatacommons.org/licenses/odbl/1-0/.
+
 * C2_TRACKER 
 C2 Tracker is a free-to-use-community-driven IOC feed that searches to collect IP addresses of known malware/botnet/C2 infrastructure.
 
