@@ -54,8 +54,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayo
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit) 
 from PySide6.QtGui import QIcon, QAction
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
 
 VERSION = "2.8.5" # Current script version
 
@@ -91,6 +92,24 @@ GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TITLE = GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TITL
 GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT = GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT= f"GeoLite2 is created by MaxMind. Please carefully read the GeoLite2 GEOLITE2_LICENSE and GEOLITE2_EULA license files available at https://github.com/sapics/ip-location-db/tree/main/geolite2-city if you use these database.\n\n This package comes with certain restrictions and obligations, most notably:\n\n- You cannot prevent the library from updating the databases..\n\n- You cannot use the GeoLite2 data: \n\n   * for FCRA purposes, \n\n   * to identify specific households or individuals."
 C2_TRACKER_DB_DOWNLOAD_ABOUT_TITLE = "C2-TRACKER Database"
 C2_TRACKER_DB_DOWNLOAD_ABOUT_TEXT = f"C2 Tracker is a free-to-use-community-driven IOC feed that uses Shodan and Censys searches to collect IP addresses of known malware/botnet/C2 infrastructure. Check out: https://github.com/montysecurity/C2-Tracker"
+
+# Leaflet resources configuration
+RESOURCES_DIR = "resources"
+LEAFLET_DIR = os.path.join(RESOURCES_DIR, "leaflet")
+LEAFLET_CSS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+LEAFLET_JS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+LEAFLET_MARKER_RED_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png"
+LEAFLET_MARKER_GREEN_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png"
+LEAFLET_MARKER_BLUE_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png"
+
+LEAFLET_CSS_PATH = os.path.join(LEAFLET_DIR, "leaflet.css")
+LEAFLET_JS_PATH = os.path.join(LEAFLET_DIR, "leaflet.js")
+LEAFLET_MARKER_RED_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-red.png")
+LEAFLET_MARKER_GREEN_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-green.png")
+LEAFLET_MARKER_BLUE_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-blue.png")
+
+LEAFLET_RESOURCES_ABOUT_TITLE = "About Leaflet Resources and pointhi marker icons"
+LEAFLET_RESOURCES_ABOUT_TEXT = """Leaflet is an open-source JavaScript library for interactive maps.\n\nThis application uses:\n- Leaflet library (https://leafletjs.com/)\n- Colored map markers from https://github.com/pointhi/leaflet-color-markers\n\nDownloading these resources locally will:\n- Speed up application startup time\n- Enable offline map functionality\n- Reduce dependency on external CDN availability\n\nBy downloading, you agree to comply with the Leaflet license (BSD 2-Clause) and respective marker icon licenses."""
 
 PROCESS_ROW_INDEX = 0     # Index of the 'Process' column in the table
 PID_ROW_INDEX = 1         # Index of the 'PID' column in the table
@@ -239,8 +258,9 @@ class TCPConnectionViewer(QMainWindow):
 
         self.dns_worker = DNSWorker(ip_cache, cache_lock, on_resolve=_dns_notify)
         self.dns_worker.start()
-        
+
         self.load_databases()
+        self._check_and_download_leaflet_resources()
         self.init_ui()
         self.load_settings()
        
@@ -1087,9 +1107,27 @@ class TCPConnectionViewer(QMainWindow):
         self.map_view = QWebEngineView()
         self.map_view.setMinimumSize(MAP_TABLE_MIN_WIDTH, MAP_TABLE_MIN_HEIGHT)
         self.map_view.setHtml("<html><body><h2>Loading map...</h2></body></html>")
+
+        # Enable developer console logging (for debugging)
+        def _on_console_message(level, message, line, source):
+            print(f"[WebEngine Console] {message} (line {line})")
+
+        try:
+            from PySide6.QtWebEngineCore import QWebEnginePage
+
+            class DebugPage(QWebEnginePage):
+                def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+                    print(f"[JS Console] {message} (line {lineNumber} in {sourceID})")
+
+            debug_page = DebugPage(self.map_view)
+            self.map_view.setPage(debug_page)
+        except Exception as e:
+            print(f"Could not enable console logging: {e}")
+
         self.map_redraw = True
         self.map_objects = 0
         self.map_initialized = False
+        self._map_reload_attempts = 0  # Track reload attempts to prevent infinite loops
 
         # Pulse indicator - small green circle that fades in/out on refresh
         self.pulse_indicator = QFrame()
@@ -1354,16 +1392,134 @@ class TCPConnectionViewer(QMainWindow):
                 about_title,
                 about_text
             )
-            
+
             response = QMessageBox.question(
                 self,
                 "Download Required",
                 f"The {db_type} database is either missing or older than {DATABASE_EXPIRE_AFTER_DAYS} days. Downloading means your are accepting database licensing terms by its publisher. Would you like to download it now?",
                 QMessageBox.Yes | QMessageBox.No
             )
-        
+
             if not ACCEPT_EULA and response == QMessageBox.Yes:
                 self.download_database(db_path, download_url)
+
+    def _download_leaflet_file(self, file_path, url, file_description=""):
+        """Download a single Leaflet resource file"""
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+            # Download file
+            response = requests.get(url, stream=True, timeout=30)
+            if response.status_code == 200:
+                # Remove existing file if present
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+                with open(file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+
+                if not ACCEPT_EULA:
+                    print(f"Successfully downloaded {file_description} to {file_path}")
+                else:
+                    print(f"Downloaded {file_description} from {url} to {file_path}.")
+                return True
+            else:
+                raise Exception(f"Failed to download. HTTP Status Code: {response.status_code}")
+        except Exception as e:
+            print(f"Warning: Failed to download {file_description}: {str(e)}")
+            return False
+
+    def _check_and_download_leaflet_resources(self):
+        """Check if Leaflet resources exist locally and download them if missing"""
+        try:
+            # Define resources to check/download
+            resources = [
+                (LEAFLET_CSS_PATH, LEAFLET_CSS_URL, "Leaflet CSS"),
+                (LEAFLET_JS_PATH, LEAFLET_JS_URL, "Leaflet JavaScript"),
+                (LEAFLET_MARKER_RED_PATH, LEAFLET_MARKER_RED_URL, "Red marker icon"),
+                (LEAFLET_MARKER_GREEN_PATH, LEAFLET_MARKER_GREEN_URL, "Green marker icon"),
+                (LEAFLET_MARKER_BLUE_PATH, LEAFLET_MARKER_BLUE_URL, "Blue marker icon"),
+            ]
+
+            # Check which resources are missing
+            missing_resources = []
+            for file_path, url, description in resources:
+                if not os.path.exists(file_path):
+                    missing_resources.append((file_path, url, description))
+
+            # If all resources exist, no action needed
+            if not missing_resources:
+                return
+
+            # Determine if we should download automatically or prompt
+            should_download = ACCEPT_EULA
+
+            if not ACCEPT_EULA:
+                # Show information dialog
+                QMessageBox.about(
+                    self,
+                    LEAFLET_RESOURCES_ABOUT_TITLE,
+                    LEAFLET_RESOURCES_ABOUT_TEXT
+                )
+
+                # Ask user if they want to download
+                response = QMessageBox.question(
+                    self,
+                    "Download Leaflet Resources?",
+                    f"Would you like to download {len(missing_resources)} Leaflet resource file(s) locally?\n\n"
+                    f"This will speed up application startup and enable offline map functionality.\n\n"
+                    f"Files will be saved to: {LEAFLET_DIR}",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+
+                should_download = (response == QMessageBox.Yes)
+
+            # Download resources if approved
+            if should_download:
+                # Ensure directory exists
+                os.makedirs(LEAFLET_DIR, exist_ok=True)
+
+                success_count = 0
+                fail_count = 0
+
+                for file_path, url, description in missing_resources:
+                    if self._download_leaflet_file(file_path, url, description):
+                        success_count += 1
+                    else:
+                        fail_count += 1
+
+                # Show summary if not in auto-accept mode
+                if not ACCEPT_EULA:
+                    if fail_count == 0:
+                        QMessageBox.information(
+                            self,
+                            "Download Complete",
+                            f"Successfully downloaded {success_count} Leaflet resource file(s) to {LEAFLET_DIR}\n\n"
+                            f"The application will now use local resources for faster startup and offline support."
+                        )
+                    else:
+                        QMessageBox.warning(
+                            self,
+                            "Download Partially Complete",
+                            f"Downloaded {success_count} file(s) successfully.\n"
+                            f"Failed to download {fail_count} file(s).\n\n"
+                            f"The application will fall back to CDN for missing resources."
+                        )
+                else:
+                    print(f"Leaflet resources download complete: {success_count} succeeded, {fail_count} failed.")
+
+        except Exception as e:
+            error_msg = f"Error checking/downloading Leaflet resources: {str(e)}"
+            print(error_msg)
+            if not ACCEPT_EULA:
+                QMessageBox.warning(
+                    self,
+                    "Leaflet Resources Error",
+                    f"{error_msg}\n\nThe application will use CDN resources instead."
+                )
 
             connections = []
             
@@ -1662,39 +1818,58 @@ class TCPConnectionViewer(QMainWindow):
     def _call_update_js(self, js, connection_data=None, force_show_tooltip=False, retries=10, delay_ms=200):
         """
         Safely call JS updater by first checking that `window.updateConnections` is defined.
-        Retries a few times with a delay; if exhausted, force a reload of the map HTML and retry.
+        Retries a few times with a delay; shows error if function never becomes available.
         """
 
         try:
             check_expr = "typeof window.updateConnections === 'function';"
 
-            def _on_check(result, retries=retries):
+            # Use a list to create a mutable container for retries (closure-friendly)
+            retries_remaining = [retries]
+
+            def _on_check(result):
                 if result:
                     try:
                         self.map_view.page().runJavaScript(js)
                         self._pulse_map_indicator()
-                    except Exception:
-                        # best-effort; if run fails, attempt a reload to recover
-                        self.map_initialized = False
-                        self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
-                        QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
+                        # Reset reload counter on successful call
+                        try:
+                            self._map_reload_attempts = 0
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        # Log error but don't reload to prevent infinite loop
+                        print(f"[ERROR] Failed to execute map update JS: {e}")
+                        try:
+                            self.status_label.setText("Map update failed. Try refreshing manually.")
+                        except Exception:
+                            pass
                 else:
-                    if retries <= 0:
-                        # give up and reinit the page once
-                        self.map_initialized = False
-                        self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
-                        QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
+                    # Decrement retries
+                    retries_remaining[0] -= 1
+
+                    if retries_remaining[0] <= 0:
+                        # Give up - show error instead of reloading
+                        print("[WARNING] Map initialization failed - updateConnections function not found (exhausted retries)")
+                        try:
+                            self.status_label.setText("Map failed to initialize. Check network connection or local resources.")
+                        except Exception:
+                            pass
+                        # DON'T reload here - that causes infinite loop
                     else:
-                        # schedule another existence check
-                        QTimer.singleShot(delay_ms, lambda: self._call_update_js(js, connection_data, force_show_tooltip, retries - 1, delay_ms))
+                        # schedule another existence check with same closure
+                        print(f"[DEBUG] Retrying map initialization ({retries_remaining[0]} attempts remaining)")
+                        QTimer.singleShot(delay_ms, lambda: self.map_view.page().runJavaScript(check_expr, _on_check))
 
             # run the check asynchronously; _on_check will be called with the boolean result
             self.map_view.page().runJavaScript(check_expr, _on_check)
-        except Exception:
-            # fallback: reinitialize the page and retry update_map
-            self.map_initialized = False
-            self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
-            QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip))
+        except Exception as e:
+            # Log error but don't reload to prevent infinite loop
+            print(f"[ERROR] Exception in _call_update_js: {e}")
+            try:
+                self.status_label.setText("Map error occurred.")
+            except Exception:
+                pass
 
     def update_map(self, connection_data, force_show_tooltip=False, stats_text=""):
         """
@@ -1705,6 +1880,23 @@ class TCPConnectionViewer(QMainWindow):
         data_json = json.dumps(connection_data)
         # Send stats_text to JS via setStats(...) helper
         js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}); setStats({json.dumps(stats_text)});"
+
+        # Check reload attempt limit to prevent infinite loops
+        if not getattr(self, "map_initialized", False):
+            # Prevent infinite reload loop
+            if getattr(self, "_map_reload_attempts", 0) >= 3:
+                print("[ERROR] Max map reload attempts (3) reached. Stopping to prevent infinite loop.")
+                try:
+                    self.status_label.setText("Map failed to load after 3 attempts. Try restarting the application.")
+                except Exception:
+                    pass
+                return
+
+            try:
+                self._map_reload_attempts += 1
+                print(f"[DEBUG] Map load attempt {self._map_reload_attempts}/3")
+            except Exception:
+                self._map_reload_attempts = 1
 
         # If not initialized, load the full HTML and wait for loadFinished before calling JS
         if not getattr(self, "map_initialized", False):
@@ -1760,20 +1952,59 @@ class TCPConnectionViewer(QMainWindow):
                         onerror="try{injectLocalLeaflet(true);}catch(e){}"></script>
 
                 <script>
-                    // Try to resolve an image URL; fall back to local if remote unavailable
+                    // Try local file first, fall back to remote CDN if local unavailable
                     function resolveImageUrl(remoteUrl, localUrl, cb, timeoutMs) {
-                        timeoutMs = timeoutMs || 2000;
+                        timeoutMs = timeoutMs || 1000;
                         try {
                             var img = new Image();
                             var done = false;
+                            // Try LOCAL first
                             var t = setTimeout(function(){
                                 if (done) return;
                                 done = true;
-                                cb(localUrl);
+                                // Local timed out, try remote
+                                tryRemote();
                             }, timeoutMs);
-                            img.onload = function(){ if (done) return; done = true; clearTimeout(t); cb(remoteUrl); };
-                            img.onerror = function(){ if (done) return; done = true; clearTimeout(t); cb(localUrl); };
-                            img.src = remoteUrl;
+                            img.onload = function(){ 
+                                if (done) return; 
+                                done = true; 
+                                clearTimeout(t); 
+                                cb(localUrl);  // Local succeeded!
+                            };
+                            img.onerror = function(){ 
+                                if (done) return; 
+                                done = true; 
+                                clearTimeout(t); 
+                                tryRemote();  // Local failed, try remote
+                            };
+                            img.src = localUrl;  // Try LOCAL first
+
+                            function tryRemote() {
+                                try {
+                                    var remoteImg = new Image();
+                                    var remoteDone = false;
+                                    var remoteTimeout = setTimeout(function(){
+                                        if (remoteDone) return;
+                                        remoteDone = true;
+                                        cb(localUrl);  // Remote also failed, use local path anyway
+                                    }, 3000);
+                                    remoteImg.onload = function(){
+                                        if (remoteDone) return;
+                                        remoteDone = true;
+                                        clearTimeout(remoteTimeout);
+                                        cb(remoteUrl);
+                                    };
+                                    remoteImg.onerror = function(){
+                                        if (remoteDone) return;
+                                        remoteDone = true;
+                                        clearTimeout(remoteTimeout);
+                                        cb(localUrl);  // Both failed, use local path
+                                    };
+                                    remoteImg.src = remoteUrl;
+                                } catch(e) {
+                                    cb(localUrl);
+                                }
+                            }
                         } catch(e) {
                             try { cb(localUrl); } catch(_) {}
                         }
@@ -1799,7 +2030,12 @@ class TCPConnectionViewer(QMainWindow):
 
                     waitForLeaflet(function() {
                         // Prepare remote and local icon URLs
-                        var localBase = (window._local_leaflet_resources ? window._local_leaflet_resources : 'resources/leaflet/');
+                        // Determine the script directory for local resources
+                        var localBase = 'resources/leaflet/';
+
+                        // Debug: log the local base path
+                        console.log('Local resource base:', localBase);
+
                         var iconsToResolve = {
                             red: {
                                 remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
@@ -1832,10 +2068,14 @@ class TCPConnectionViewer(QMainWindow):
                                     };
 
                                     // initialize map AFTER icons resolved
+                                    console.log('Initializing map with icons:', resolved);
                                     var map = L.map('map').setView([20, 0], 2);
+                                    console.log('Map created successfully');
+
                                     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                                         attribution: '&copy; OpenStreetMap contributors'
                                     }).addTo(map);
+                                    console.log('Tile layer added successfully');
 
                                     var liveMarkers = [];
 
@@ -1882,8 +2122,111 @@ class TCPConnectionViewer(QMainWindow):
             </body>
             </html>
             """
-            # load the HTML and call updateConnections only after loadFinished
-            self.map_view.setHtml(html_content)
+            # Inject the script directory path into the HTML so JS can build absolute file:// URLs
+            # Use "about:blank" as base URL to allow external HTTPS resources (OSM tiles, CDN)
+            import pathlib
+            from PySide6.QtCore import QUrl
+
+            script_dir = pathlib.Path(__file__).parent.resolve()
+            # Convert Windows backslashes to forward slashes and build file:// URL
+            local_resources_path = str(script_dir / "resources" / "leaflet").replace("\\", "/")
+
+            # Debug: print the path being injected
+            print(f"[DEBUG] Injecting local resources path: file:///{local_resources_path}/")
+
+            # Inject the local path into JavaScript (for both markers AND Leaflet library)
+            html_with_path = html_content.replace(
+                "var localBase = 'resources/leaflet/';",
+                f"var localBase = 'file:///{local_resources_path}/';"
+            )
+
+            # Also inject absolute paths for Leaflet CSS and JS in injectLocalLeaflet function
+            html_with_path = html_with_path.replace(
+                "link.href = 'resources/leaflet/leaflet.css';",
+                f"link.href = 'file:///{local_resources_path}/leaflet.css';"
+            )
+            html_with_path = html_with_path.replace(
+                "s.src = 'resources/leaflet/leaflet.js';",
+                f"s.src = 'file:///{local_resources_path}/leaflet.js';"
+            )
+
+            # Debug: verify the replacement worked
+            if "file:///" in html_with_path:
+                print("[DEBUG] Path injection successful")
+            else:
+                print("[WARNING] Path injection may have failed!")
+
+            # Try to read local Leaflet files for offline support
+            leaflet_js_content = ""
+            leaflet_css_content = ""
+
+            try:
+                # Read local Leaflet JavaScript
+                leaflet_js_path = script_dir / "resources" / "leaflet" / "leaflet.js"
+                if leaflet_js_path.exists():
+                    with open(leaflet_js_path, 'r', encoding='utf-8') as f:
+                        leaflet_js_content = f.read()
+                    print("[DEBUG] Loaded local leaflet.js successfully")
+                else:
+                    print(f"[WARNING] Local leaflet.js not found at {leaflet_js_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to read local leaflet.js: {e}")
+
+            try:
+                # Read local Leaflet CSS
+                leaflet_css_path = script_dir / "resources" / "leaflet" / "leaflet.css"
+                if leaflet_css_path.exists():
+                    with open(leaflet_css_path, 'r', encoding='utf-8') as f:
+                        leaflet_css_content = f.read()
+                    print("[DEBUG] Loaded local leaflet.css successfully")
+                else:
+                    print(f"[WARNING] Local leaflet.css not found at {leaflet_css_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to read local leaflet.css: {e}")
+
+            # Inject local Leaflet library as inline fallback if available
+            if leaflet_js_content:
+                # Add inline script fallback after CDN script
+                html_with_path = html_with_path.replace(
+                    '<!-- CDN script with onerror fallback to local bundle -->',
+                    f'''<!-- CDN script with onerror fallback to local bundle -->
+                    <script id="leaflet-inline-fallback">
+                    // If CDN fails, this inline version will be used
+                    (function() {{
+                        var cdnScript = document.querySelector('script[src*="unpkg.com/leaflet"]');
+                        if (cdnScript) {{
+                            cdnScript.onerror = function() {{
+                                console.log('[OFFLINE] CDN failed, using inline Leaflet library');
+                                try {{
+                                    // Remove the failed CDN script
+                                    cdnScript.parentNode.removeChild(cdnScript);
+                                    // Inline Leaflet library will load after this
+                                }} catch(e) {{
+                                    console.error('[OFFLINE] Error handling CDN failure:', e);
+                                }}
+                            }};
+                        }}
+                    }})();
+                    </script>
+                    <!-- Inline Leaflet JS (loaded from local file) -->
+                    <script id="leaflet-local-inline">
+                    {leaflet_js_content}
+                    </script>'''
+                )
+
+            if leaflet_css_content:
+                # Add inline CSS fallback
+                html_with_path = html_with_path.replace(
+                    '</head>',
+                    f'''<!-- Inline Leaflet CSS (loaded from local file) -->
+                    <style id="leaflet-local-inline-css">
+                    {leaflet_css_content}
+                    </style>
+                    </head>'''
+                )
+
+            # Use about:blank as base URL (doesn't block HTTPS requests)
+            self.map_view.setHtml(html_with_path, QUrl("about:blank"))
 
             def _on_loaded(ok):
                 # run update if the page loaded successfully
@@ -1907,11 +2250,13 @@ class TCPConnectionViewer(QMainWindow):
         # If already initialized, call the JS updater using safe caller
         try:
             self._call_update_js(js, connection_data, force_show_tooltip)
-        except Exception:
-            # fallback: force reinitialize on failure
-            self.map_initialized = False
-            self.map_view.setHtml("<html><body><h2>Reloading map...</h2></body></html>")
-            QTimer.singleShot(200, lambda: self.update_map(connection_data, force_show_tooltip, stats_text))
+        except Exception as e:
+            # Log error but don't reload to prevent infinite loop
+            print(f"[ERROR] Exception when calling _call_update_js on initialized map: {e}")
+            try:
+                self.status_label.setText("Map update error occurred.")
+            except Exception:
+                pass
 
     def replay_connections(self):
 
@@ -2045,6 +2390,9 @@ class TCPConnectionViewer(QMainWindow):
     def on_map_loaded(self, success):
         if not success:
             self.status_label.setText("Error loading map")
+            print("[ERROR] Map failed to load!")
+        else:
+            print("[DEBUG] Map page loaded successfully")
 
     def showEvent(self, event):
         """Apply pending fullscreen/maximize restore on first real show.
