@@ -8,7 +8,7 @@ If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by d
 
 # Why use tcp_geo_map.py?
 Ever wondered, is this machine clean? To what endpoints and geographical destination is this host connecting to such as to sending telemetry or simply understand this machine "network" behavior based on what processes (running programs) on it? 
-This script UI shows on the earth map live network connections made and will warn based on the C2-Tracker list maintained by montysecurity if the machine connects to a suspicious C2 endpoint.
+This GeoInt OSINT script UI shows on the earth map live network connections made and will warn based on the C2-Tracker list maintained by montysecurity if the machine connects to a suspicious C2 endpoint.
 
 # Tested on
 - (Kali) Linux
