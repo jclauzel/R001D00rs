@@ -57,7 +57,7 @@ When --accept_eula is passed the databases will be downloaded automatically when
 # Offline / Telemetry reduction
 Access to tile.openstreetmap.org is required to render the map so internet access is required to that site.
 When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img as well as https://unpkg.com/leaflet and will prompt you to cache them locally into /resources/leaflet/ in order to speed up next startup time.  You can also use the script download_resources.ps1 powershell script located in resources\leaflet directory  to download the below files independently.
-If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the TILE_OPENSTREETMAP_SERVER constant variable defined in the script though I have not tested this setup myself. 
+If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the TILE_OPENSTREETMAP_SERVER constant variable defined in the tcp_geo_map.py script though I have not tested this setup myself. 
 
 
 # Persistent IP DNS reverse cache file
@@ -170,10 +170,23 @@ Other settings that you may tweak in the script itself:
 Set to True to turn on and speedup script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
 
 * IP_DNS_NAME_CACHE_FILE = "ip_cache.json"
-If PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the script will save and load from disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application start it will reload this cache to speed up startup time and name resolution of the script.
+If PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the script will save and load from disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application start it will reload this cache to speed up startup time and name resolution of the tcp_geo_map.py script.
 
 * DATABASE_EXPIRE_AFTER_DAYS = 7
 Databases expiration time in days from the last download date, default 7 days (1 week)
+
+# Troubleshooting
+The script can spew additional information by changing in the tcp_geo_map.py:
+
+logging.basicConfig(
+
+    level=logging.WARNING,
+    
+by
+
+logging.basicConfig(
+
+    level=logging.DEBUG,
 
 # Known limitations
 - Proxies since this is where the remote IP address is.
