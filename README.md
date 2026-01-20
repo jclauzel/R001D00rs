@@ -17,7 +17,6 @@ This GeoInt OSINT script UI shows on the earth map live network connections made
 ![til](./pictures/tcp_geo_map_demo.gif)
 
 # Contributors & Attribution
-
 * This script uses GeoLite2 geo database to render the remote IP location using OpenStreetMap/leaflet/folium check out: https://github.com/sapics/ip-location-db/tree/main/geolite2-city
 
 When prompted for download and agreed the script will fetch the following two files and save them in the database subfolder:
@@ -51,8 +50,8 @@ When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI w
 Databases are considered as obsolete after a week, and you will be prompted to refresh it.
 
 # Avoiding prompts
-You can start the script by passing --accept_eula (Accept End User License Agreement) this means you agree, approve to follow all the licensing terms of all contributors and attributions including GeoLite2/MaxMind, C2_TRACKER, PySide6, psutil, folium / OpenStreetMap. 
-When --accept_eula is passed the databases will be downloaded automatically when they expire (by default every 7 days).
+You can start the script by passing --accept_eula (Accept End User License Agreement) this means you agree, approve to follow all the licensing terms of all contributors and attributions including GeoLite2/MaxMind, C2_TRACKER, PySide6, psutil, folium / OpenStreetMap / Leaflet. 
+When --accept_eula is passed the databases will be downloaded automatically when they expire (by default every 7 days) and the /resources/leaflet/ files cache will be populated automatically as well to speedup startup time and reduce telemetry footprint this means you agree as well with leaflet and https://github.com/pointhi/leaflet-color-markers licensing agreements.
 
 # Offline / Telemetry reduction
 Access to tile.openstreetmap.org is required to render the map so internet access is required to that site.
