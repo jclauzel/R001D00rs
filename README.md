@@ -54,9 +54,11 @@ Databases are considered as obsolete after a week, and you will be prompted to r
 You can start the script by passing --accept_eula (Accept End User License Agreement) this means you agree, approve to follow all the licensing terms of all contributors and attributions including GeoLite2/MaxMind, C2_TRACKER, PySide6, psutil, folium / OpenStreetMap. 
 When --accept_eula is passed the databases will be downloaded automatically when they expire (by default every 7 days).
 
-# Telemetry/Internet Access
-When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img so internet access is required.
-Calls to tile.openstreetmap.org are also perfomed.
+# Offline / Telemetry reduction
+Access to tile.openstreetmap.org is required to render the map so internet access is required to that site.
+When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img as well as https://unpkg.com/leaflet and will prompt you to cache them locally into /resources/leaflet/ in order to speed up next startup time.  You can also use the script download_resources.ps1 powershell script located in resources\leaflet directory  to download the below files independently.
+If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the TILE_OPENSTREETMAP_SERVER constant variable defined in the script though I have not tested this setup myself. 
+
 
 # Persistent IP DNS reverse cache file
 PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False set to True to turn on and speedup the script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
