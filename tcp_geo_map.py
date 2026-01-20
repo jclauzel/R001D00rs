@@ -100,6 +100,9 @@ GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT = GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT=
 C2_TRACKER_DB_DOWNLOAD_ABOUT_TITLE = "C2-TRACKER Database"
 C2_TRACKER_DB_DOWNLOAD_ABOUT_TEXT = f"C2 Tracker is a free-to-use-community-driven IOC feed that uses Shodan and Censys searches to collect IP addresses of known malware/botnet/C2 infrastructure. Check out: https://github.com/montysecurity/C2-Tracker"
 
+# OpenStreetMap tile server configuration
+TILE_OPENSTREETMAP_SERVER = "tile.openstreetmap.org"
+
 # Leaflet resources configuration
 RESOURCES_DIR = "resources"
 LEAFLET_DIR = os.path.join(RESOURCES_DIR, "leaflet")
@@ -2079,7 +2082,7 @@ class TCPConnectionViewer(QMainWindow):
                                     var map = L.map('map').setView([20, 0], 2);
                                     console.log('Map created successfully');
 
-                                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                                    L.tileLayer('https://{s}.""" + TILE_OPENSTREETMAP_SERVER + """/{z}/{x}/{y}.png', {
                                         attribution: '&copy; OpenStreetMap contributors'
                                     }).addTo(map);
                                     console.log('Tile layer added successfully');
