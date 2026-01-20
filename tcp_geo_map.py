@@ -48,8 +48,15 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
     pip3 install pyside6 requests maxminddb 
 """
 
-import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue
+import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, logging
 from concurrent.futures import ThreadPoolExecutor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit) 
@@ -58,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.8.5" # Current script version
+VERSION = "2.8.6" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -1110,19 +1117,19 @@ class TCPConnectionViewer(QMainWindow):
 
         # Enable developer console logging (for debugging)
         def _on_console_message(level, message, line, source):
-            print(f"[WebEngine Console] {message} (line {line})")
+            logging.debug(f"[WebEngine Console] {message} (line {line})")
 
         try:
             from PySide6.QtWebEngineCore import QWebEnginePage
 
             class DebugPage(QWebEnginePage):
                 def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
-                    print(f"[JS Console] {message} (line {lineNumber} in {sourceID})")
+                    logging.debug(f"[JS Console] {message} (line {lineNumber} in {sourceID})")
 
             debug_page = DebugPage(self.map_view)
             self.map_view.setPage(debug_page)
         except Exception as e:
-            print(f"Could not enable console logging: {e}")
+            logging.warning(f"Could not enable console logging: {e}")
 
         self.map_redraw = True
         self.map_objects = 0
@@ -1349,7 +1356,7 @@ class TCPConnectionViewer(QMainWindow):
                         f"Successfully downloaded GeoLite2 database to {db_path}"
                     )
                 else:
-                    print(f"Downloaded database {url} to {db_path}. This means you FULLY AGREE with the database' EULA and their liceensing terms.")
+                    logging.info(f"Downloaded database {url} to {db_path}. This means you FULLY AGREE with the database' EULA and their liceensing terms.")
             else:
                 raise Exception(f"Failed to download. HTTP Status Code: {response.status_code}")
         except Exception as e:
@@ -1422,14 +1429,14 @@ class TCPConnectionViewer(QMainWindow):
                             f.write(chunk)
 
                 if not ACCEPT_EULA:
-                    print(f"Successfully downloaded {file_description} to {file_path}")
+                    logging.info(f"Successfully downloaded {file_description} to {file_path}")
                 else:
-                    print(f"Downloaded {file_description} from {url} to {file_path}.")
+                    logging.info(f"Downloaded {file_description} from {url} to {file_path}.")
                 return True
             else:
                 raise Exception(f"Failed to download. HTTP Status Code: {response.status_code}")
         except Exception as e:
-            print(f"Warning: Failed to download {file_description}: {str(e)}")
+            logging.warning(f"Failed to download {file_description}: {str(e)}")
             return False
 
     def _check_and_download_leaflet_resources(self):
@@ -1509,11 +1516,11 @@ class TCPConnectionViewer(QMainWindow):
                             f"The application will fall back to CDN for missing resources."
                         )
                 else:
-                    print(f"Leaflet resources download complete: {success_count} succeeded, {fail_count} failed.")
+                    logging.info(f"Leaflet resources download complete: {success_count} succeeded, {fail_count} failed.")
 
         except Exception as e:
             error_msg = f"Error checking/downloading Leaflet resources: {str(e)}"
-            print(error_msg)
+            logging.error(error_msg)
             if not ACCEPT_EULA:
                 QMessageBox.warning(
                     self,
@@ -1839,7 +1846,7 @@ class TCPConnectionViewer(QMainWindow):
                             pass
                     except Exception as e:
                         # Log error but don't reload to prevent infinite loop
-                        print(f"[ERROR] Failed to execute map update JS: {e}")
+                        logging.error(f"Failed to execute map update JS: {e}")
                         try:
                             self.status_label.setText("Map update failed. Try refreshing manually.")
                         except Exception:
@@ -1850,7 +1857,7 @@ class TCPConnectionViewer(QMainWindow):
 
                     if retries_remaining[0] <= 0:
                         # Give up - show error instead of reloading
-                        print("[WARNING] Map initialization failed - updateConnections function not found (exhausted retries)")
+                        logging.warning("Map initialization failed - updateConnections function not found (exhausted retries)")
                         try:
                             self.status_label.setText("Map failed to initialize. Check network connection or local resources.")
                         except Exception:
@@ -1858,14 +1865,14 @@ class TCPConnectionViewer(QMainWindow):
                         # DON'T reload here - that causes infinite loop
                     else:
                         # schedule another existence check with same closure
-                        print(f"[DEBUG] Retrying map initialization ({retries_remaining[0]} attempts remaining)")
+                        logging.debug(f"Retrying map initialization ({retries_remaining[0]} attempts remaining)")
                         QTimer.singleShot(delay_ms, lambda: self.map_view.page().runJavaScript(check_expr, _on_check))
 
             # run the check asynchronously; _on_check will be called with the boolean result
             self.map_view.page().runJavaScript(check_expr, _on_check)
         except Exception as e:
             # Log error but don't reload to prevent infinite loop
-            print(f"[ERROR] Exception in _call_update_js: {e}")
+            logging.error(f"Exception in _call_update_js: {e}")
             try:
                 self.status_label.setText("Map error occurred.")
             except Exception:
@@ -1885,7 +1892,7 @@ class TCPConnectionViewer(QMainWindow):
         if not getattr(self, "map_initialized", False):
             # Prevent infinite reload loop
             if getattr(self, "_map_reload_attempts", 0) >= 3:
-                print("[ERROR] Max map reload attempts (3) reached. Stopping to prevent infinite loop.")
+                logging.error("Max map reload attempts (3) reached. Stopping to prevent infinite loop.")
                 try:
                     self.status_label.setText("Map failed to load after 3 attempts. Try restarting the application.")
                 except Exception:
@@ -1894,7 +1901,7 @@ class TCPConnectionViewer(QMainWindow):
 
             try:
                 self._map_reload_attempts += 1
-                print(f"[DEBUG] Map load attempt {self._map_reload_attempts}/3")
+                logging.debug(f"Map load attempt {self._map_reload_attempts}/3")
             except Exception:
                 self._map_reload_attempts = 1
 
@@ -2131,8 +2138,8 @@ class TCPConnectionViewer(QMainWindow):
             # Convert Windows backslashes to forward slashes and build file:// URL
             local_resources_path = str(script_dir / "resources" / "leaflet").replace("\\", "/")
 
-            # Debug: print the path being injected
-            print(f"[DEBUG] Injecting local resources path: file:///{local_resources_path}/")
+            # Debug: log the path being injected
+            logging.debug(f"Injecting local resources path: file:///{local_resources_path}/")
 
             # Inject the local path into JavaScript (for both markers AND Leaflet library)
             html_with_path = html_content.replace(
@@ -2152,9 +2159,9 @@ class TCPConnectionViewer(QMainWindow):
 
             # Debug: verify the replacement worked
             if "file:///" in html_with_path:
-                print("[DEBUG] Path injection successful")
+                logging.debug("Path injection successful")
             else:
-                print("[WARNING] Path injection may have failed!")
+                logging.warning("Path injection may have failed!")
 
             # Try to read local Leaflet files for offline support
             leaflet_js_content = ""
@@ -2166,11 +2173,11 @@ class TCPConnectionViewer(QMainWindow):
                 if leaflet_js_path.exists():
                     with open(leaflet_js_path, 'r', encoding='utf-8') as f:
                         leaflet_js_content = f.read()
-                    print("[DEBUG] Loaded local leaflet.js successfully")
+                    logging.debug("Loaded local leaflet.js successfully")
                 else:
-                    print(f"[WARNING] Local leaflet.js not found at {leaflet_js_path}")
+                    logging.warning(f"Local leaflet.js not found at {leaflet_js_path}")
             except Exception as e:
-                print(f"[ERROR] Failed to read local leaflet.js: {e}")
+                logging.error(f"Failed to read local leaflet.js: {e}")
 
             try:
                 # Read local Leaflet CSS
@@ -2178,11 +2185,11 @@ class TCPConnectionViewer(QMainWindow):
                 if leaflet_css_path.exists():
                     with open(leaflet_css_path, 'r', encoding='utf-8') as f:
                         leaflet_css_content = f.read()
-                    print("[DEBUG] Loaded local leaflet.css successfully")
+                    logging.debug("Loaded local leaflet.css successfully")
                 else:
-                    print(f"[WARNING] Local leaflet.css not found at {leaflet_css_path}")
+                    logging.warning(f"Local leaflet.css not found at {leaflet_css_path}")
             except Exception as e:
-                print(f"[ERROR] Failed to read local leaflet.css: {e}")
+                logging.error(f"Failed to read local leaflet.css: {e}")
 
             # Inject local Leaflet library as inline fallback if available
             if leaflet_js_content:
@@ -2252,7 +2259,7 @@ class TCPConnectionViewer(QMainWindow):
             self._call_update_js(js, connection_data, force_show_tooltip)
         except Exception as e:
             # Log error but don't reload to prevent infinite loop
-            print(f"[ERROR] Exception when calling _call_update_js on initialized map: {e}")
+            logging.error(f"Exception when calling _call_update_js on initialized map: {e}")
             try:
                 self.status_label.setText("Map update error occurred.")
             except Exception:
@@ -2390,9 +2397,9 @@ class TCPConnectionViewer(QMainWindow):
     def on_map_loaded(self, success):
         if not success:
             self.status_label.setText("Error loading map")
-            print("[ERROR] Map failed to load!")
+            logging.error("Map failed to load!")
         else:
-            print("[DEBUG] Map page loaded successfully")
+            logging.debug("Map page loaded successfully")
 
     def showEvent(self, event):
         """Apply pending fullscreen/maximize restore on first real show.
