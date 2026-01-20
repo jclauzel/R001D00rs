@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.8.6" # Current script version
+VERSION = "2.8.7" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
