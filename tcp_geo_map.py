@@ -150,6 +150,8 @@ show_only_remote_connections = False # Hide local connections (ie 127.0.0.1 ::1)
 table_column_sort_index = -1  # Default column index to sort the table by the index
 table_column_sort_reverse = False  # Default sort order
 do_reverse_dns = False  # Set to True to enable reverse DNS lookups
+do_resolve_public_ip = False  # Set to True to resolve public IP addresses to hostnames (may slow down refresh)
+do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
 do_c2_check = False    # Set to True to enable C2-TRACKER checks
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
@@ -352,7 +354,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, do_resolve_public_ip
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -360,6 +362,7 @@ class TCPConnectionViewer(QMainWindow):
             'show_only_new_active_connections': show_only_new_active_connections,
             'show_only_remote_connections': show_only_remote_connections,
             'do_reverse_dns': do_reverse_dns,
+            'do_resolve_public_ip': do_resolve_public_ip,
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
@@ -413,13 +416,14 @@ class TCPConnectionViewer(QMainWindow):
                     settings = json.load(f)
 
                     # Apply loaded settings
-                    global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse
+                    global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, do_resolve_public_ip
 
                     max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
                     do_c2_check = settings.get('do_c2_check', do_c2_check)
                     show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
                     show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
                     do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
+                    do_resolve_public_ip = settings.get('do_resolve_public_ip', do_resolve_public_ip)
 
                     map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
                     self.refresh_interval_combo_box.setCurrentText(f"{map_refresh_interval}")
@@ -432,6 +436,7 @@ class TCPConnectionViewer(QMainWindow):
                     self.only_show_remote_connections.setChecked(show_only_remote_connections)
                     self.reverse_dns_check.setChecked(do_reverse_dns)
                     self.c2_check.setChecked(do_c2_check)
+                    self.resolve_public_ip.setChecked(do_resolve_public_ip)
 
                     # Restore splitter states if saved (Base64)
                     try:
@@ -789,6 +794,17 @@ class TCPConnectionViewer(QMainWindow):
         else: 
             self.slider.setToolTip("")
 
+    def update_resolve_public_ip(self):
+        global do_resolve_public_ip
+
+        new_state = self.resolve_public_ip.isChecked()
+        if new_state == True:
+            do_resolve_public_ip = True
+        else:
+            do_resolve_public_ip = False
+
+
+
     def update_reverse_dns(self):
         global do_reverse_dns
 
@@ -797,8 +813,6 @@ class TCPConnectionViewer(QMainWindow):
             do_reverse_dns = True
         else:
             do_reverse_dns = False
-
-        self.refresh_connections()
         
     def update_c2_check(self):
         global do_c2_check
@@ -1242,7 +1256,13 @@ class TCPConnectionViewer(QMainWindow):
         self.only_show_remote_connections = QCheckBox("Hide local connections on left table")
         self.only_show_remote_connections.setChecked(False)
         self.controls_layout.addWidget(self.only_show_remote_connections)    
-        self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)  
+        self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)
+
+        # Resolve public IP using ipfy checkbox
+        self.resolve_public_ip = QCheckBox("Resolve public internet IP using ipfy.com")
+        self.resolve_public_ip.setChecked(False)
+        self.controls_layout.addWidget(self.resolve_public_ip)    
+        self.resolve_public_ip.stateChanged.connect(self.update_resolve_public_ip)        
 
         self.reset_connections_btn = QPushButton("Reset connections")
         self.reset_connections_btn.clicked.connect(self.reset_connections)
@@ -1881,15 +1901,101 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
+    def get_public_ip(self):
+        """Get public IP address using ipify API. Returns empty string on error."""
+        try:
+            response = requests.get('https://api.ipify.org', timeout=5)
+            if response.status_code == 200:
+                return response.text.strip()
+            else:
+                return ""
+        except Exception:
+            return ""
+
     def update_map(self, connection_data, force_show_tooltip=False, stats_text=""):
         """
         Load map HTML once and afterwards update markers via injected JavaScript.
         Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
         """
 
+        if do_resolve_public_ip:
+            try:
+                public_ip = self.get_public_ip()
+                if public_ip:
+                    # Determine IP type
+                    import ipaddress
+                    try:
+                        ip_obj = ipaddress.ip_address(public_ip)
+                        ip_type = "IPv4" if ip_obj.version == 4 else "IPv6"
+                    except Exception:
+                        ip_type = "IPv4"
+
+                    # Get reverse DNS if enabled
+                    dns_name = ""
+                    if do_reverse_dns:
+
+                        # Try to get from cache immediately
+                        global cache_lock, ip_cache
+
+                        if not ip_cache.get(public_ip):
+                        # Enqueue for background resolution
+                            try:
+                                if getattr(self, "dns_worker", None) is not None:
+                                    self.dns_worker.enqueue(public_ip)
+                            except Exception:
+                                pass
+
+
+                        with cache_lock:
+                            cached_name = ip_cache.get(public_ip)
+                            if cached_name:
+                                dns_name = cached_name
+
+                    # Get geolocation
+                    lat = lng = None
+                    try:
+                        if ip_type == "IPv4" and self.reader_ipv4:
+                            res = self.reader_ipv4.get(public_ip)
+                            if res is not None:
+                                lat = res.get('latitude') or res.get('location', {}).get('latitude')
+                                lng = res.get('longitude') or res.get('location', {}).get('longitude')
+                        elif ip_type == "IPv6" and self.reader_ipv6:
+                            res = self.reader_ipv6.get(public_ip)
+                            if res is not None:
+                                lat = res.get('latitude') or res.get('location', {}).get('latitude')
+                                lng = res.get('longitude') or res.get('location', {}).get('longitude')
+                    except Exception:
+                        pass
+
+                    # Only add if we have geolocation
+                    if lat is not None and lng is not None:
+                        display_name = f"Public IP: {public_ip}"
+                        if dns_name:
+                            display_name = f"Public IP: {public_ip} ({dns_name})"
+
+                        connection_data.append({
+                            'process': 'Public IP',
+                            'pid': '',
+                            'suspect': '',
+                            'local': '',
+                            'localport': '',
+                            'remote': display_name,
+                            'remoteport': '',
+                            'name': dns_name,
+                            'ip_type': ip_type,
+                            'lat': lat,
+                            'lng': lng,
+                            'connection': None,
+                            'icon': 'redCircle'
+                        })
+            except Exception:
+                pass
+
         data_json = json.dumps(connection_data)
+        # Determine if we should draw lines from public IP to markers
+        draw_lines = do_resolve_public_ip and do_drawlines_between_local_and_remote
         # Send stats_text to JS via setStats(...) helper
-        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}); setStats({json.dumps(stats_text)});"
+        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)});"
 
         # Check reload attempt limit to prevent infinite loops
         if not getattr(self, "map_initialized", False):
@@ -2082,6 +2188,10 @@ class TCPConnectionViewer(QMainWindow):
                                     var map = L.map('map').setView([20, 0], 2);
                                     console.log('Map created successfully');
 
+                                    // Create custom pane for public IP circle with high z-index (above markers)
+                                    map.createPane('publicIpPane');
+                                    map.getPane('publicIpPane').style.zIndex = 650;  // Above markers (600) but below tooltips (700)
+
                                     L.tileLayer('https://{s}.""" + TILE_OPENSTREETMAP_SERVER + """/{z}/{x}/{y}.png', {
                                         attribution: '&copy; OpenStreetMap contributors'
                                     }).addTo(map);
@@ -2089,7 +2199,7 @@ class TCPConnectionViewer(QMainWindow):
 
                                     var liveMarkers = [];
 
-                                    function updateConnections(conns, showTooltip) {
+                                    function updateConnections(conns, showTooltip, drawLines) {
                                         for (var i=0; i<liveMarkers.length; i++) {
                                             try { map.removeLayer(liveMarkers[i]); } catch(e) {}
                                         }
@@ -2097,21 +2207,64 @@ class TCPConnectionViewer(QMainWindow):
 
                                         if (!conns || !Array.isArray(conns)) { return; }
 
+                                        var publicIpCoords = null;
+                                        var otherMarkerCoords = [];
+
                                         conns.forEach(function(conn) {
                                             if (conn.lat && conn.lng) {
                                                 var iconName = conn.icon || 'greenIcon';
-                                                var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
-                                                var marker = L.marker([conn.lat, conn.lng], { icon: icon }).addTo(map);
-                                                var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
-                                                marker.bindTooltip(conn.process || '', tooltipOptions);
-                                                var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
-                                                                "PID: " + (conn.pid || '') + "<br>" +
-                                                                "Remote: " + (conn.remote || '') + "<br>" +
-                                                                "Local: " + (conn.local || '') + "<br>";
-                                                marker.bindPopup(popupHtml);
-                                                liveMarkers.push(marker);
+
+                                                if (iconName === 'redCircle') {
+                                                    // Create a red circle for public IP - ON TOP OF ALL MARKERS
+                                                    var circle = L.circle([conn.lat, conn.lng], {
+                                                        color: 'red',
+                                                        fillColor: '#f03',
+                                                        fillOpacity: 0.5,
+                                                        radius: 100000,
+                                                        pane: 'publicIpPane'  // Use custom pane with higher z-index
+                                                    }).addTo(map);
+
+                                                    var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
+                                                    circle.bindTooltip(conn.remote || 'Public IP', tooltipOptions);
+
+                                                    var popupHtml = "<b>Public IP</b><br>" +
+                                                                    "IP: " + (conn.remote || '') + "<br>";
+                                                    circle.bindPopup(popupHtml);
+                                                    liveMarkers.push(circle);
+
+                                                    // Save public IP coordinates for line drawing
+                                                    publicIpCoords = [conn.lat, conn.lng];
+                                                } else {
+                                                    // Regular marker
+                                                    var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
+                                                    var marker = L.marker([conn.lat, conn.lng], { icon: icon }).addTo(map);
+                                                    var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
+                                                    marker.bindTooltip(conn.process || '', tooltipOptions);
+                                                    var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
+                                                                    "PID: " + (conn.pid || '') + "<br>" +
+                                                                    "Remote: " + (conn.remote || '') + "<br>" +
+                                                                    "Local: " + (conn.local || '') + "<br>";
+                                                    marker.bindPopup(popupHtml);
+                                                    liveMarkers.push(marker);
+
+                                                    // Save marker coordinates for line drawing
+                                                    otherMarkerCoords.push([conn.lat, conn.lng]);
+                                                }
                                             }
                                         });
+
+                                        // Draw blue lines from public IP to all other markers if enabled
+                                        if (drawLines && publicIpCoords && otherMarkerCoords.length > 0) {
+                                            otherMarkerCoords.forEach(function(markerCoords) {
+                                                var polyline = L.polyline([publicIpCoords, markerCoords], {
+                                                    color: 'blue',
+                                                    weight: 2,
+                                                    opacity: 0.6,
+                                                    dashArray: '5, 10'
+                                                }).addTo(map);
+                                                liveMarkers.push(polyline);
+                                            });
+                                        }
                                     }
 
                                     function setStats(s) {
