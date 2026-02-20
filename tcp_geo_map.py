@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.8.8" # Current script version
+VERSION = "2.9.1" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -149,7 +149,7 @@ show_only_new_active_connections = False # Show only new connections in the tabl
 show_only_remote_connections = False # Hide local connections (ie 127.0.0.1 ::1)
 table_column_sort_index = -1  # Default column index to sort the table by the index
 table_column_sort_reverse = False  # Default sort order
-do_reverse_dns = False  # Set to True to enable reverse DNS lookups
+do_reverse_dns = True  # Set to False to disable reverse DNS lookups
 do_resolve_public_ip = False  # Set to True to resolve public IP addresses to hostnames (may slow down refresh)
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
 do_c2_check = False    # Set to True to enable C2-TRACKER checks
@@ -1401,6 +1401,10 @@ class TCPConnectionViewer(QMainWindow):
         self.right_splitter.setStretchFactor(0, 8)
         self.right_splitter.setStretchFactor(1, 2)
 
+        # Set initial 50/50 split for the vertical splitter (only on first launch)
+        initial_height = 800  # Use initial window height
+        self.right_splitter.setSizes([initial_height // 2, initial_height // 2])
+
         # Allow collapsing for user flexibility (they can minimize the controls if desired)
         self.right_splitter.setCollapsible(0, False)  # Map cannot collapse completely
         self.right_splitter.setCollapsible(1, True)   # Controls can be minimized by user
@@ -2046,6 +2050,7 @@ class TCPConnectionViewer(QMainWindow):
         Load map HTML once and afterwards update markers via injected JavaScript.
         Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
         """
+        display_name = ""
 
         if do_resolve_public_ip:
             try:
@@ -2122,7 +2127,11 @@ class TCPConnectionViewer(QMainWindow):
 
         data_json = json.dumps(connection_data)
         # Determine if we should draw lines from public IP to markers
+
         draw_lines = do_resolve_public_ip and do_drawlines_between_local_and_remote
+        if display_name:
+            stats_text += f" - {display_name}"
+
         # Send stats_text to JS via setStats(...) helper
         js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)});"
 
