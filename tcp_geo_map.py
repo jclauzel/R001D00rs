@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.8.7" # Current script version
+VERSION = "2.8.8" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -347,6 +347,127 @@ class TCPConnectionViewer(QMainWindow):
                     self.show()
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    def changeEvent(self, event):
+        """Handle window state changes (fullscreen, maximize, minimize, etc.)"""
+        try:
+            super().changeEvent(event)
+        except Exception:
+            pass
+
+        try:
+            # Detect window state changes (fullscreen toggle, maximize, etc.)
+            if event.type() == event.WindowStateChange:
+                # Schedule a delayed layout update to ensure proper rendering
+                # This fixes the map overlapping issue when entering fullscreen via double-click
+                QTimer.singleShot(100, self._update_layout_after_state_change)
+        except Exception:
+            pass
+
+    def _update_layout_after_state_change(self):
+        """Force layout recalculation after window state change"""
+        try:
+            # Save current splitter proportions
+            saved_h_sizes = None
+            saved_v_sizes = None
+
+            try:
+                if hasattr(self, 'splitter') and self.splitter is not None:
+                    saved_h_sizes = self.splitter.sizes()
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, 'right_splitter') and self.right_splitter is not None:
+                    saved_v_sizes = self.right_splitter.sizes()
+            except Exception:
+                pass
+
+            # Force process any pending events
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+
+            # Force the central widget to update its geometry first
+            if self.centralWidget():
+                try:
+                    self.centralWidget().updateGeometry()
+                    self.centralWidget().update()
+                except Exception:
+                    pass
+
+            # Force the splitters to recalculate their sizes
+            if hasattr(self, 'splitter') and self.splitter is not None:
+                try:
+                    self.splitter.updateGeometry()
+                    self.splitter.update()
+                except Exception:
+                    pass
+
+            if hasattr(self, 'right_splitter') and self.right_splitter is not None:
+                try:
+                    self.right_splitter.updateGeometry()
+                    self.right_splitter.update()
+                except Exception:
+                    pass
+
+            # Force the map view to update
+            if hasattr(self, 'map_view') and self.map_view is not None:
+                try:
+                    self.map_view.updateGeometry()
+                    self.map_view.update()
+                except Exception:
+                    pass
+
+            # Force controls widget to update
+            if hasattr(self, 'controls_widget') and self.controls_widget is not None:
+                try:
+                    self.controls_widget.updateGeometry()
+                    self.controls_widget.update()
+                except Exception:
+                    pass
+
+            # Restore splitter proportions if we had valid ones
+            # This prevents the splitter from getting corrupted sizes during state changes
+            try:
+                if saved_h_sizes and hasattr(self, 'splitter') and self.splitter is not None:
+                    total = sum(saved_h_sizes)
+                    if total > 0:
+                        self.splitter.setSizes(saved_h_sizes)
+            except Exception:
+                pass
+
+            try:
+                if saved_v_sizes and hasattr(self, 'right_splitter') and self.right_splitter is not None:
+                    total = sum(saved_v_sizes)
+                    if total > 0:
+                        self.right_splitter.setSizes(saved_v_sizes)
+            except Exception:
+                pass
+
+            # Final process events to apply all updates
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        """Handle window resize events to ensure splitters adjust properly"""
+        try:
+            super().resizeEvent(event)
+        except Exception:
+            pass
+
+        try:
+            # Force splitters to refresh after resize
+            if hasattr(self, 'right_splitter') and self.right_splitter is not None:
+                # Ensure the vertical splitter recalculates its child widget sizes
+                QTimer.singleShot(0, lambda: self.right_splitter.refresh() if hasattr(self.right_splitter, 'refresh') else self.right_splitter.update())
         except Exception:
             pass
 
@@ -1272,9 +1393,17 @@ class TCPConnectionViewer(QMainWindow):
         self.right_splitter.addWidget(self.map_view)
         self.right_splitter.addWidget(self.controls_widget)
 
+        # Set minimal minimum heights - just enough to prevent complete overlap but allow user flexibility
+        self.map_view.setMinimumHeight(100)
+        self.controls_widget.setMinimumHeight(50)
+
         # Give the map more initial stretch so it's larger by default
         self.right_splitter.setStretchFactor(0, 8)
         self.right_splitter.setStretchFactor(1, 2)
+
+        # Allow collapsing for user flexibility (they can minimize the controls if desired)
+        self.right_splitter.setCollapsible(0, False)  # Map cannot collapse completely
+        self.right_splitter.setCollapsible(1, True)   # Controls can be minimized by user
 
         # Finally, add the vertical splitter to the right panel layout
         self.right_layout.addWidget(self.right_splitter)
