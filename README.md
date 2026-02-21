@@ -110,7 +110,7 @@ Execute the script:
 
 python .\tcp_geo_map.py
 
-= Note optional as a best practice it is always best to create an vistual environement here is how to do so:
+- Note optional as a best practice it is always best to create an vistual environement here is how to do so:
 
 Windows:
 
