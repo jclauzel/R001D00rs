@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.1" # Current script version
+VERSION = "2.9.2" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -2130,7 +2130,10 @@ class TCPConnectionViewer(QMainWindow):
 
         draw_lines = do_resolve_public_ip and do_drawlines_between_local_and_remote
         if display_name:
-            stats_text += f" - {display_name}"
+            if stats_text:
+                stats_text += f" - {display_name}"
+            else:
+                stats_text = f"{display_name}"
 
         # Send stats_text to JS via setStats(...) helper
         js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)});"
