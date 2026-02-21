@@ -5,6 +5,7 @@ tcp_geo_map.py is a python desktop UI tool that enumerates active TCP connection
 If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by default) users will be warned if the machine running the script connects to a suspected remote IP address. 
 
 "Live network connection snapshots" refresh times can be customized, connections can be replayed and saved...
+When the "Resolve public internet IP address" feature is turned on you can monitor your exit point.
 
 # Why use tcp_geo_map.py?
 Ever wondered, is this machine clean? To what endpoints and geographical destination is this host connecting to such as to sending telemetry or simply understand this machine "network" behavior based on what processes (running programs) on it? 
