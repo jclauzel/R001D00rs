@@ -126,7 +126,7 @@ python .\tcp_geo_map.py
 
 deactivate
 
-- Execute script : python .\tcp_geo_map.py
+
 
 # Features overview
 - Download and install of the MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases are made easy using a driven step-by-step process.
