@@ -105,17 +105,29 @@ pip3 install pyside6 requests maxminddb
 or
 
 pip install -r REQUIREMENTS.txt
+Execute the script:
+python .\tcp_geo_map.py
 
-Note: as a best practice it is always best to create an vistual environement here is how to do so:
-
+Note optional as a best practice it is always best to create an vistual environement here is how to do so:
+Windows:
+cd .\R001D00rs\
 python -m venv R001D00rs
-
-source R001D00rs\Scripts\activate
-
+R001D00rs\Scripts\activate
 pip install -r requirements.txt
+python .\tcp_geo_map.py
+deactivate
+
+Linux:
+python -m venv R001D00rs
+source R001D00rs\Scripts\activate
+pip install -r requirements.txt
+python .\tcp_geo_map.py
+deactivate
 
 
-- Execute script : python tcp_geo_map.py
+
+
+- Execute script : python .\tcp_geo_map.py
 
 # Features overview
 - Download and install of the MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases are made easy using a driven step-by-step process.
