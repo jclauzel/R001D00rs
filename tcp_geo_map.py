@@ -59,13 +59,13 @@ logging.basicConfig(
 )
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit) 
+                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget) 
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.2" # Current script version
+VERSION = "2.9.3" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -149,6 +149,8 @@ show_only_new_active_connections = False # Show only new connections in the tabl
 show_only_remote_connections = False # Hide local connections (ie 127.0.0.1 ::1)
 table_column_sort_index = -1  # Default column index to sort the table by the index
 table_column_sort_reverse = False  # Default sort order
+summary_table_column_sort_index = -1  # Default column index to sort the summary table by the index
+summary_table_column_sort_reverse = False  # Default sort order for summary table
 do_reverse_dns = True  # Set to False to disable reverse DNS lookups
 do_resolve_public_ip = False  # Set to True to resolve public IP addresses to hostnames (may slow down refresh)
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
@@ -475,7 +477,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, do_resolve_public_ip
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -487,6 +489,8 @@ class TCPConnectionViewer(QMainWindow):
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
+            'summary_table_column_sort_index': summary_table_column_sort_index,
+            'summary_table_column_sort_reverse': summary_table_column_sort_reverse,
         }
 
         # Save splitter states (Base64) if available
@@ -537,7 +541,7 @@ class TCPConnectionViewer(QMainWindow):
                     settings = json.load(f)
 
                     # Apply loaded settings
-                    global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, do_resolve_public_ip
+                    global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip
 
                     max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
                     do_c2_check = settings.get('do_c2_check', do_c2_check)
@@ -551,6 +555,8 @@ class TCPConnectionViewer(QMainWindow):
 
                     table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                     table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
+                    summary_table_column_sort_index = settings.get('summary_table_column_sort_index', summary_table_column_sort_index)
+                    summary_table_column_sort_reverse = settings.get('summary_table_column_sort_reverse', summary_table_column_sort_reverse)
                         
                     # Update UI elements if needed
                     self.only_show_new_connections.setChecked(show_only_new_active_connections)
@@ -889,6 +895,84 @@ class TCPConnectionViewer(QMainWindow):
             self.connection_table.insertRow(new_row)
             for c, text in enumerate(row_values):
                 self.connection_table.setItem(new_row, c, QTableWidgetItem(text))
+
+    def on_summary_header_clicked(self, index):
+        """
+        Handles sorting when a summary table column header is clicked.
+
+        Args:
+            index (int): The column index that was clicked.
+        """
+        global summary_table_column_sort_index
+        global summary_table_column_sort_reverse
+
+        if summary_table_column_sort_index == index:
+            if summary_table_column_sort_reverse:
+                summary_table_column_sort_reverse = False
+            else:
+                summary_table_column_sort_reverse = True
+
+        summary_table_column_sort_index = index
+
+        self.sort_summary_table_by_column(index, summary_table_column_sort_reverse)
+
+    def sort_summary_table_by_column(self, column_index, reverse=False):
+        """
+        Sort the summary_table robustly.
+
+        - Snapshot every row as a list of strings.
+        - Detect numeric values for numeric sort (ints/floats).
+        - Fall back to case-insensitive string comparison.
+        - Rebuild the table from the sorted snapshot (stable).
+        - Preserve red highlighting for suspect connections.
+        """
+        # collect snapshot of all rows with their formatting
+        rows = []
+        row_count = self.summary_table.rowCount()
+        col_count = self.summary_table.columnCount()
+
+        for r in range(row_count):
+            row_values = []
+            row_colors = []
+            for c in range(col_count):
+                item = self.summary_table.item(r, c)
+                row_values.append(item.text() if item is not None else "")
+                # Store the foreground color to preserve red highlighting
+                row_colors.append(item.foreground() if item is not None else None)
+
+            # determine key from the sort column
+            raw_key = row_values[column_index] if column_index < len(row_values) else ""
+            # try numeric conversion (int then float)
+            sort_key = raw_key
+            try:
+                if raw_key != "":
+                    if raw_key.isdigit():
+                        sort_key = int(raw_key)
+                    else:
+                        # attempt float parsing after removing common thousands separators
+                        normalized = raw_key.replace(",", "")
+                        sort_key = float(normalized)
+                else:
+                    sort_key = ""  # keep empty strings sorted consistently
+            except Exception:
+                # fallback to case-insensitive string
+                sort_key = raw_key.lower()
+            rows.append((sort_key, row_values, row_colors))
+
+        # stable sort by computed key
+        rows.sort(key=lambda x: x[0], reverse=reverse)
+
+        # repopulate table from sorted snapshot
+        self.summary_table.setRowCount(0)
+        for _, row_values, row_colors in rows:
+            new_row = self.summary_table.rowCount()
+            self.summary_table.insertRow(new_row)
+            for c, text in enumerate(row_values):
+                item = QTableWidgetItem(text)
+                # Restore original color if it was saved
+                if c < len(row_colors) and row_colors[c] is not None:
+                    item.setForeground(row_colors[c])
+                self.summary_table.setItem(new_row, c, item)
 
      # Update connection list when slider changes
     def update_slider_value(self, value):
@@ -1354,37 +1438,6 @@ class TCPConnectionViewer(QMainWindow):
         self.controls_layout.addWidget(self.save_connections_btn)
         self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
 
-        # Reverse DNS checkbox
-        self.reverse_dns_check = QCheckBox("Perform Reverse DNS Lookup on captured IPs")
-        self.reverse_dns_check.setChecked(True)
-        self.controls_layout.addWidget(self.reverse_dns_check)    
-        self.reverse_dns_check.stateChanged.connect(self.update_reverse_dns)
-
-        # C2 Check checkbox
-        self.c2_check = QCheckBox("Perform C2 checks against C2-TRACKER database")
-        self.c2_check.setChecked(False)
-        self.controls_layout.addWidget(self.c2_check)    
-        self.c2_check.stateChanged.connect(self.update_c2_check)
-        self.c2_check.setChecked(True)
-
-        # Only show new connections
-        self.only_show_new_connections = QCheckBox("Only show new connections")
-        self.only_show_new_connections.setChecked(False)
-        self.controls_layout.addWidget(self.only_show_new_connections)    
-        self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)
-        
-        # Hide remote local connections
-        self.only_show_remote_connections = QCheckBox("Hide local connections on left table")
-        self.only_show_remote_connections.setChecked(False)
-        self.controls_layout.addWidget(self.only_show_remote_connections)    
-        self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)
-
-        # Resolve public IP using ipfy checkbox
-        self.resolve_public_ip = QCheckBox("Resolve public internet IP using ipfy.com")
-        self.resolve_public_ip.setChecked(False)
-        self.controls_layout.addWidget(self.resolve_public_ip)    
-        self.resolve_public_ip.stateChanged.connect(self.update_resolve_public_ip)        
-
         self.reset_connections_btn = QPushButton("Reset connections")
         self.reset_connections_btn.clicked.connect(self.reset_connections)
         self.controls_layout.addWidget(self.reset_connections_btn)
@@ -1413,17 +1466,99 @@ class TCPConnectionViewer(QMainWindow):
         self.right_layout.addWidget(self.right_splitter)
 
         self.right_panel.setLayout(self.right_layout)    
-        
+
         # Add panels to main layout
         main_layout.addWidget(self.left_panel, 1)
         main_layout.addWidget(self.right_panel, 2)
-        
-        # central_widget holds the top-level splitter
-        central_widget = QWidget()
-        central_layout = QHBoxLayout(central_widget)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.addWidget(self.splitter)
-        self.setCentralWidget(central_widget)
+
+        # Create Main tab widget that holds the existing splitter-based UI
+        main_tab_widget = QWidget()
+        main_tab_layout = QHBoxLayout(main_tab_widget)
+        main_tab_layout.setContentsMargins(0, 0, 0, 0)
+        main_tab_layout.addWidget(self.splitter)
+
+        # Create Summary tab with aggregated connection statistics
+        summary_tab_widget = QWidget()
+        summary_tab_layout = QVBoxLayout(summary_tab_widget)
+        summary_tab_layout.setContentsMargins(10, 10, 10, 10)
+        summary_tab_layout.setSpacing(10)
+
+        # Add title label
+        summary_title_label = QLabel("Connection Summary Statistics")
+        summary_title_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        summary_tab_layout.addWidget(summary_title_label)
+
+        # Create summary table with 6 columns
+        self.summary_table = QTableWidget(0, 6)
+        self.summary_table.setHorizontalHeaderLabels([
+            "Process", "PID", "C2", "Remote Address", "Name", "Count"
+        ])
+        self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.summary_table.setMinimumHeight(400)
+
+        # Connect the header clicked signal to the summary table sort function
+        self.summary_table.horizontalHeader().sectionClicked.connect(self.on_summary_header_clicked)
+
+        summary_tab_layout.addWidget(self.summary_table)
+
+        # Create Settings tab with all checkboxes
+        settings_tab_widget = QWidget()
+        settings_tab_layout = QVBoxLayout(settings_tab_widget)
+        settings_tab_layout.setContentsMargins(10, 10, 10, 10)
+        settings_tab_layout.setSpacing(10)
+
+        # Add a title label
+        settings_title_label = QLabel("Application Settings")
+        settings_title_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        settings_tab_layout.addWidget(settings_title_label)
+
+        # Reverse DNS checkbox
+        self.reverse_dns_check = QCheckBox("Perform Reverse DNS Lookup on captured IPs")
+        self.reverse_dns_check.setChecked(True)
+        settings_tab_layout.addWidget(self.reverse_dns_check)    
+        self.reverse_dns_check.stateChanged.connect(self.update_reverse_dns)
+
+        # C2 Check checkbox
+        self.c2_check = QCheckBox("Perform C2 checks against C2-TRACKER database")
+        self.c2_check.setChecked(False)
+        settings_tab_layout.addWidget(self.c2_check)    
+        self.c2_check.stateChanged.connect(self.update_c2_check)
+        self.c2_check.setChecked(True)
+
+        # Only show new connections
+        self.only_show_new_connections = QCheckBox("Only show new connections")
+        self.only_show_new_connections.setChecked(False)
+        settings_tab_layout.addWidget(self.only_show_new_connections)    
+        self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)
+
+        # Hide remote local connections
+        self.only_show_remote_connections = QCheckBox("Hide local connections on left table")
+        self.only_show_remote_connections.setChecked(False)
+        settings_tab_layout.addWidget(self.only_show_remote_connections)    
+        self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)
+
+        # Resolve public IP using ipfy checkbox
+        self.resolve_public_ip = QCheckBox("Resolve public internet IP using ipfy.com")
+        self.resolve_public_ip.setChecked(False)
+        settings_tab_layout.addWidget(self.resolve_public_ip)    
+        self.resolve_public_ip.stateChanged.connect(self.update_resolve_public_ip)
+
+        # Add stretch to push settings to the top
+        settings_tab_layout.addStretch()
+
+        # Create QTabWidget and add all tabs
+        self.tab_widget = QTabWidget()
+        self.tab_widget.addTab(main_tab_widget, "Main")
+        self.tab_widget.addTab(summary_tab_widget, "Summary")
+        self.tab_widget.addTab(settings_tab_widget, "Settings")
+
+        # Connect tab change event to update summary when Summary tab is selected
+        self.tab_widget.currentChanged.connect(self.on_tab_changed)
+
+        # Set QTabWidget as central widget
+        self.setCentralWidget(self.tab_widget)
 
         # keyboard shortcuts for fullscreen / exit-fullscreen
         try:
@@ -1936,6 +2071,13 @@ class TCPConnectionViewer(QMainWindow):
                 self.slider.valueChanged.disconnect(self.update_slider_value)
                 self.slider.setValue(self.connection_list_counter)
                 self.slider.valueChanged.connect(self.update_slider_value)
+
+            # If Summary tab is active, refresh it with new data
+            try:
+                if hasattr(self, 'tab_widget') and self.tab_widget.currentIndex() == 1:
+                    self.update_summary_table()
+            except Exception:
+                pass
 
         return connections
     
@@ -2746,6 +2888,89 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
     
+    def on_tab_changed(self, index):
+        """Called when user switches tabs - update Summary tab if selected"""
+        try:
+            # Index 1 is the Summary tab (0=Main, 1=Summary, 2=Settings)
+            if index == 1:
+                self.update_summary_table()
+        except Exception as e:
+            logging.error(f"Error updating summary tab: {e}")
+
+    def update_summary_table(self):
+        """Populate the summary table with aggregated connection statistics"""
+        try:
+            # Clear existing rows
+            self.summary_table.setRowCount(0)
+
+            if not self.connection_list:
+                return
+
+            # Dictionary to track unique connections: (process, pid, suspect, remote, name) -> count
+            connection_stats = {}
+
+            # Iterate through all timeline snapshots in connection_list
+            for timeline_entry in self.connection_list:
+                connection_list = timeline_entry.get('connection_list', [])
+
+                for conn in connection_list:
+                    # Create a unique key from connection attributes
+                    process = conn.get('process', '')
+                    pid = conn.get('pid', '')
+                    suspect = conn.get('suspect', '')
+                    remote = conn.get('remote', '')
+                    name = conn.get('name', '')
+
+                    # Use tuple as dictionary key for grouping
+                    key = (process, pid, suspect, remote, name)
+
+                    # Increment count for this unique connection
+                    if key in connection_stats:
+                        connection_stats[key] += 1
+                    else:
+                        connection_stats[key] = 1
+
+            # Sort by count descending (highest first)
+            sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1], reverse=True)
+
+            # Populate table with sorted results
+            for (process, pid, suspect, remote, name), count in sorted_stats:
+                row = self.summary_table.rowCount()
+                self.summary_table.insertRow(row)
+
+                self.summary_table.setItem(row, 0, QTableWidgetItem(process))
+                self.summary_table.setItem(row, 1, QTableWidgetItem(pid))
+                self.summary_table.setItem(row, 2, QTableWidgetItem(suspect))
+                self.summary_table.setItem(row, 3, QTableWidgetItem(remote))
+                self.summary_table.setItem(row, 4, QTableWidgetItem(name))
+                self.summary_table.setItem(row, 5, QTableWidgetItem(str(count)))
+
+                # Highlight suspect connections in red
+                if suspect == "Yes":
+                    for col in range(self.summary_table.columnCount()):
+                        self.summary_table.item(row, col).setForeground(Qt.red)
+
+            # Update title with total count
+            total_unique = len(sorted_stats)
+            total_connections = sum(count for _, count in sorted_stats)
+
+            # Find the title label and update it
+            for i in range(self.tab_widget.widget(1).layout().count()):
+                item = self.tab_widget.widget(1).layout().itemAt(i)
+                if item and isinstance(item.widget(), QLabel):
+                    label = item.widget()
+                    if "Connection Summary" in label.text():
+                        label.setText(f"Connection Summary Statistics - {total_unique} unique connections ({total_connections} total)")
+                        break
+
+            # Apply sorting if a column was previously sorted
+            global summary_table_column_sort_index, summary_table_column_sort_reverse
+            if summary_table_column_sort_index >= 0:
+                self.sort_summary_table_by_column(summary_table_column_sort_index, summary_table_column_sort_reverse)
+
+        except Exception as e:
+            logging.error(f"Error populating summary table: {e}")
+
     def on_table_cell_clicked(self, row, column):
         # Get the connection data for the clicked row
         lat, lng = None, None
