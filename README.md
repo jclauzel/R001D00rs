@@ -94,7 +94,7 @@ python3 tcp_geo_map.py
 
 - Windows:
 
-Install a recent python interpreter from https://www.python.org/ if not done yet.
+Install a recent python interpreter from https://www.python.org/ if not done yet or directly from the Windows Store (search for Python and select 3.13 or higher).
 
 Download source from latest "release" located on the right side of https://github.com/jclauzel/R001D00rs or git clone https://github.com/jclauzel/R001D00rs
 
