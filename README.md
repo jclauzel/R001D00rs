@@ -145,7 +145,7 @@ deactivate
 - The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live view of your connections on a separate monitor, for example.
 - MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases will be considered stale/obsolete after 7 days by default. When this occurs the application will prompt for a new download of the database. The process is eased and automated through the UI when accepting the licensing rights. When --accept_eula is passed as a startup parameter since it means you agree with their licensing terms, the download of the databases will be done automatically.
 - Summary tab shows an aggregated list view of all connections that are still in the capture buffer. This is useful for many reasons and may help uncover quick sporadic connections.
-- No high privileges required during execution.
+- No high privileges required during execution on Linux some limitations may apply check psutil.net_connections section at https://psutil.readthedocs.io/en/latest/.
 
 # Settings
 
