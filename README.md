@@ -12,7 +12,7 @@ Ever wondered, is this machine clean? To what endpoints and geographical destina
 This GeoInt OSINT script UI shows on the earth map live network connections made and will warn based on the C2-Tracker list maintained by montysecurity if the machine connects to a suspicious C2 endpoint.
 
 # Tested on
-- (Kali) Linux
+- (Kali, Bazzite) Linux
 - Windows 11
 
 ![til](./pictures/tcp_geo_map_demo.gif)
