@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.3" # Current script version
+VERSION = "2.9.4" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -1534,7 +1534,7 @@ class TCPConnectionViewer(QMainWindow):
         self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)
 
         # Hide remote local connections
-        self.only_show_remote_connections = QCheckBox("Hide local connections on left table")
+        self.only_show_remote_connections = QCheckBox("Hide local connections on tables")
         self.only_show_remote_connections.setChecked(False)
         settings_tab_layout.addWidget(self.only_show_remote_connections)    
         self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)
@@ -2909,6 +2909,9 @@ class TCPConnectionViewer(QMainWindow):
             # Dictionary to track unique connections: (process, pid, suspect, remote, name) -> count
             connection_stats = {}
 
+            # Get current setting for filtering local connections
+            global show_only_remote_connections
+
             # Iterate through all timeline snapshots in connection_list
             for timeline_entry in self.connection_list:
                 connection_list = timeline_entry.get('connection_list', [])
@@ -2920,6 +2923,14 @@ class TCPConnectionViewer(QMainWindow):
                     suspect = conn.get('suspect', '')
                     remote = conn.get('remote', '')
                     name = conn.get('name', '')
+
+                    # Filter out local connections if show_only_remote_connections is enabled
+                    if show_only_remote_connections:
+                        # Extract IP address (before any hostname in parentheses)
+                        remote_ip = remote.split(' (')[0].split(':')[0]
+                        # Skip local connections
+                        if remote_ip in ('127.0.0.1', '::1'):
+                            continue
 
                     # Use tuple as dictionary key for grouping
                     key = (process, pid, suspect, remote, name)
