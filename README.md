@@ -84,7 +84,7 @@ python3 -m venv ./R001D00rs
 
 source R001D00rs/bin/activate
 
-pip3 install pyside6 requests maxminddb
+pip3 install pyside6 requests maxminddb psutil
 
 or
 
