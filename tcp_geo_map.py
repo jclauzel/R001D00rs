@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.4" # Current script version
+VERSION = "2.9.5" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -162,6 +162,13 @@ USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 # Global cache and lock for thread-safe IP lookups
 ip_cache = {}
 cache_lock = threading.Lock()
+
+# Global cache to track attempted public IP DNS resolutions to avoid repeated failures
+public_ip_dns_attempts = {}  # {ip: datetime} - tracks when we attempted resolution
+public_ip_dns_attempts_lock = threading.Lock()
+
+PUBLIC_IP_ENQUEUE_MAX_CACHE_SIZE = 10000 # maximum number of public IPs to keep in the enqueue cache to avoid unbounded growth
+PUBLIC_IP_ENQUEUE_TIMER_INTERVAL = 10000 # timer scavanger in milliseconds
 
 class DNSWorker(threading.Thread):
     """
@@ -277,12 +284,20 @@ class TCPConnectionViewer(QMainWindow):
         self._check_and_download_leaflet_resources()
         self.init_ui()
         self.load_settings()
-       
+
         # Set up timer to refresh connections periodically
 
         self.timer.timeout.connect(self.refresh_connections)
         self.timer.start(map_refresh_interval)  # Refresh every 5 seconds
         self.timer_replay_connections.timeout.connect(self.replay_connections)
+
+        # Set up cleanup timer for public IP DNS attempt cache
+        self.public_ip_dns_cache_cleanup_timer = QTimer(self)
+        self.public_ip_dns_cache_cleanup_timer.timeout.connect(self._cleanup_public_ip_dns_cache)
+        # Start timer only if reverse DNS is enabled (runs every 60 seconds = 60000 ms)
+        if do_reverse_dns:
+            self.public_ip_dns_cache_cleanup_timer.start(60000)
+
 
     def _toggle_fullscreen(self):
         """Toggle between fullscreen and normal state (defensive)."""
@@ -812,6 +827,25 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+    def _cleanup_public_ip_dns_cache(self):
+        """
+        Periodic cleanup callback for public IP DNS attempt cache.
+        Runs every 60 seconds when do_reverse_dns is True.
+        Resets the cache if it exceeds 10000 entries to prevent unbounded memory growth.
+        """
+        global public_ip_dns_attempts, public_ip_dns_attempts_lock
+
+        try:
+            with public_ip_dns_attempts_lock:
+                cache_size = len(public_ip_dns_attempts)
+                if cache_size > PUBLIC_IP_ENQUEUE_MAX_CACHE_SIZE:
+                    # Reset cache to prevent unbounded memory growth
+                    public_ip_dns_attempts.clear()
+                    logging.info(f"Public IP DNS cache cleared (exceeded {PUBLIC_IP_ENQUEUE_MAX_CACHE_SIZE} entries, was {cache_size})")
+        except Exception as e:
+            logging.warning(f"Error cleaning public IP DNS cache: {e}")
+
+
 
     def on_header_clicked(self, index):
         """
@@ -1016,9 +1050,21 @@ class TCPConnectionViewer(QMainWindow):
         new_state = self.reverse_dns_check.isChecked()
         if new_state == True:
             do_reverse_dns = True
+            # Start the cleanup timer when reverse DNS is enabled
+            try:
+                if hasattr(self, 'public_ip_dns_cache_cleanup_timer'):
+                    self.public_ip_dns_cache_cleanup_timer.start(PUBLIC_IP_ENQUEUE_TIMER_INTERVAL)
+            except Exception:
+                pass
         else:
             do_reverse_dns = False
-        
+            # Stop the cleanup timer when reverse DNS is disabled
+            try:
+                if hasattr(self, 'public_ip_dns_cache_cleanup_timer'):
+                    self.public_ip_dns_cache_cleanup_timer.stop()
+            except Exception:
+                pass
+
     def update_c2_check(self):
         global do_c2_check
 
@@ -1901,12 +1947,25 @@ class TCPConnectionViewer(QMainWindow):
 
         ip_hostnames = {}
         if do_reverse_dns and ips_to_resolve:
-            # enqueue for background warming (non-blocking)
-            try:
-                if getattr(self, "dns_worker", None) is not None:
-                    self.dns_worker.enqueue_many(ips_to_resolve)
-            except Exception:
-                pass
+            # Filter IPs to only those not already attempted for DNS resolution
+            ips_to_enqueue = set()
+            global public_ip_dns_attempts, public_ip_dns_attempts_lock
+
+            with public_ip_dns_attempts_lock:
+                for ip in ips_to_resolve:
+                    # Only enqueue if not previously attempted (regardless of success/failure)
+                    if ip not in public_ip_dns_attempts:
+                        # Mark as attempted with current timestamp
+                        public_ip_dns_attempts[ip] = datetime.datetime.now()
+                        ips_to_enqueue.add(ip)
+
+            # enqueue for background warming (non-blocking) - only new IPs
+            if ips_to_enqueue:
+                try:
+                    if getattr(self, "dns_worker", None) is not None:
+                        self.dns_worker.enqueue_many(ips_to_enqueue)
+                except Exception:
+                    pass
 
             # read any already-cached names immediately (non-blocking)
             with cache_lock:
@@ -2211,15 +2270,24 @@ class TCPConnectionViewer(QMainWindow):
                     if do_reverse_dns:
 
                         # Try to get from cache immediately
-                        global cache_lock, ip_cache
+                        global cache_lock, ip_cache, public_ip_dns_attempts, public_ip_dns_attempts_lock
 
                         if not ip_cache.get(public_ip):
-                        # Enqueue for background resolution
-                            try:
-                                if getattr(self, "dns_worker", None) is not None:
-                                    self.dns_worker.enqueue(public_ip)
-                            except Exception:
-                                pass
+                            # Check if we've already attempted to resolve this IP
+                            should_enqueue = False
+                            with public_ip_dns_attempts_lock:
+                                if public_ip not in public_ip_dns_attempts:
+                                    # First time seeing this IP - mark it as attempted
+                                    public_ip_dns_attempts[public_ip] = datetime.datetime.now()
+                                    should_enqueue = True
+
+                            # Enqueue for background resolution only if not previously attempted
+                            if should_enqueue:
+                                try:
+                                    if getattr(self, "dns_worker", None) is not None:
+                                        self.dns_worker.enqueue(public_ip)
+                                except Exception:
+                                    pass
 
 
                         with cache_lock:
