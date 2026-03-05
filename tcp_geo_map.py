@@ -53,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.WARNING,  # Changed from WARNING to DEBUG to see diagnostic messages
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.5" # Current script version
+VERSION = "2.9.6" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -255,6 +255,11 @@ class TCPConnectionViewer(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         # pending restore info will be applied on first showEvent to avoid races
         self._pending_restore = None
+
+        # Initialize saved map state (will be loaded from settings if available)
+        self.saved_map_center_lat = None
+        self.saved_map_center_lng = None
+        self.saved_map_zoom = None
         
         # Initialize database readers
         self.reader_ipv4 = None
@@ -282,8 +287,14 @@ class TCPConnectionViewer(QMainWindow):
 
         self.load_databases()
         self._check_and_download_leaflet_resources()
+
+        # Load settings BEFORE init_ui() so saved map position is available when HTML is generated
+        self._load_settings_early()
+
         self.init_ui()
-        self.load_settings()
+
+        # Apply UI-dependent settings after UI is created
+        self._apply_settings_to_ui()
 
         # Set up timer to refresh connections periodically
 
@@ -298,6 +309,45 @@ class TCPConnectionViewer(QMainWindow):
         if do_reverse_dns:
             self.public_ip_dns_cache_cleanup_timer.start(60000)
 
+
+    def _verify_map_ready(self):
+        """Verify that window.map is actually ready before marking map as initialized"""
+        def on_check(is_ready):
+            if is_ready:
+                logging.info("Map verified as ready - window.map exists and has required methods")
+                self.map_initialized = True
+            else:
+                logging.warning("Map not ready yet - retrying in 500ms")
+                # Retry a few times
+                if not hasattr(self, '_map_ready_retries'):
+                    self._map_ready_retries = 0
+
+                self._map_ready_retries += 1
+
+                if self._map_ready_retries < 10:  # Max 10 retries = 5 seconds
+                    QTimer.singleShot(500, self._verify_map_ready)
+                else:
+                    logging.error("Map failed to initialize after 10 retries")
+                    self._map_ready_retries = 0
+
+        check_code = """
+        (function() {
+            try {
+                return (typeof window.map !== 'undefined' && 
+                        window.map && 
+                        typeof window.map.getCenter === 'function' && 
+                        typeof window.map.getZoom === 'function');
+            } catch(e) {
+                console.error('[Map Ready Check] Error:', e);
+                return false;
+            }
+        })();
+        """
+
+        try:
+            self.map_view.page().runJavaScript(check_code, on_check)
+        except Exception as e:
+            logging.error(f"Error verifying map ready: {e}")
 
     def _toggle_fullscreen(self):
         """Toggle between fullscreen and normal state (defensive)."""
@@ -366,6 +416,116 @@ class TCPConnectionViewer(QMainWindow):
                     pass
         except Exception:
             pass
+
+    def get_map_state(self):
+        """Get current map center and zoom from JavaScript (synchronous via QEventLoop with timeout)"""
+        if not hasattr(self, 'map_view'):
+            logging.debug("get_map_state: map_view not available")
+            return None
+
+        if not getattr(self, 'map_initialized', False):
+            logging.debug("get_map_state: map not initialized yet")
+            return None
+
+        from PySide6.QtCore import QEventLoop
+
+        result = {'center': None, 'zoom': None, 'timed_out': False}
+        loop = QEventLoop()
+
+        def on_result(value):
+            try:
+                logging.debug(f"get_map_state: JavaScript returned raw value: {value!r} (type: {type(value).__name__})")
+                # Parse JSON string returned from JavaScript
+                if value and isinstance(value, str):
+                    try:
+                        parsed = json.loads(value)
+                        if parsed and isinstance(parsed, dict):
+                            result['center'] = parsed.get('center')
+                            result['zoom'] = parsed.get('zoom')
+                            logging.debug(f"get_map_state: Parsed JSON successfully: {parsed}")
+                        else:
+                            logging.warning(f"get_map_state: Parsed JSON is not a dict: {parsed}")
+                    except json.JSONDecodeError as e:
+                        logging.error(f"get_map_state: JSON decode error: {e}")
+                elif value and isinstance(value, dict):
+                    # Fallback: handle if QWebEngine did serialize it properly
+                    result['center'] = value.get('center')
+                    result['zoom'] = value.get('zoom')
+                    logging.debug(f"get_map_state: Received dict directly (unexpected): {value}")
+                else:
+                    logging.warning(f"get_map_state: Invalid JavaScript result: {value!r}")
+            except Exception as e:
+                logging.error(f"get_map_state: Error processing result: {e}")
+            finally:
+                if loop.isRunning():
+                    loop.quit()
+
+        # Timeout handler
+        def on_timeout():
+            logging.warning("get_map_state: Timeout waiting for JavaScript response (2 seconds)")
+            result['timed_out'] = True
+            if loop.isRunning():
+                loop.quit()
+
+        # Set up timeout timer (2 seconds)
+        timeout_timer = QTimer()
+        timeout_timer.setSingleShot(True)
+        timeout_timer.timeout.connect(on_timeout)
+        timeout_timer.start(2000)
+
+        js_code = """
+        (function() {
+            try {
+                console.log('[Map State] Checking for window.map...');
+                if (typeof window.map !== 'undefined' && window.map && window.map.getCenter && window.map.getZoom) {
+                    var center = window.map.getCenter();
+                    var zoom = window.map.getZoom();
+                    console.log('[Map State] Successfully got map state:', center, zoom);
+                    // Return JSON string instead of object (QWebEnginePage serialization workaround)
+                    var result = {
+                        center: {lat: center.lat, lng: center.lng},
+                        zoom: zoom
+                    };
+                    return JSON.stringify(result);
+                } else {
+                    console.warn('[Map State] window.map not available or missing methods');
+                    console.log('[Map State] window.map exists:', typeof window.map !== 'undefined');
+                    if (typeof window.map !== 'undefined') {
+                        console.log('[Map State] has getCenter:', typeof window.map.getCenter === 'function');
+                        console.log('[Map State] has getZoom:', typeof window.map.getZoom === 'function');
+                    }
+                }
+            } catch(e) {
+                console.error('[Map State] Error getting map state:', e);
+            }
+            return null;
+        })();
+        """
+
+        try:
+            logging.debug("get_map_state: Executing JavaScript to get map state...")
+            self.map_view.page().runJavaScript(js_code, on_result)
+            # Wait for either result or timeout
+            loop.exec()
+
+            # Stop the timeout timer if still running
+            timeout_timer.stop()
+
+            if result['timed_out']:
+                logging.warning("get_map_state: Timed out waiting for map state")
+                return None
+
+        except Exception as e:
+            logging.error(f"get_map_state: Exception while getting map state: {e}")
+            timeout_timer.stop()
+            return None
+
+        if result['center']:
+            logging.info(f"get_map_state: Successfully retrieved map state: center={result['center']}, zoom={result['zoom']}")
+            return result
+        else:
+            logging.warning("get_map_state: No valid center in result")
+            return None
 
     def changeEvent(self, event):
         """Handle window state changes (fullscreen, maximize, minimize, etc.)"""
@@ -508,6 +668,19 @@ class TCPConnectionViewer(QMainWindow):
             'summary_table_column_sort_reverse': summary_table_column_sort_reverse,
         }
 
+        # Save current map position and zoom
+        try:
+            map_state = self.get_map_state()
+            if map_state and map_state['center']:
+                settings['map_center_lat'] = map_state['center']['lat']
+                settings['map_center_lng'] = map_state['center']['lng']
+                settings['map_zoom'] = map_state['zoom']
+                logging.info(f"Saved map state: center=({settings['map_center_lat']}, {settings['map_center_lng']}), zoom={settings['map_zoom']}")
+            else:
+                logging.debug("No map state to save (map not initialized or no valid state)")
+        except Exception as e:
+            logging.warning(f"Failed to save map state: {e}")
+
         # Save splitter states (Base64) if available
         try:
             settings['splitter_state'] = None
@@ -547,106 +720,153 @@ class TCPConnectionViewer(QMainWindow):
             QMessageBox.critical(self, "Error saving settings", f"Error: {e}")
             
 
-    def load_settings(self):
-        """Load settings from a JSON file"""
-        
-        if os.path.exists(SETTINGS_FILE_NAME):
-            try:
-                with open(SETTINGS_FILE_NAME, 'r') as f:
-                    settings = json.load(f)
+    def _load_settings_early(self):
+        """Load settings from JSON file (early phase - before UI is created)"""
+        if not os.path.exists(SETTINGS_FILE_NAME):
+            return
 
-                    # Apply loaded settings
-                    global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip
+        try:
+            with open(SETTINGS_FILE_NAME, 'r') as f:
+                settings = json.load(f)
 
-                    max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
-                    do_c2_check = settings.get('do_c2_check', do_c2_check)
-                    show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
-                    show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
-                    do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
-                    do_resolve_public_ip = settings.get('do_resolve_public_ip', do_resolve_public_ip)
+                # Apply loaded settings to global variables
+                global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections
+                global show_only_remote_connections, do_reverse_dns, map_refresh_interval
+                global table_column_sort_index, table_column_sort_reverse
+                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip
 
-                    map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
-                    self.refresh_interval_combo_box.setCurrentText(f"{map_refresh_interval}")
+                max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
+                do_c2_check = settings.get('do_c2_check', do_c2_check)
+                show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
+                show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
+                do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
+                do_resolve_public_ip = settings.get('do_resolve_public_ip', do_resolve_public_ip)
+                map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
+                table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
+                table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
+                summary_table_column_sort_index = settings.get('summary_table_column_sort_index', summary_table_column_sort_index)
+                summary_table_column_sort_reverse = settings.get('summary_table_column_sort_reverse', summary_table_column_sort_reverse)
 
-                    table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
-                    table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
-                    summary_table_column_sort_index = settings.get('summary_table_column_sort_index', summary_table_column_sort_index)
-                    summary_table_column_sort_reverse = settings.get('summary_table_column_sort_reverse', summary_table_column_sort_reverse)
-                        
-                    # Update UI elements if needed
-                    self.only_show_new_connections.setChecked(show_only_new_active_connections)
-                    self.only_show_remote_connections.setChecked(show_only_remote_connections)
-                    self.reverse_dns_check.setChecked(do_reverse_dns)
-                    self.c2_check.setChecked(do_c2_check)
-                    self.resolve_public_ip.setChecked(do_resolve_public_ip)
+                # Restore map position and zoom (CRITICAL: do this BEFORE init_ui/update_map)
+                try:
+                    lat = settings.get('map_center_lat')
+                    lng = settings.get('map_center_lng')
+                    zoom = settings.get('map_zoom')
 
-                    # Restore splitter states if saved (Base64)
-                    try:
-                        split_state = settings.get('splitter_state')
-                        if split_state and hasattr(self, 'splitter'):
-                            ba = QByteArray.fromBase64(split_state.encode('ascii'))
-                            self.splitter.restoreState(ba)
-                    except Exception:
-                        pass
+                    if lat is not None and lng is not None and zoom is not None:
+                        try:
+                            lat_float = float(lat)
+                            lng_float = float(lng)
+                            zoom_float = float(zoom)
 
-                    try:
-                        right_state = settings.get('right_splitter_state')
-                        if right_state and hasattr(self, 'right_splitter'):
-                            ba = QByteArray.fromBase64(right_state.encode('ascii'))
-                            self.right_splitter.restoreState(ba)
-                    except Exception:
-                        pass
-
-                    # Restore fullscreen or maximized state if saved
-                    try:
-                        is_fs = settings.get('is_fullscreen', False)
-                        is_max = settings.get('is_maximized', False)
-                        screen_name = settings.get('fullscreen_screen_name')
-
-                        restored = False
-
-                        # Only attempt fullscreen when it was explicitly saved
-                        if is_fs:
-                            # existing fullscreen restore (prefer exact match)
-                            if screen_name:
-                                target = None
-                                for s in QApplication.screens():
-                                    try:
-                                        if s.name() == screen_name:
-                                            target = s
-                                            break
-                                    except Exception:
-                                        continue
-                                if target:
-                                    # schedule pending fullscreen on that screen by name
-                                    self._pending_restore = {'type': 'fullscreen', 'screen_name': target.name()}
-                                    restored = True
+                            if -90 <= lat_float <= 90 and -180 <= lng_float <= 180 and 0 <= zoom_float <= 20:
+                                self.saved_map_center_lat = lat_float
+                                self.saved_map_center_lng = lng_float
+                                self.saved_map_zoom = zoom_float
+                                logging.info(f"Loaded map state (early): center=({self.saved_map_center_lat}, {self.saved_map_center_lng}), zoom={self.saved_map_zoom}")
                             else:
-                                self._pending_restore = {'type': 'fullscreen', 'screen_name': None}
-                                restored = True
+                                logging.warning(f"Invalid map state ranges: lat={lat_float}, lng={lng_float}, zoom={zoom_float}")
+                        except (ValueError, TypeError) as e:
+                            logging.warning(f"Invalid map state values: {e}")
+                    else:
+                        logging.debug("No saved map state found in settings")
+                except Exception as e:
+                    logging.warning(f"Error loading map state: {e}")
 
-                        # if fullscreen not restored and maximize was saved, restore maximize on saved screen if possible
-                        if not restored and is_max:
-                            if screen_name:
-                                target = None
-                                for s in QApplication.screens():
-                                    try:
-                                        if s.name() == screen_name:
-                                            target = s
-                                            break
-                                    except Exception:
-                                        continue
-                                if target:
-                                    self._pending_restore = {'type': 'maximized', 'screen_name': target.name()}
-                                else:
-                                    self._pending_restore = {'type': 'maximized', 'screen_name': None}
+                # Store fullscreen/maximize info for later application
+                try:
+                    is_fs = settings.get('is_fullscreen', False)
+                    is_max = settings.get('is_maximized', False)
+                    screen_name = settings.get('fullscreen_screen_name')
+
+                    restored = False
+
+                    if is_fs:
+                        if screen_name:
+                            target = None
+                            for s in QApplication.screens():
+                                try:
+                                    if s.name() == screen_name:
+                                        target = s
+                                        break
+                                except Exception:
+                                    continue
+                            if target:
+                                self._pending_restore = {'type': 'fullscreen', 'screen_name': target.name()}
+                                restored = True
+                        else:
+                            self._pending_restore = {'type': 'fullscreen', 'screen_name': None}
+                            restored = True
+
+                    if not restored and is_max:
+                        if screen_name:
+                            target = None
+                            for s in QApplication.screens():
+                                try:
+                                    if s.name() == screen_name:
+                                        target = s
+                                        break
+                                except Exception:
+                                    continue
+                            if target:
+                                self._pending_restore = {'type': 'maximized', 'screen_name': target.name()}
                             else:
                                 self._pending_restore = {'type': 'maximized', 'screen_name': None}
-                    except Exception:
-                        pass
+                        else:
+                            self._pending_restore = {'type': 'maximized', 'screen_name': None}
+                except Exception:
+                    pass
 
-            except Exception as e:
-                QMessageBox.critical(self, "Error loading settings", f"Error: {e}")
+                # Store splitter states for later restoration (after UI is created)
+                self._saved_splitter_state = settings.get('splitter_state')
+                self._saved_right_splitter_state = settings.get('right_splitter_state')
+
+        except Exception as e:
+            logging.error(f"Error loading settings (early phase): {e}")
+
+    def _apply_settings_to_ui(self):
+        """Apply settings to UI elements (late phase - after UI is created)"""
+        if not os.path.exists(SETTINGS_FILE_NAME):
+            return
+
+        try:
+            with open(SETTINGS_FILE_NAME, 'r') as f:
+                settings = json.load(f)
+
+                # Update UI elements with loaded settings
+                map_refresh_interval_val = settings.get('map_refresh_interval', map_refresh_interval)
+                self.refresh_interval_combo_box.setCurrentText(f"{map_refresh_interval_val}")
+
+                self.only_show_new_connections.setChecked(show_only_new_active_connections)
+                self.only_show_remote_connections.setChecked(show_only_remote_connections)
+                self.reverse_dns_check.setChecked(do_reverse_dns)
+                self.c2_check.setChecked(do_c2_check)
+                self.resolve_public_ip.setChecked(do_resolve_public_ip)
+
+                # Restore splitter states if saved
+                try:
+                    if hasattr(self, '_saved_splitter_state') and self._saved_splitter_state:
+                        ba = QByteArray.fromBase64(self._saved_splitter_state.encode('ascii'))
+                        self.splitter.restoreState(ba)
+                except Exception:
+                    pass
+
+                try:
+                    if hasattr(self, '_saved_right_splitter_state') and self._saved_right_splitter_state:
+                        ba = QByteArray.fromBase64(self._saved_right_splitter_state.encode('ascii'))
+                        self.right_splitter.restoreState(ba)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logging.error(f"Error applying settings to UI: {e}")
+
+    def load_settings(self):
+        """Load settings from a JSON file (legacy method - now split into early/late phases)"""
+        # This method is kept for backward compatibility but actual loading happens in:
+        # _load_settings_early() - before UI creation
+        # _apply_settings_to_ui() - after UI creation
+        pass
 
     def closeEvent(self, event):
         """Save settings when closing the application"""
@@ -2524,7 +2744,7 @@ class TCPConnectionViewer(QMainWindow):
                         Object.keys(iconsToResolve).forEach(function(k){
                             var info = iconsToResolve[k];
                             resolveImageUrl(info.remote, info.local, function(finalUrl){
-                                resolved[k] = finalUrl;
+                                    resolved[k] = finalUrl;
                                 remaining--;
                                 if (remaining === 0) {
                                     // create icon definitions using resolved URLs
@@ -2536,8 +2756,33 @@ class TCPConnectionViewer(QMainWindow):
 
                                     // initialize map AFTER icons resolved
                                     console.log('Initializing map with icons:', resolved);
-                                    var map = L.map('map').setView([20, 0], 2);
-                                    console.log('Map created successfully');
+
+                                    // Use saved map position and zoom if available (injected by Python)
+                                    var initialLat = 20;  // Default latitude
+                                    var initialLng = 0;   // Default longitude
+                                    var initialZoom = 2;  // Default zoom
+
+                                    // Check if saved state was injected
+                                    if (typeof window._saved_map_lat !== 'undefined' && 
+                                        typeof window._saved_map_lng !== 'undefined' && 
+                                        typeof window._saved_map_zoom !== 'undefined') {
+                                        // Validate that the values are valid numbers
+                                        if (!isNaN(window._saved_map_lat) && !isNaN(window._saved_map_lng) && !isNaN(window._saved_map_zoom)) {
+                                            initialLat = window._saved_map_lat;
+                                            initialLng = window._saved_map_lng;
+                                            initialZoom = window._saved_map_zoom;
+                                            console.log('[Map Restore] Restoring saved position:', initialLat, initialLng, 'zoom:', initialZoom);
+                                        } else {
+                                            console.warn('[Map Restore] Saved values are invalid (NaN), using defaults');
+                                        }
+                                    } else {
+                                        console.log('[Map Restore] No saved position found, using defaults:', initialLat, initialLng, 'zoom:', initialZoom);
+                                    }
+
+                                    // Create map instance as global (window.map) so get_map_state() can access it
+                                    window.map = L.map('map').setView([initialLat, initialLng], initialZoom);
+                                    var map = window.map;  // Local reference for convenience
+                                    console.log('Map created successfully at position:', initialLat, initialLng, 'zoom:', initialZoom);
 
                                     // Create custom pane for public IP circle with high z-index (above markers)
                                     map.createPane('publicIpPane');
@@ -2628,6 +2873,20 @@ class TCPConnectionViewer(QMainWindow):
                                     // expose to the host Python code
                                     window.updateConnections = updateConnections;
                                     window.setStats = setStats;
+
+                                    // Notify Python that map is fully initialized
+                                    console.log('[Map Init] Notifying Python that map is ready');
+                                    try {
+                                        // Call a Python-registered callback to signal map is ready
+                                        if (typeof window.qt !== 'undefined' && window.qt.webChannelTransport) {
+                                            // QWebChannel is available (not used here, but could be)
+                                        }
+                                        // Set a flag that Python can check
+                                        window._map_ready = true;
+                                        console.log('[Map Init] window._map_ready set to true');
+                                    } catch(e) {
+                                        console.error('[Map Init] Error notifying Python:', e);
+                                    }
                                 }
                             }, 3000);
                         });
@@ -2669,6 +2928,36 @@ class TCPConnectionViewer(QMainWindow):
                 logging.debug("Path injection successful")
             else:
                 logging.warning("Path injection may have failed!")
+
+            # Inject saved map state into JavaScript as window variables (with validation)
+            map_state_js = ""
+            if (hasattr(self, 'saved_map_center_lat') and 
+                hasattr(self, 'saved_map_center_lng') and 
+                hasattr(self, 'saved_map_zoom') and
+                self.saved_map_center_lat is not None and 
+                self.saved_map_center_lng is not None and 
+                self.saved_map_zoom is not None):
+                try:
+                    # Double-check values are valid numbers before injecting
+                    lat_val = float(self.saved_map_center_lat)
+                    lng_val = float(self.saved_map_center_lng)
+                    zoom_val = float(self.saved_map_zoom)
+
+                    map_state_js = f"""
+                    <script>
+                        // Inject saved map state for restoration
+                        window._saved_map_lat = {lat_val};
+                        window._saved_map_lng = {lng_val};
+                        window._saved_map_zoom = {zoom_val};
+                        console.log('[Map Restore] Using saved position:', window._saved_map_lat, window._saved_map_lng, 'zoom:', window._saved_map_zoom);
+                    </script>
+                    """
+                    logging.info(f"Injecting map state into HTML: center=({lat_val}, {lng_val}), zoom={zoom_val}")
+                except (ValueError, TypeError) as e:
+                    logging.warning(f"Failed to inject map state: {e}")
+                    map_state_js = ""
+            else:
+                logging.debug("No saved map state to inject (using default position)")
 
             # Try to read local Leaflet files for offline support
             leaflet_js_content = ""
@@ -2739,6 +3028,10 @@ class TCPConnectionViewer(QMainWindow):
                     </head>'''
                 )
 
+            # Insert map state script before closing </head> tag
+            if map_state_js:
+                html_with_path = html_with_path.replace('</head>', f'{map_state_js}</head>')
+
             # Use about:blank as base URL (doesn't block HTTPS requests)
             self.map_view.setHtml(html_with_path, QUrl("about:blank"))
 
@@ -2750,12 +3043,15 @@ class TCPConnectionViewer(QMainWindow):
                         self._call_update_js(js, connection_data, force_show_tooltip)
                     except Exception:
                         pass
-                # mark initialized (we will still verify function existence before calling in _call_update_js)
+
+                    # Schedule a check to verify map is actually ready and set flag
+                    # Wait a bit for nested JS callbacks to complete
+                    QTimer.singleShot(1000, self._verify_map_ready)
+
                 try:
                     self.map_view.loadFinished.disconnect(_on_loaded)
                 except Exception:
                     pass
-                self.map_initialized = True
 
             # connect a one-shot handler that will invoke the JS updater when ready
             self.map_view.loadFinished.connect(_on_loaded)
