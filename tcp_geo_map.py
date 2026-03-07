@@ -53,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARNING,  # Changed from WARNING to DEBUG to see diagnostic messages
+    level=logging.DEBUG,  # Changed to DEBUG to see diagnostic messages
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -65,12 +65,13 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.6" # Current script version
+VERSION = "2.9.7" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
 DATABASE_EXPIRE_AFTER_DAYS = 7 # Databases expiration time in days from download date, default 7 days (1 week)
 DB_DIR = "databases" # Database location are contained in this subdirectory under the main script directory
+SCREENSHOTS_DIR = "screen_captures"  # Screenshot directory for captured map images
 
 IPV4_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv4.mmdb")
 IPV6_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv6.mmdb")
@@ -142,7 +143,7 @@ TIME_SLIDER_TEXT = "Time slider position: "
 START_CAPTURE_BUTTON_TEXT = "Start capture live connections"
 STOP_CAPTURE_BUTTON_TEXT = "Stop capture live connections" 
 
-max_connection_list_filo_buffer_size = 1000  # Maximum number of connection snapshots to keep in memory. The larger this value the more memory will be used. When the max size is reached the oldest connection snapshot will be removed from memory.
+max_connection_list_filo_buffer_size = 5  # Maximum number of connection snapshots to keep in memory. The larger this value the more memory will be used. When the max size is reached the oldest connection snapshot will be removed from memory.
 show_tooltip = False # Show tooltips on map markers
 map_refresh_interval = 2000  # Map refresh time in milliseconds
 show_only_new_active_connections = False # Show only new connections in the table
@@ -155,6 +156,7 @@ do_reverse_dns = True  # Set to False to disable reverse DNS lookups
 do_resolve_public_ip = False  # Set to True to resolve public IP addresses to hostnames (may slow down refresh)
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
 do_c2_check = False    # Set to True to enable C2-TRACKER checks
+do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
  
@@ -289,7 +291,8 @@ class TCPConnectionViewer(QMainWindow):
         self._check_and_download_leaflet_resources()
 
         # Load settings BEFORE init_ui() so saved map position is available when HTML is generated
-        self._load_settings_early()
+        # Returns True if settings were loaded, None if this is first run
+        self._is_first_run = (self._load_settings_early() is None)
 
         self.init_ui()
 
@@ -652,7 +655,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -661,6 +664,7 @@ class TCPConnectionViewer(QMainWindow):
             'show_only_remote_connections': show_only_remote_connections,
             'do_reverse_dns': do_reverse_dns,
             'do_resolve_public_ip': do_resolve_public_ip,
+            'do_capture_screenshots': do_capture_screenshots,
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
@@ -721,9 +725,15 @@ class TCPConnectionViewer(QMainWindow):
             
 
     def _load_settings_early(self):
-        """Load settings from JSON file (early phase - before UI is created)"""
+        """Load settings from JSON file (early phase - before UI is created)
+
+        Returns:
+            True if settings file was found and loaded successfully
+            None if settings file doesn't exist (first run)
+        """
         if not os.path.exists(SETTINGS_FILE_NAME):
-            return
+            logging.info("No settings file found - this appears to be first run")
+            return None
 
         try:
             with open(SETTINGS_FILE_NAME, 'r') as f:
@@ -733,7 +743,7 @@ class TCPConnectionViewer(QMainWindow):
                 global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections
                 global show_only_remote_connections, do_reverse_dns, map_refresh_interval
                 global table_column_sort_index, table_column_sort_reverse
-                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip
+                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
                 do_c2_check = settings.get('do_c2_check', do_c2_check)
@@ -741,6 +751,7 @@ class TCPConnectionViewer(QMainWindow):
                 show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
                 do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
                 do_resolve_public_ip = settings.get('do_resolve_public_ip', do_resolve_public_ip)
+                do_capture_screenshots = settings.get('do_capture_screenshots', do_capture_screenshots)
                 map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
                 table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                 table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
@@ -821,8 +832,13 @@ class TCPConnectionViewer(QMainWindow):
                 self._saved_splitter_state = settings.get('splitter_state')
                 self._saved_right_splitter_state = settings.get('right_splitter_state')
 
+                # Settings loaded successfully
+                logging.info("Settings loaded successfully from file")
+                return True
+
         except Exception as e:
             logging.error(f"Error loading settings (early phase): {e}")
+            return None
 
     def _apply_settings_to_ui(self):
         """Apply settings to UI elements (late phase - after UI is created)"""
@@ -842,6 +858,11 @@ class TCPConnectionViewer(QMainWindow):
                 self.reverse_dns_check.setChecked(do_reverse_dns)
                 self.c2_check.setChecked(do_c2_check)
                 self.resolve_public_ip.setChecked(do_resolve_public_ip)
+                self.capture_screenshots_check.setChecked(do_capture_screenshots)
+
+                # Update buffer size input field
+                if hasattr(self, 'buffer_size_input'):
+                    self.buffer_size_input.setText(str(max_connection_list_filo_buffer_size))
 
                 # Restore splitter states if saved
                 try:
@@ -1261,6 +1282,132 @@ class TCPConnectionViewer(QMainWindow):
             do_resolve_public_ip = True
         else:
             do_resolve_public_ip = False
+
+    def update_capture_screenshots(self):
+        global do_capture_screenshots
+
+        new_state = self.capture_screenshots_check.isChecked()
+        if new_state == True:
+            do_capture_screenshots = True
+            # Ensure screenshot directory exists
+            try:
+                os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+                logging.info(f"Screenshot capture enabled. Files will be saved to: {SCREENSHOTS_DIR}")
+            except Exception as e:
+                logging.error(f"Failed to create screenshot directory: {e}")
+                QMessageBox.warning(self, "Screenshot Error", f"Failed to create screenshot directory: {e}")
+        else:
+            do_capture_screenshots = False
+
+    def update_buffer_size(self):
+        """Validate and update the max_connection_list_filo_buffer_size setting"""
+        global max_connection_list_filo_buffer_size
+
+        # Store the previous valid value
+        previous_value = max_connection_list_filo_buffer_size
+
+        try:
+            # Get the text from the input field
+            new_value_text = self.buffer_size_input.text().strip()
+
+            # Try to convert to integer
+            new_value = int(new_value_text)
+
+            # Validate that it's a positive number
+            if new_value <= 0:
+                raise ValueError("Buffer size must be greater than 0")
+
+            # Valid value - update the global
+            max_connection_list_filo_buffer_size = new_value
+            logging.info(f"Updated max_connection_list_filo_buffer_size to {new_value}")
+
+            # Check if capture was running before reset
+            was_running = False
+            if hasattr(self, 'timer') and self.timer.isActive():
+                was_running = True
+                self.timer.stop()
+                logging.debug("Stopped capture timer before reset")
+
+            # Stop replay timer if active
+            if hasattr(self, 'timer_replay_connections') and self.timer_replay_connections.isActive():
+                self.timer_replay_connections.stop()
+                logging.debug("Stopped replay timer before reset")
+
+            # Always reset connections when buffer size changes
+            logging.info("Resetting connections due to buffer size change")
+
+            # Clear connection data
+            if hasattr(self, 'connection_list'):
+                self.connection_list.clear()
+            if hasattr(self, 'connections'):
+                self.connections = []
+
+            self.connection_list_counter = 0
+
+            # Update slider
+            if hasattr(self, 'slider'):
+                self.slider.setMaximum(self.connection_list_counter)
+                self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)))
+
+            # Clear map
+            if hasattr(self, 'connections'):
+                self.update_map(self.connections)
+
+            # Update UI buttons
+            if hasattr(self, 'start_capture_btn'):
+                self.start_capture_btn.setVisible(True)
+            if hasattr(self, 'stop_capture_btn'):
+                self.stop_capture_btn.setVisible(False)
+
+            # Trigger screenshot cleanup if enabled (to match new buffer size)
+            global do_capture_screenshots
+            if do_capture_screenshots:
+                try:
+                    logging.info("Triggering screenshot cleanup after buffer size change")
+                    self._cleanup_old_screenshots()
+                except Exception as e:
+                    logging.error(f"Failed to cleanup screenshots after buffer resize: {e}")
+
+            # Restart capture if it was running before
+            if was_running:
+                logging.info("Restarting capture after buffer size change")
+                if hasattr(self, 'timer'):
+                    self.timer.start(map_refresh_interval)
+                    if hasattr(self, 'start_capture_btn'):
+                        self.start_capture_btn.setVisible(False)
+                    if hasattr(self, 'stop_capture_btn'):
+                        self.stop_capture_btn.setVisible(True)
+                    if hasattr(self, 'status_label'):
+                        self.status_label.setText("Auto-refreshing connections.")
+
+        except ValueError as e:
+            # Invalid input - show error and revert
+            QMessageBox.warning(
+                self,
+                "Invalid Buffer Size",
+                f"Invalid value: '{new_value_text}'\n\n"
+                f"The buffer size must be a positive integer greater than 0.\n\n"
+                f"Reverting to previous value: {previous_value}"
+            )
+
+            # Revert to previous value
+            max_connection_list_filo_buffer_size = previous_value
+            self.buffer_size_input.setText(str(previous_value))
+            logging.warning(f"Invalid buffer size input '{new_value_text}', reverted to {previous_value}")
+
+        except Exception as e:
+            # Unexpected error - show error and revert
+            QMessageBox.warning(
+                self,
+                "Buffer Size Error",
+                f"Error updating buffer size: {str(e)}\n\n"
+                f"Reverting to previous value: {previous_value}"
+            )
+
+            # Revert to previous value
+            max_connection_list_filo_buffer_size = previous_value
+            self.buffer_size_input.setText(str(previous_value))
+            logging.error(f"Error updating buffer size: {e}, reverted to {previous_value}")
 
 
 
@@ -1811,6 +1958,29 @@ class TCPConnectionViewer(QMainWindow):
         settings_tab_layout.addWidget(self.resolve_public_ip)    
         self.resolve_public_ip.stateChanged.connect(self.update_resolve_public_ip)
 
+        # Capture screenshots checkbox
+        self.capture_screenshots_check = QCheckBox("Capture screenshots of the map to disk")
+        self.capture_screenshots_check.setChecked(False)
+        settings_tab_layout.addWidget(self.capture_screenshots_check)
+        self.capture_screenshots_check.stateChanged.connect(self.update_capture_screenshots)
+
+        # Max connection buffer size input
+        buffer_size_layout = QHBoxLayout()
+        buffer_size_label = QLabel("Maximum connection snapshots to keep in memory:")
+        buffer_size_label.setToolTip("Controls how many historical connection snapshots are stored.\nAlso determines how many screenshot files to keep on disk.")
+        buffer_size_layout.addWidget(buffer_size_label)
+
+        from PySide6.QtWidgets import QLineEdit
+        self.buffer_size_input = QLineEdit()
+        self.buffer_size_input.setText(str(max_connection_list_filo_buffer_size))
+        self.buffer_size_input.setMaximumWidth(100)
+        self.buffer_size_input.setToolTip("Enter a positive number greater than 0")
+        self.buffer_size_input.editingFinished.connect(self.update_buffer_size)
+        buffer_size_layout.addWidget(self.buffer_size_input)
+        buffer_size_layout.addStretch()
+
+        settings_tab_layout.addLayout(buffer_size_layout)
+
         # Add stretch to push settings to the top
         settings_tab_layout.addStretch()
 
@@ -2153,6 +2323,8 @@ class TCPConnectionViewer(QMainWindow):
 
         connections = []
         c2_connections = []
+        global do_capture_screenshots
+
 
         # Get all connections once
         all_connections = psutil.net_connections(kind='inet')
@@ -2342,6 +2514,18 @@ class TCPConnectionViewer(QMainWindow):
                     self.connection_list.pop(0)
                 self.connection_list_counter = len(self.connection_list)
 
+                # Cleanup old screenshots when buffer is full (if screenshot capture is enabled)
+                global do_capture_screenshots
+                logging.debug(f"Buffer full (counter={self.connection_list_counter}, max={max_connection_list_filo_buffer_size}). do_capture_screenshots={do_capture_screenshots}")
+                if do_capture_screenshots:
+                    try:
+                        logging.info("Triggering screenshot cleanup...")
+                        self._cleanup_old_screenshots()
+                    except Exception as e:
+                        logging.error(f"Failed to cleanup old screenshots: {e}")
+                else:
+                    logging.debug("Screenshot capture disabled - skipping cleanup")
+
             # keep slider in sync
             self.slider.setMaximum(self.connection_list_counter)
             self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)-1))
@@ -2357,6 +2541,16 @@ class TCPConnectionViewer(QMainWindow):
                     self.update_summary_table()
             except Exception:
                 pass
+
+            # Capture screenshot if enabled (only for live captures, not timeline replay)
+
+            if do_capture_screenshots:
+                try:
+                    logging.debug(f"Scheduling screenshot capture (buffer counter={self.connection_list_counter})")
+                    # Schedule screenshot capture after a short delay to ensure map is fully rendered
+                    QTimer.singleShot(1500, self._capture_map_screenshot)
+                except Exception as e:
+                    logging.error(f"Failed to schedule screenshot capture: {e}")
 
         return connections
     
@@ -3216,6 +3410,17 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+        # Show first-run welcome message if this is the first time the app is launched
+        if getattr(self, '_is_first_run', False):
+            try:
+                # Clear the flag so we only show this once
+                self._is_first_run = False
+
+                # Schedule the message to show after a short delay (after window is fully visible)
+                QTimer.singleShot(500, self._show_first_run_message)
+            except Exception:
+                pass
+
         try:
             pr = getattr(self, '_pending_restore', None)
             if not pr:
@@ -3251,7 +3456,105 @@ class TCPConnectionViewer(QMainWindow):
                     QTimer.singleShot(50, self.showMaximized)
         except Exception:
             pass
-    
+
+    def _show_first_run_message(self):
+        """Show welcome message for first-time users"""
+        try:
+            QMessageBox.about(
+                self,
+                "Welcome to TCP Geo Map",
+                "By default ipify.com is disabled and your geo localization exit point will not show on the map.\n\n"
+                "To enable it navigate to the Settings tab on the top and check the "
+                '"Resolve public internet IP using ipify.com" option.'
+            )
+        except Exception as e:
+            logging.warning(f"Failed to show first run message: {e}")
+
+    def _capture_map_screenshot(self):
+        """Capture screenshot of the map widget and save to disk as JPG"""
+        try:
+            # Ensure screenshot directory exists
+            os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+
+            # Generate filename with timestamp
+            timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+            filename = f"tcp_geo_map_{timestamp}.jpg"
+            filepath = os.path.join(SCREENSHOTS_DIR, filename)
+
+            # Capture the map widget as QPixmap
+            if hasattr(self, 'map_view') and self.map_view is not None:
+                pixmap = self.map_view.grab()
+
+                # Save as JPG with quality 95
+                success = pixmap.save(filepath, 'JPG', 95)
+
+                if success:
+                    logging.info(f"Screenshot saved: {filepath}")
+                else:
+                    logging.warning(f"Failed to save screenshot: {filepath}")
+            else:
+                logging.warning("Cannot capture screenshot - map_view not available")
+
+        except Exception as e:
+            logging.error(f"Error capturing screenshot: {e}")
+
+    def _cleanup_old_screenshots(self):
+        """Delete old screenshot files to keep only the most recent max_connection_list_filo_buffer_size files"""
+        try:
+            global max_connection_list_filo_buffer_size
+
+            logging.debug(f"_cleanup_old_screenshots: Starting cleanup (max_buffer={max_connection_list_filo_buffer_size})")
+
+            # Get all screenshot files in the directory
+            if not os.path.exists(SCREENSHOTS_DIR):
+                logging.debug(f"_cleanup_old_screenshots: Directory {SCREENSHOTS_DIR} does not exist")
+                return
+
+            # Find all jpg files matching our naming pattern
+            screenshot_files = []
+            for filename in os.listdir(SCREENSHOTS_DIR):
+                if filename.startswith("tcp_geo_map_") and filename.endswith(".jpg"):
+                    filepath = os.path.join(SCREENSHOTS_DIR, filename)
+                    try:
+                        # Get file modification time
+                        mtime = os.path.getmtime(filepath)
+                        screenshot_files.append((mtime, filepath, filename))
+                    except Exception as e:
+                        logging.warning(f"Failed to get mtime for {filename}: {e}")
+                        continue
+
+            logging.debug(f"_cleanup_old_screenshots: Found {len(screenshot_files)} screenshot files")
+
+            # Sort by modification time (oldest first)
+            screenshot_files.sort(key=lambda x: x[0])
+
+            # Calculate how many files to delete
+            total_files = len(screenshot_files)
+            files_to_keep = max_connection_list_filo_buffer_size
+            files_to_delete = total_files - files_to_keep
+
+            logging.debug(f"_cleanup_old_screenshots: Total={total_files}, Keep={files_to_keep}, Delete={files_to_delete}")
+
+            if files_to_delete > 0:
+                # Delete the oldest files
+                deleted_count = 0
+                for i in range(files_to_delete):
+                    try:
+                        _, filepath, filename = screenshot_files[i]
+                        os.remove(filepath)
+                        deleted_count += 1
+                        logging.debug(f"Deleted old screenshot: {filename}")
+                    except Exception as e:
+                        logging.warning(f"Failed to delete screenshot {filename}: {e}")
+
+                if deleted_count > 0:
+                    logging.info(f"Cleaned up {deleted_count} old screenshot(s). Kept {files_to_keep} most recent files.")
+            else:
+                logging.debug("_cleanup_old_screenshots: No files to delete")
+
+        except Exception as e:
+            logging.error(f"Error cleaning up old screenshots: {e}")
+
     def on_tab_changed(self, index):
         """Called when user switches tabs - update Summary tab if selected"""
         try:
