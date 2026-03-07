@@ -179,6 +179,7 @@ Sample settings.json with explanations:
 "is_maximized": true, // Allows restoring maximized screen on startups (it is either full-screen or maximized) - setting will be applied/reset after every closing of the script
 
 "fullscreen_screen_name": "MyScreenName" // Allows restoring the application UI back on to the right screen - setting will be applied/reset after every closing of the script.
+"map_center_lat", "map_center_lng", "map_zoom": are the values of the map settings and position used to restore the exact map layout settings when the application starts again.
 
 Other settings that you may tweak in the script itself:
 
