@@ -7,6 +7,10 @@ If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by d
 "Live network connection snapshots" refresh times can be customized, connections can be replayed and saved...
 When the "Resolve public internet IP address" feature is turned on you can monitor your exit point.
 
+Maximum connection snapshots to keep in memory can be modified on the Settings tab.
+
+In the settings tab the "Capture screenshots of the map to disk" feature may be turned on to take screenshots of the map into the screen_captures folder. Everytime the map is lived refreshed an new .jpg file will be generated. When the feature is on a new button will apear on the main tab that will generate a new .mp4 video capture of all the present .jpg file in the same location. To prevent disk space from getting filled the older files are automaticaly deleted.
+
 # Why use tcp_geo_map.py?
 Ever wondered, is this machine clean? To what endpoints and geographical destination is this host connecting to such as to sending telemetry or simply understand this machine "network" behavior based on what processes (running programs) on it? 
 This GeoInt OSINT script UI shows on the earth map live network connections made and will warn based on the C2-Tracker list maintained by montysecurity if the machine connects to a suspicious C2 endpoint.
