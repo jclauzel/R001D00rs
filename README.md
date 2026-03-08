@@ -47,6 +47,8 @@ C2 Tracker is a free-to-use-community-driven IOC feed that searches to collect I
 When prompted for download and agreed the script will fetch the following file containing the list of C2 Suspect IP addresses and save it in the database subfolder:
 - https://github.com/montysecurity/C2-Tracker/raw/refs/heads/main/data/all.txt
 
+tcp_geo_map uses:
+
 * maxminddb
 * PySide6
 * psutil
