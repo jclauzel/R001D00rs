@@ -84,7 +84,7 @@ python3 -m venv ./R001D00rs
 
 source R001D00rs/bin/activate
 
-pip3 install pyside6 requests maxminddb psutil
+pip3 install pyside6 requests maxminddb psutil opencv-python
 
 or
 
@@ -100,7 +100,7 @@ Download source from latest "release" located on the right side of https://githu
 
 Install required packages:
 
-pip3 install pyside6 requests maxminddb
+pip3 install pyside6 requests maxminddb opencv-python
 
 or
 
