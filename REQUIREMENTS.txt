@@ -5,3 +5,4 @@ pandas>=2.0.3
 numpy>=1.25.0
 requests>=2.31.0
 folium>=0.14.0
+opencv-python>=4.8.0

@@ -2,7 +2,7 @@
 
 # R001D00rs tcp_geo_map https://github.com/jclauzel/R001D00rs/
 
-# pip install psutil, maxminddb, PySide6, folium
+# pip install psutil, maxminddb, PySide6, opencv-python
 
 # using https://github.com/pointhi/leaflet-color-markers for colored map markers
 # using https://github.com/sapics/ip-location-db/tree/main/geolite2-city this script is using the MaxMind GeoLite2 database and is attributed accordingly for its usage.
@@ -41,11 +41,11 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
     git clone https://github.com/jclauzel/R001D00rs
     python3 -m venv ./venv
     source venv/bin/activate
-    pip3 install pyside6 requests maxminddb 
+    pip3 install pyside6 requests maxminddb opencv-python
     python3 tcp_geo_map.py
 
     Windows:
-    pip3 install pyside6 requests maxminddb 
+    pip3 install pyside6 requests maxminddb opencv-python
 """
 
 import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, logging
@@ -53,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG to see diagnostic messages
+    level=logging.WARNING,  # Changed to DEBUG to see diagnostic messages
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.7" # Current script version
+VERSION = "2.9.8" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -125,16 +125,18 @@ LEAFLET_RESOURCES_ABOUT_TEXT = """Leaflet is an open-source JavaScript library f
 PROCESS_ROW_INDEX = 0     # Index of the 'Process' column in the table
 PID_ROW_INDEX = 1         # Index of the 'PID' column in the table
 SUSPECT_ROW_INDEX = 2     # Index of the 'Suspect' column in the table
-LOCAL_ADDRESS_ROW_INDEX = 3    # Index of the 'Local Address' column in the table
-LOCAL_PORT_ROW_INDEX = 4      # Index of the 'Local Port' column in the table
-REMOTE_ADDRESS_ROW_INDEX = 5  # Index of the 'Remote Address' column in the table
-REMOTE_PORT_ROW_INDEX = 6     # Index of the 'Remote Port' column in the table
-NAME_ROW_INDEX = 7        # Index of the 'Name' column in the table
-IP_TYPE_ROW_INDEX = 8      # Index of the 'IP Type' column in the table
-LOCATION_LAT_ROW_INDEX = 9   # Index of the 'Location' column in the table
-LOCATION_LON_ROW_INDEX = 10  # Index of the 'Location' column in the table
+PROTOCOL_ROW_INDEX = 3    # Index of the 'Protocol' column in the table (TCP/UDP)
+LOCAL_ADDRESS_ROW_INDEX = 4    # Index of the 'Local Address' column in the table
+LOCAL_PORT_ROW_INDEX = 5      # Index of the 'Local Port' column in the table
+REMOTE_ADDRESS_ROW_INDEX = 6  # Index of the 'Remote Address' column in the table
+REMOTE_PORT_ROW_INDEX = 7     # Index of the 'Remote Port' column in the table
+NAME_ROW_INDEX = 8        # Index of the 'Name' column in the table
+IP_TYPE_ROW_INDEX = 9      # Index of the 'IP Type' column in the table
+LOCATION_LAT_ROW_INDEX = 10   # Index of the 'Location' column in the table
+LOCATION_LON_ROW_INDEX = 11  # Index of the 'Location' column in the table
 PID_COLUMN_SIZE = 60
 SUSPECT_COLUMN_SIZE = 30
+PROTOCOL_COLUMN_SIZE = 55
 PORTS_COLUMN_SIZE = 70
 IP_TYPE_COLUMN_SIZE = 20
 
@@ -253,7 +255,7 @@ class DNSWorker(threading.Thread):
 class TCPConnectionViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"TCP Geo Map - R001D00rs - v {VERSION}")
+        self.setWindowTitle(f"TCP/UDP Geo Map - R001D00rs - v {VERSION}")
         self.setGeometry(100, 100, 1200, 800)
         # pending restore info will be applied on first showEvent to avoid races
         self._pending_restore = None
@@ -1681,11 +1683,11 @@ class TCPConnectionViewer(QMainWindow):
         self.timer_replay_connections = QTimer(self)
 
         # Left panel for connection list
-        self.left_panel = QGroupBox("Active Connections")
+        self.left_panel = QGroupBox("Active TCP/UDP Connections")
         self.left_layout = QVBoxLayout()
 
         # Right panel for map
-        self.right_panel = QGroupBox("Network Connections Map")
+        self.right_panel = QGroupBox("Network Connections Map (TCP/UDP)")
         self.right_layout = QVBoxLayout()
 
         self.slider = QSlider(Qt.Horizontal)
@@ -1711,7 +1713,7 @@ class TCPConnectionViewer(QMainWindow):
         # Connection table
         self.connection_table = QTableWidget(0, LOCATION_LON_ROW_INDEX+1)
         self.connection_table.setHorizontalHeaderLabels([
-            "Process", "PID", "C2", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon"
+            "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon"
         ])
 
         # Connect the header clicked signal to a custom sort function
@@ -1726,6 +1728,7 @@ class TCPConnectionViewer(QMainWindow):
 
         self.connection_table.setColumnWidth(PID_ROW_INDEX, PID_COLUMN_SIZE)
         self.connection_table.setColumnWidth(SUSPECT_ROW_INDEX, SUSPECT_COLUMN_SIZE)
+        self.connection_table.setColumnWidth(PROTOCOL_ROW_INDEX, PROTOCOL_COLUMN_SIZE)
         self.connection_table.setColumnWidth(LOCAL_PORT_ROW_INDEX, PORTS_COLUMN_SIZE)
         self.connection_table.setColumnWidth(REMOTE_PORT_ROW_INDEX, PORTS_COLUMN_SIZE)
         self.connection_table.setColumnWidth(IP_TYPE_ROW_INDEX, IP_TYPE_COLUMN_SIZE)
@@ -1854,6 +1857,12 @@ class TCPConnectionViewer(QMainWindow):
         self.reset_connections_btn = QPushButton("Reset connections")
         self.reset_connections_btn.clicked.connect(self.reset_connections)
         self.controls_layout.addWidget(self.reset_connections_btn)
+
+        # Generate video button (shown only when screenshots exist)
+        self.generate_video_btn = QPushButton("Generate .mp4 video file")
+        self.generate_video_btn.clicked.connect(self.generate_video_from_screenshots)
+        self.generate_video_btn.setVisible(False)  # Hidden by default, shown when screenshots exist
+        self.controls_layout.addWidget(self.generate_video_btn)
 
         # Put map and controls into the vertical splitter (map on top, controls below)
         self.right_splitter.addWidget(self.map_view)
@@ -2297,12 +2306,13 @@ class TCPConnectionViewer(QMainWindow):
         return (
             conn1['process'] == conn2['process'] and
             conn1['pid'] == conn2['pid'] and
+            conn1.get('protocol', 'TCP') == conn2.get('protocol', 'TCP') and
             conn1['local'] == conn2['local'] and
             conn1['localport'] == conn2['localport'] and
             conn1['remote'] == conn2['remote'] and
             conn1['remoteport'] == conn2['remoteport'] and
             conn1['ip_type'] == conn2['ip_type'] 
-        )  
+        )
 
     def is_connection_in_list(self, connection, connection_list):
         for conn in connection_list:
@@ -2312,13 +2322,14 @@ class TCPConnectionViewer(QMainWindow):
 
     def get_active_tcp_connections(self, position_timeline=None):
         """
-        Enumerate TCP connections and build the connection snapshot.
+        Enumerate TCP and UDP connections and build the connection snapshot.
 
         Performance and reliability improvements:
         - Use local variable references to reduce attribute lookups.
         - Avoid multiple calls to psutil.net_connections().
         - Build ip collection and perform reverse DNS in batches only when enabled.
         - Write to `self.connection_list` with minimum temporary allocations.
+        - Captures both TCP (ESTABLISHED) and UDP (all) connections.
         """
 
         connections = []
@@ -2326,13 +2337,21 @@ class TCPConnectionViewer(QMainWindow):
         global do_capture_screenshots
 
 
-        # Get all connections once
+        # Get all connections once (both TCP and UDP)
         all_connections = psutil.net_connections(kind='inet')
 
         # Collect remote IPs for DNS resolution (only those we care about)
         ips_to_resolve = set()
         for c in all_connections:
-            if c.status == psutil.CONN_ESTABLISHED and getattr(c, "raddr", None):
+            # For TCP, only process ESTABLISHED connections
+            # For UDP, process all connections (UDP is connectionless)
+            is_tcp = (c.type == socket.SOCK_STREAM)
+            is_udp = (c.type == socket.SOCK_DGRAM)
+
+            if is_tcp and c.status != psutil.CONN_ESTABLISHED:
+                continue
+
+            if getattr(c, "raddr", None):
                 raddr_ip = getattr(c.raddr, "ip", None)
                 if raddr_ip and raddr_ip not in ('127.0.0.1', '::1'):
                     ips_to_resolve.add(raddr_ip)
@@ -2385,7 +2404,15 @@ class TCPConnectionViewer(QMainWindow):
                 return []
 
         for conn in current_connections:
-            if conn.status != psutil.CONN_ESTABLISHED:
+            # Determine protocol type
+            is_tcp = (conn.type == socket.SOCK_STREAM)
+            is_udp = (conn.type == socket.SOCK_DGRAM)
+
+            protocol = "TCP" if is_tcp else ("UDP" if is_udp else "Unknown")
+
+            # For TCP, only process ESTABLISHED connections
+            # For UDP, process all connections (connectionless protocol)
+            if is_tcp and conn.status != psutil.CONN_ESTABLISHED:
                 continue
 
             try:
@@ -2444,6 +2471,7 @@ class TCPConnectionViewer(QMainWindow):
                                     'process': process_name,
                                     'pid': str(pid) if pid else "",
                                     'suspect': 'Yes',
+                                    'protocol': protocol,
                                     'local': local_addr,
                                     'localport': local_port,
                                     'remote': remote_addr,
@@ -2464,6 +2492,7 @@ class TCPConnectionViewer(QMainWindow):
                     'process': process_name,
                     'pid': str(pid) if pid else "",
                     'suspect': '',
+                    'protocol': protocol,
                     'local': local_addr,
                     'localport': local_port,
                     'remote': remote_addr,
@@ -2551,6 +2580,12 @@ class TCPConnectionViewer(QMainWindow):
                     QTimer.singleShot(1500, self._capture_map_screenshot)
                 except Exception as e:
                     logging.error(f"Failed to schedule screenshot capture: {e}")
+
+            # Update video button visibility whenever connections are refreshed
+            try:
+                self._update_video_button_visibility()
+            except Exception:
+                pass
 
         return connections
     
@@ -2660,7 +2695,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             return ""
 
-    def update_map(self, connection_data, force_show_tooltip=False, stats_text=""):
+    def update_map(self, connection_data, force_show_tooltip=False, stats_text="", datetime_text=""):
         """
         Load map HTML once and afterwards update markers via injected JavaScript.
         Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
@@ -2759,8 +2794,12 @@ class TCPConnectionViewer(QMainWindow):
             else:
                 stats_text = f"{display_name}"
 
-        # Send stats_text to JS via setStats(...) helper
-        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)});"
+        # Determine if we should show recording indicator (only in live mode with screenshots enabled)
+        # Live mode is when datetime_text starts with "Live:"
+        is_recording = do_capture_screenshots and datetime_text.startswith("Live:")
+
+        # Send stats_text, datetime_text, and recording indicator status to JS
+        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)}); setDateTime({json.dumps(datetime_text)}); setRecordingIndicator({str(is_recording).lower()});"
 
         # Check reload attempt limit to prevent infinite loops
         if not getattr(self, "map_initialized", False):
@@ -2795,11 +2834,27 @@ class TCPConnectionViewer(QMainWindow):
                        #map-stats { position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:1000; 
                                     background:rgba(255,255,255,0.85); padding:6px 10px; border-radius:6px; 
                                     font-family:Arial, sans-serif; font-size:14px; pointer-events:none; }
+                       /* datetime overlay at bottom center */
+                       #map-datetime { position:absolute; bottom:25px; left:50%; transform:translateX(-50%); z-index:1000;
+                                       background:rgba(255,255,255,0.85); padding:6px 10px 6px 6px; border-radius:6px;
+                                       font-family:Arial, sans-serif; font-size:12px; pointer-events:none; 
+                                       display:flex; align-items:center; gap:8px; }
+                       /* red recording pulse indicator */
+                       #recording-indicator { width:10px; height:10px; background-color:#ff0000; border-radius:50%; 
+                                              display:none; animation:pulse-red 1.5s ease-in-out infinite; }
+                       @keyframes pulse-red {
+                           0%, 100% { opacity:1; transform:scale(1); }
+                           50% { opacity:0.3; transform:scale(0.85); }
+                       }
                 </style>
             </head>
             <body>
                 <div id="map"></div>
                 <div id="map-stats"></div>
+                <div id="map-datetime">
+                    <span id="recording-indicator"></span>
+                    <span id="datetime-text"></span>
+                </div>
 
                 <script>
                     // injectLocalLeaflet(true) => also try local CSS + set marker resources path
@@ -3029,8 +3084,13 @@ class TCPConnectionViewer(QMainWindow):
                                                     var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
                                                     var marker = L.marker([conn.lat, conn.lng], { icon: icon }).addTo(map);
                                                     var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
-                                                    marker.bindTooltip(conn.process || '', tooltipOptions);
+
+                                                    // Include protocol in tooltip
+                                                    var tooltipText = (conn.process || '') + ' [' + (conn.protocol || 'TCP') + ']';
+                                                    marker.bindTooltip(tooltipText, tooltipOptions);
+
                                                     var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
+                                                                    "Protocol: " + (conn.protocol || 'TCP') + "<br>" +
                                                                     "PID: " + (conn.pid || '') + "<br>" +
                                                                     "Remote: " + (conn.remote || '') + "<br>" +
                                                                     "Local: " + (conn.local || '') + "<br>";
@@ -3064,9 +3124,27 @@ class TCPConnectionViewer(QMainWindow):
                                         } catch(e) {}
                                     }
 
+                                    function setDateTime(dt) {
+                                        try {
+                                            var el = document.getElementById('datetime-text');
+                                            if (el) { el.innerText = dt || ''; }
+                                        } catch(e) {}
+                                    }
+
+                                    function setRecordingIndicator(isRecording) {
+                                        try {
+                                            var indicator = document.getElementById('recording-indicator');
+                                            if (indicator) {
+                                                indicator.style.display = isRecording ? 'block' : 'none';
+                                            }
+                                        } catch(e) {}
+                                    }
+
                                     // expose to the host Python code
                                     window.updateConnections = updateConnections;
                                     window.setStats = setStats;
+                                    window.setDateTime = setDateTime;
+                                    window.setRecordingIndicator = setRecordingIndicator;
 
                                     // Notify Python that map is fully initialized
                                     console.log('[Map Init] Notifying Python that map is ready');
@@ -3314,8 +3392,8 @@ class TCPConnectionViewer(QMainWindow):
         if len(self.connections) != number_of_previous_objects:
             self.map_redraw = True
             self.map_objects = len(self.connections)
-            
-            self.left_panel.setTitle(f"Active Connections - {self.map_objects} connections")
+
+            self.left_panel.setTitle(f"Active TCP/UDP Connections - {self.map_objects} connections")
         
         # Update table
         self.connection_table.setRowCount(0)
@@ -3346,10 +3424,11 @@ class TCPConnectionViewer(QMainWindow):
 
                 if not (show_only_remote_connections and ip in ('127.0.0.1','::1')):
                     self.connection_table.insertRow(row)
-                
+
                     self.connection_table.setItem(row, PROCESS_ROW_INDEX, QTableWidgetItem(conn['process']))
                     self.connection_table.setItem(row, PID_ROW_INDEX , QTableWidgetItem(conn['pid']))
                     self.connection_table.setItem(row, SUSPECT_ROW_INDEX, QTableWidgetItem(conn['suspect']))
+                    self.connection_table.setItem(row, PROTOCOL_ROW_INDEX, QTableWidgetItem(conn.get('protocol', 'TCP')))
                     self.connection_table.setItem(row, LOCAL_ADDRESS_ROW_INDEX, QTableWidgetItem(conn['local']))
                     self.connection_table.setItem(row, LOCAL_PORT_ROW_INDEX, QTableWidgetItem(conn['localport']))
                     self.connection_table.setItem(row, REMOTE_ADDRESS_ROW_INDEX, QTableWidgetItem(conn['remote']))
@@ -3383,10 +3462,29 @@ class TCPConnectionViewer(QMainWindow):
                     self.status_label.setText("Warning: Suspect C2 connections detected!")
                 
                 connections_to_show_on_map.append(conn)
-            
+
+        # Get datetime for the current view (live or timeline)
+        datetime_text = ""
+        if slider_position is None or slider_position is False:
+            # Live mode - use current time
+            datetime_text = f"Live: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        else:
+            # Timeline mode - get datetime from connection_list
+            if hasattr(self, 'connection_list') and self.connection_list:
+                idx = min(slider_position, len(self.connection_list) - 1)
+                if idx >= 0:
+                    try:
+                        dt = self.connection_list[idx].get('datetime')
+                        if isinstance(dt, datetime.datetime):
+                            datetime_text = f"Timeline: {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+                        else:
+                            datetime_text = f"Timeline: {str(dt)}"
+                    except Exception:
+                        datetime_text = ""
+
         # Build single-line stats string and update map with it
         stats_line = f"Geo resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses}"
-        self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line)
+        self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line, datetime_text=datetime_text)
 
         if table_column_sort_index>-1:
             self.column_resort(table_column_sort_index)  
@@ -3490,6 +3588,8 @@ class TCPConnectionViewer(QMainWindow):
 
                 if success:
                     logging.info(f"Screenshot saved: {filepath}")
+                    # Update video button visibility after capturing screenshot
+                    self._update_video_button_visibility()
                 else:
                     logging.warning(f"Failed to save screenshot: {filepath}")
             else:
@@ -3497,6 +3597,133 @@ class TCPConnectionViewer(QMainWindow):
 
         except Exception as e:
             logging.error(f"Error capturing screenshot: {e}")
+
+    def generate_video_from_screenshots(self):
+        """Generate MP4 video from all screenshots in the screen_captures folder"""
+        try:
+            # Check if cv2 is available
+            try:
+                import cv2
+            except ImportError:
+                QMessageBox.critical(
+                    self,
+                    "Missing Dependency",
+                    "OpenCV (cv2) is required to generate videos.\n\n"
+                    "Please install it using:\n"
+                    "pip install opencv-python\n\n"
+                    "Then restart the application."
+                )
+                return
+
+            # Check if screenshots directory exists
+            if not os.path.exists(SCREENSHOTS_DIR):
+                QMessageBox.warning(
+                    self,
+                    "No Screenshots",
+                    f"Screenshot directory '{SCREENSHOTS_DIR}' does not exist.\n\n"
+                    "Enable screenshot capture and capture some connections first."
+                )
+                return
+
+            # Get all screenshot files
+            screenshot_files = []
+            for filename in os.listdir(SCREENSHOTS_DIR):
+                if filename.startswith("tcp_geo_map_") and filename.endswith(".jpg"):
+                    filepath = os.path.join(SCREENSHOTS_DIR, filename)
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                        screenshot_files.append((mtime, filepath, filename))
+                    except Exception:
+                        continue
+
+            if len(screenshot_files) < 2:
+                QMessageBox.warning(
+                    self,
+                    "Not Enough Screenshots",
+                    f"Found only {len(screenshot_files)} screenshot(s).\n\n"
+                    "At least 2 screenshots are required to generate a video.\n"
+                    "Capture more connections with screenshot capture enabled."
+                )
+                return
+
+            # Sort by modification time (oldest first)
+            screenshot_files.sort(key=lambda x: x[0])
+
+            # Generate output filename with current timestamp
+            timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+            output_filename = f"tcp_geo_map_{timestamp}.mp4"
+            output_path = os.path.join(SCREENSHOTS_DIR, output_filename)
+
+            # Read first image to get dimensions
+            first_frame = cv2.imread(screenshot_files[0][1])
+            if first_frame is None:
+                raise Exception("Failed to read first screenshot")
+
+            height, width, _ = first_frame.shape
+            logging.info(f"Video dimensions: {width}x{height}")
+
+            # Define codec and create VideoWriter object
+            # Use mp4v codec for MP4 format (widely compatible)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = 1  # 1 frame per second (adjust as needed)
+
+            video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+            if not video_writer.isOpened():
+                raise Exception("Failed to create video writer")
+
+            # Write each frame to video
+            frames_written = 0
+            for mtime, filepath, filename in screenshot_files:
+                try:
+                    frame = cv2.imread(filepath)
+                    if frame is not None:
+                        # Ensure frame has same dimensions as first frame
+                        if frame.shape[0] != height or frame.shape[1] != width:
+                            frame = cv2.resize(frame, (width, height))
+
+                        video_writer.write(frame)
+                        frames_written += 1
+                        logging.debug(f"Added frame {frames_written}/{len(screenshot_files)}: {filename}")
+                    else:
+                        logging.warning(f"Failed to read screenshot: {filename}")
+                except Exception as e:
+                    logging.warning(f"Error adding frame {filename}: {e}")
+                    continue
+
+            # Release the video writer
+            video_writer.release()
+
+            if frames_written > 0:
+                QMessageBox.information(
+                    self,
+                    "Video Generated",
+                    f"Successfully generated video:\n{output_path}\n\n"
+                    f"Frames: {frames_written}/{len(screenshot_files)}\n"
+                    f"Duration: {frames_written} seconds @ {fps} FPS\n"
+                    f"Resolution: {width}x{height}"
+                )
+                logging.info(f"Video generated: {output_path} ({frames_written} frames)")
+            else:
+                raise Exception("No frames were written to video")
+
+        except ImportError as e:
+            QMessageBox.critical(
+                self,
+                "Missing Dependency",
+                f"OpenCV (cv2) is required to generate videos.\n\n"
+                f"Please install it using:\n"
+                f"pip install opencv-python\n\n"
+                f"Error: {e}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Video Generation Error",
+                f"Failed to generate video:\n{str(e)}\n\n"
+                f"Check the logs for more details."
+            )
+            logging.error(f"Error generating video: {e}")
 
     def _cleanup_old_screenshots(self):
         """Delete old screenshot files to keep only the most recent max_connection_list_filo_buffer_size files"""
@@ -3552,8 +3779,34 @@ class TCPConnectionViewer(QMainWindow):
             else:
                 logging.debug("_cleanup_old_screenshots: No files to delete")
 
+            # Update video button visibility
+            self._update_video_button_visibility()
+
         except Exception as e:
             logging.error(f"Error cleaning up old screenshots: {e}")
+
+    def _update_video_button_visibility(self):
+        """Show or hide the Generate Video button based on whether screenshots exist"""
+        try:
+            if not hasattr(self, 'generate_video_btn'):
+                return
+
+            screenshot_count = 0
+            if os.path.exists(SCREENSHOTS_DIR):
+                for filename in os.listdir(SCREENSHOTS_DIR):
+                    if filename.startswith("tcp_geo_map_") and filename.endswith(".jpg"):
+                        screenshot_count += 1
+
+            # Show button only if we have at least 2 screenshots (need multiple frames for video)
+            self.generate_video_btn.setVisible(screenshot_count >= 2)
+
+            if screenshot_count >= 2:
+                self.generate_video_btn.setText(f"Generate .mp4 video file ({screenshot_count} frames)")
+            else:
+                self.generate_video_btn.setText("Generate .mp4 video file")
+
+        except Exception as e:
+            logging.warning(f"Error updating video button visibility: {e}")
 
     def on_tab_changed(self, index):
         """Called when user switches tabs - update Summary tab if selected"""
