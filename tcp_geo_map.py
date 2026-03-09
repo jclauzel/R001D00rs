@@ -53,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARNING,  # Changed to DEBUG to see diagnostic messages
+    level=logging.WARNING,  # Changed to INFO to see cleanup diagnostic messages
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -61,11 +61,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayo
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget) 
 from PySide6.QtGui import QIcon, QAction
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.8" # Current script version
+VERSION = "2.9.9" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -145,7 +145,7 @@ TIME_SLIDER_TEXT = "Time slider position: "
 START_CAPTURE_BUTTON_TEXT = "Start capture live connections"
 STOP_CAPTURE_BUTTON_TEXT = "Stop capture live connections" 
 
-max_connection_list_filo_buffer_size = 5  # Maximum number of connection snapshots to keep in memory. The larger this value the more memory will be used. When the max size is reached the oldest connection snapshot will be removed from memory.
+max_connection_list_filo_buffer_size = 1000  # Maximum number of connection snapshots to keep in memory. The larger this value the more memory will be used. When the max size is reached the oldest connection snapshot will be removed from memory.
 show_tooltip = False # Show tooltips on map markers
 map_refresh_interval = 2000  # Map refresh time in milliseconds
 show_only_new_active_connections = False # Show only new connections in the table
@@ -173,6 +173,147 @@ public_ip_dns_attempts_lock = threading.Lock()
 
 PUBLIC_IP_ENQUEUE_MAX_CACHE_SIZE = 10000 # maximum number of public IPs to keep in the enqueue cache to avoid unbounded growth
 PUBLIC_IP_ENQUEUE_TIMER_INTERVAL = 10000 # timer scavanger in milliseconds
+
+class VideoGeneratorSignals(QObject):
+    """Signals for video generation worker"""
+    finished = Signal(bool, str, dict)  # success, message, stats
+    error = Signal(str)  # error message
+    progress = Signal(int, int)  # current frame, total frames
+
+class VideoGeneratorWorker(QRunnable):
+    """
+    Worker thread for generating MP4 video from screenshots.
+    Runs in QThreadPool to avoid blocking the UI.
+    """
+    def __init__(self, screenshots_dir):
+        super().__init__()
+        self.screenshots_dir = screenshots_dir
+        self.signals = VideoGeneratorSignals()
+
+    def run(self):
+        """Execute the video generation in a background thread"""
+        try:
+            # Import cv2 here to avoid import errors in main thread
+            try:
+                import cv2
+            except ImportError:
+                self.signals.error.emit(
+                    "OpenCV (cv2) is required to generate videos.\n\n"
+                    "Please install it using:\n"
+                    "pip install opencv-python\n\n"
+                    "Then restart the application."
+                )
+                return
+
+            # Check if screenshots directory exists
+            if not os.path.exists(self.screenshots_dir):
+                self.signals.error.emit(
+                    f"Screenshot directory '{self.screenshots_dir}' does not exist.\n\n"
+                    "Enable screenshot capture and capture some connections first."
+                )
+                return
+
+            # Get all screenshot files
+            screenshot_files = []
+            for filename in os.listdir(self.screenshots_dir):
+                if filename.startswith("tcp_geo_map_") and filename.endswith(".jpg"):
+                    filepath = os.path.join(self.screenshots_dir, filename)
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                        screenshot_files.append((mtime, filepath, filename))
+                    except Exception:
+                        continue
+
+            if len(screenshot_files) < 2:
+                self.signals.error.emit(
+                    f"Found only {len(screenshot_files)} screenshot(s).\n\n"
+                    "At least 2 screenshots are required to generate a video.\n"
+                    "Capture more connections with screenshot capture enabled."
+                )
+                return
+
+            # Sort by modification time (oldest first)
+            screenshot_files.sort(key=lambda x: x[0])
+
+            # Generate output filename with current timestamp
+            timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+            output_filename = f"tcp_geo_map_{timestamp}.mp4"
+            output_path = os.path.join(self.screenshots_dir, output_filename)
+
+            # Read first image to get dimensions
+            first_frame = cv2.imread(screenshot_files[0][1])
+            if first_frame is None:
+                self.signals.error.emit("Failed to read first screenshot")
+                return
+
+            height, width, _ = first_frame.shape
+            logging.info(f"Video dimensions: {width}x{height}")
+
+            # Define codec and create VideoWriter object
+            # Use mp4v codec for MP4 format (widely compatible)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = 1  # 1 frame per second (adjust as needed)
+
+            video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+            if not video_writer.isOpened():
+                self.signals.error.emit("Failed to create video writer")
+                return
+
+            # Write each frame to video
+            frames_written = 0
+            total_frames = len(screenshot_files)
+
+            for idx, (mtime, filepath, filename) in enumerate(screenshot_files):
+                try:
+                    frame = cv2.imread(filepath)
+                    if frame is not None:
+                        # Ensure frame has same dimensions as first frame
+                        if frame.shape[0] != height or frame.shape[1] != width:
+                            frame = cv2.resize(frame, (width, height))
+
+                        video_writer.write(frame)
+                        frames_written += 1
+
+                        # Emit progress signal
+                        self.signals.progress.emit(frames_written, total_frames)
+
+                        logging.debug(f"Added frame {frames_written}/{total_frames}: {filename}")
+                    else:
+                        logging.warning(f"Failed to read screenshot: {filename}")
+                except Exception as e:
+                    logging.warning(f"Error adding frame {filename}: {e}")
+                    continue
+
+            # Release the video writer
+            video_writer.release()
+
+            if frames_written > 0:
+                stats = {
+                    'output_path': output_path,
+                    'frames_written': frames_written,
+                    'total_files': len(screenshot_files),
+                    'fps': fps,
+                    'width': width,
+                    'height': height
+                }
+
+                success_msg = (
+                    f"Successfully generated video:\n{output_path}\n\n"
+                    f"Frames: {frames_written}/{len(screenshot_files)}\n"
+                    f"Duration: {frames_written} seconds @ {fps} FPS\n"
+                    f"Resolution: {width}x{height}"
+                )
+
+                self.signals.finished.emit(True, success_msg, stats)
+                logging.info(f"Video generated: {output_path} ({frames_written} frames)")
+            else:
+                self.signals.error.emit("No frames were written to video")
+
+        except Exception as e:
+            error_msg = f"Failed to generate video:\n{str(e)}\n\nCheck the logs for more details."
+            self.signals.error.emit(error_msg)
+            logging.error(f"Error generating video: {e}")
 
 class DNSWorker(threading.Thread):
     """
@@ -288,6 +429,10 @@ class TCPConnectionViewer(QMainWindow):
 
         self.dns_worker = DNSWorker(ip_cache, cache_lock, on_resolve=_dns_notify)
         self.dns_worker.start()
+
+        # Initialize thread pool for async operations (video generation, etc.)
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(2)  # Limit concurrent background tasks
 
         self.load_databases()
         self._check_and_download_leaflet_resources()
@@ -2543,18 +2688,6 @@ class TCPConnectionViewer(QMainWindow):
                     self.connection_list.pop(0)
                 self.connection_list_counter = len(self.connection_list)
 
-                # Cleanup old screenshots when buffer is full (if screenshot capture is enabled)
-                global do_capture_screenshots
-                logging.debug(f"Buffer full (counter={self.connection_list_counter}, max={max_connection_list_filo_buffer_size}). do_capture_screenshots={do_capture_screenshots}")
-                if do_capture_screenshots:
-                    try:
-                        logging.info("Triggering screenshot cleanup...")
-                        self._cleanup_old_screenshots()
-                    except Exception as e:
-                        logging.error(f"Failed to cleanup old screenshots: {e}")
-                else:
-                    logging.debug("Screenshot capture disabled - skipping cleanup")
-
             # keep slider in sync
             self.slider.setMaximum(self.connection_list_counter)
             self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)-1))
@@ -3588,8 +3721,13 @@ class TCPConnectionViewer(QMainWindow):
 
                 if success:
                     logging.info(f"Screenshot saved: {filepath}")
-                    # Update video button visibility after capturing screenshot
-                    self._update_video_button_visibility()
+
+                    # Immediately cleanup old screenshots after saving new one
+                    # This ensures we maintain the buffer size limit
+                    try:
+                        self._cleanup_old_screenshots()
+                    except Exception as cleanup_error:
+                        logging.error(f"Failed to cleanup after screenshot save: {cleanup_error}")
                 else:
                     logging.warning(f"Failed to save screenshot: {filepath}")
             else:
@@ -3599,9 +3737,9 @@ class TCPConnectionViewer(QMainWindow):
             logging.error(f"Error capturing screenshot: {e}")
 
     def generate_video_from_screenshots(self):
-        """Generate MP4 video from all screenshots in the screen_captures folder"""
+        """Generate MP4 video from all screenshots in the screen_captures folder (async)"""
         try:
-            # Check if cv2 is available
+            # Check if cv2 is available (quick check before starting worker)
             try:
                 import cv2
             except ImportError:
@@ -3615,7 +3753,7 @@ class TCPConnectionViewer(QMainWindow):
                 )
                 return
 
-            # Check if screenshots directory exists
+            # Quick validation before starting async operation
             if not os.path.exists(SCREENSHOTS_DIR):
                 QMessageBox.warning(
                     self,
@@ -3625,121 +3763,132 @@ class TCPConnectionViewer(QMainWindow):
                 )
                 return
 
-            # Get all screenshot files
-            screenshot_files = []
-            for filename in os.listdir(SCREENSHOTS_DIR):
-                if filename.startswith("tcp_geo_map_") and filename.endswith(".jpg"):
-                    filepath = os.path.join(SCREENSHOTS_DIR, filename)
-                    try:
-                        mtime = os.path.getmtime(filepath)
-                        screenshot_files.append((mtime, filepath, filename))
-                    except Exception:
-                        continue
+            # Count screenshots
+            screenshot_count = sum(
+                1 for f in os.listdir(SCREENSHOTS_DIR)
+                if f.startswith("tcp_geo_map_") and f.endswith(".jpg")
+            )
 
-            if len(screenshot_files) < 2:
+            if screenshot_count < 2:
                 QMessageBox.warning(
                     self,
                     "Not Enough Screenshots",
-                    f"Found only {len(screenshot_files)} screenshot(s).\n\n"
+                    f"Found only {screenshot_count} screenshot(s).\n\n"
                     "At least 2 screenshots are required to generate a video.\n"
                     "Capture more connections with screenshot capture enabled."
                 )
                 return
 
-            # Sort by modification time (oldest first)
-            screenshot_files.sort(key=lambda x: x[0])
+            # Disable button and update text
+            self.generate_video_btn.setEnabled(False)
+            self.generate_video_btn.setText("Generating .mp4 video please wait...")
+            logging.info(f"Starting async video generation with {screenshot_count} screenshots")
 
-            # Generate output filename with current timestamp
-            timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-            output_filename = f"tcp_geo_map_{timestamp}.mp4"
-            output_path = os.path.join(SCREENSHOTS_DIR, output_filename)
+            # Create worker and connect signals
+            worker = VideoGeneratorWorker(SCREENSHOTS_DIR)
 
-            # Read first image to get dimensions
-            first_frame = cv2.imread(screenshot_files[0][1])
-            if first_frame is None:
-                raise Exception("Failed to read first screenshot")
+            worker.signals.finished.connect(self._on_video_generation_finished)
+            worker.signals.error.connect(self._on_video_generation_error)
+            worker.signals.progress.connect(self._on_video_generation_progress)
 
-            height, width, _ = first_frame.shape
-            logging.info(f"Video dimensions: {width}x{height}")
+            # Start the worker in the thread pool
+            self.thread_pool.start(worker)
 
-            # Define codec and create VideoWriter object
-            # Use mp4v codec for MP4 format (widely compatible)
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            fps = 1  # 1 frame per second (adjust as needed)
-
-            video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-            if not video_writer.isOpened():
-                raise Exception("Failed to create video writer")
-
-            # Write each frame to video
-            frames_written = 0
-            for mtime, filepath, filename in screenshot_files:
-                try:
-                    frame = cv2.imread(filepath)
-                    if frame is not None:
-                        # Ensure frame has same dimensions as first frame
-                        if frame.shape[0] != height or frame.shape[1] != width:
-                            frame = cv2.resize(frame, (width, height))
-
-                        video_writer.write(frame)
-                        frames_written += 1
-                        logging.debug(f"Added frame {frames_written}/{len(screenshot_files)}: {filename}")
-                    else:
-                        logging.warning(f"Failed to read screenshot: {filename}")
-                except Exception as e:
-                    logging.warning(f"Error adding frame {filename}: {e}")
-                    continue
-
-            # Release the video writer
-            video_writer.release()
-
-            if frames_written > 0:
-                QMessageBox.information(
-                    self,
-                    "Video Generated",
-                    f"Successfully generated video:\n{output_path}\n\n"
-                    f"Frames: {frames_written}/{len(screenshot_files)}\n"
-                    f"Duration: {frames_written} seconds @ {fps} FPS\n"
-                    f"Resolution: {width}x{height}"
-                )
-                logging.info(f"Video generated: {output_path} ({frames_written} frames)")
-            else:
-                raise Exception("No frames were written to video")
-
-        except ImportError as e:
-            QMessageBox.critical(
-                self,
-                "Missing Dependency",
-                f"OpenCV (cv2) is required to generate videos.\n\n"
-                f"Please install it using:\n"
-                f"pip install opencv-python\n\n"
-                f"Error: {e}"
-            )
         except Exception as e:
+            # Re-enable button on unexpected error
+            self.generate_video_btn.setEnabled(True)
+            self.generate_video_btn.setText("Generate .mp4 video file")
+
             QMessageBox.critical(
                 self,
                 "Video Generation Error",
-                f"Failed to generate video:\n{str(e)}\n\n"
-                f"Check the logs for more details."
+                f"Failed to start video generation:\n{str(e)}"
             )
-            logging.error(f"Error generating video: {e}")
+            logging.error(f"Error starting video generation: {e}")
+
+    def _on_video_generation_finished(self, success, message, stats):
+        """Called when video generation completes successfully"""
+        try:
+            # Re-enable button and restore text
+            screenshot_count = sum(
+                1 for f in os.listdir(SCREENSHOTS_DIR)
+                if f.startswith("tcp_geo_map_") and f.endswith(".jpg")
+            )
+
+            if screenshot_count >= 2:
+                self.generate_video_btn.setText(f"Generate .mp4 video file ({screenshot_count} frames)")
+            else:
+                self.generate_video_btn.setText("Generate .mp4 video file")
+
+            self.generate_video_btn.setEnabled(True)
+
+            # Show success message
+            if success:
+                QMessageBox.information(
+                    self,
+                    "Video Generated",
+                    message
+                )
+        except Exception as e:
+            logging.error(f"Error in video generation finished handler: {e}")
+
+    def _on_video_generation_error(self, error_message):
+        """Called when video generation fails"""
+        try:
+            # Re-enable button and restore text
+            screenshot_count = sum(
+                1 for f in os.listdir(SCREENSHOTS_DIR)
+                if f.startswith("tcp_geo_map_") and f.endswith(".jpg")
+            )
+
+            if screenshot_count >= 2:
+                self.generate_video_btn.setText(f"Generate .mp4 video file ({screenshot_count} frames)")
+            else:
+                self.generate_video_btn.setText("Generate .mp4 video file")
+
+            self.generate_video_btn.setEnabled(True)
+
+            # Show error message
+            QMessageBox.critical(
+                self,
+                "Video Generation Error",
+                error_message
+            )
+        except Exception as e:
+            logging.error(f"Error in video generation error handler: {e}")
+
+    def _on_video_generation_progress(self, current_frame, total_frames):
+        """Called when video generation makes progress"""
+        try:
+            # Update button text with progress
+            progress_text = f"Generating video... {current_frame}/{total_frames} frames"
+            self.generate_video_btn.setText(progress_text)
+            logging.debug(f"Video generation progress: {current_frame}/{total_frames}")
+        except Exception as e:
+            logging.error(f"Error updating video generation progress: {e}")
 
     def _cleanup_old_screenshots(self):
         """Delete old screenshot files to keep only the most recent max_connection_list_filo_buffer_size files"""
-        try:
-            global max_connection_list_filo_buffer_size
+        global max_connection_list_filo_buffer_size
 
-            logging.debug(f"_cleanup_old_screenshots: Starting cleanup (max_buffer={max_connection_list_filo_buffer_size})")
+        try:
+            # Ensure we have a valid buffer size (defensive)
+            buffer_limit = max_connection_list_filo_buffer_size
+            if not isinstance(buffer_limit, int) or buffer_limit <= 0:
+                logging.warning(f"Invalid buffer size: {buffer_limit}, defaulting to 5")
+                buffer_limit = 5
+
+            logging.info(f"_cleanup_old_screenshots: Starting cleanup (buffer_limit={buffer_limit})")
 
             # Get all screenshot files in the directory
             if not os.path.exists(SCREENSHOTS_DIR):
                 logging.debug(f"_cleanup_old_screenshots: Directory {SCREENSHOTS_DIR} does not exist")
                 return
 
-            # Find all jpg files matching our naming pattern
+            # Find all jpg files matching our naming pattern (EXCLUDE .mp4 video files)
             screenshot_files = []
             for filename in os.listdir(SCREENSHOTS_DIR):
+                # Only process .jpg screenshot files, NOT .mp4 video files
                 if filename.startswith("tcp_geo_map_") and filename.endswith(".jpg"):
                     filepath = os.path.join(SCREENSHOTS_DIR, filename)
                     try:
@@ -3750,17 +3899,17 @@ class TCPConnectionViewer(QMainWindow):
                         logging.warning(f"Failed to get mtime for {filename}: {e}")
                         continue
 
-            logging.debug(f"_cleanup_old_screenshots: Found {len(screenshot_files)} screenshot files")
+            logging.info(f"_cleanup_old_screenshots: Found {len(screenshot_files)} .jpg screenshot files (excluding .mp4 videos)")
 
             # Sort by modification time (oldest first)
             screenshot_files.sort(key=lambda x: x[0])
 
             # Calculate how many files to delete
             total_files = len(screenshot_files)
-            files_to_keep = max_connection_list_filo_buffer_size
+            files_to_keep = buffer_limit
             files_to_delete = total_files - files_to_keep
 
-            logging.debug(f"_cleanup_old_screenshots: Total={total_files}, Keep={files_to_keep}, Delete={files_to_delete}")
+            logging.info(f"_cleanup_old_screenshots: Total={total_files}, Keep={files_to_keep}, Delete={files_to_delete}")
 
             if files_to_delete > 0:
                 # Delete the oldest files
@@ -3770,12 +3919,12 @@ class TCPConnectionViewer(QMainWindow):
                         _, filepath, filename = screenshot_files[i]
                         os.remove(filepath)
                         deleted_count += 1
-                        logging.debug(f"Deleted old screenshot: {filename}")
+                        logging.info(f"Deleted old screenshot: {filename}")
                     except Exception as e:
                         logging.warning(f"Failed to delete screenshot {filename}: {e}")
 
                 if deleted_count > 0:
-                    logging.info(f"Cleaned up {deleted_count} old screenshot(s). Kept {files_to_keep} most recent files.")
+                    logging.info(f"Cleaned up {deleted_count} old screenshot(s). Kept {files_to_keep} most recent .jpg files.")
             else:
                 logging.debug("_cleanup_old_screenshots: No files to delete")
 
