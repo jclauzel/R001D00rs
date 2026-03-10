@@ -1,6 +1,6 @@
 # Summary
 
-tcp_geo_map.py is a python desktop UI tool that enumerates active TCP connections (via `psutil` like a "netstat") per process, resolves geolocation using (MaxMind GeoLite2) and optionally it can perform reverse DNS/C2 checks. 
+tcp_geo_map.py is a python desktop UI tool that enumerates active TCP and UDP connections (via `psutil` like a "netstat") per process, resolves geolocation using (MaxMind GeoLite2) and optionally it can perform reverse DNS/C2 checks. 
 "Live snapshots" of the outbound TCP connections are then displayed in a Qt GUI (`PySide6`) with a Leaflet map using OpenStreetMap giving a graphical representation of where the current machine connects to.
 If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by default) users will be warned if the machine running the script connects to a suspected remote IP address. 
 
