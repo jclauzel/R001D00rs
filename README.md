@@ -97,6 +97,11 @@ or
 
 pip install -r REQUIREMENTS.txt
 
+
+Then execute script using:
+
+cd R001D00rs 
+
 python3 tcp_geo_map.py
 
 - Windows:
