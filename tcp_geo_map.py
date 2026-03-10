@@ -62,10 +62,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayo
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget) 
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool
+from PySide6.QtWidgets import QStyle
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "3.0.0" # Current script version
+VERSION = "3.0.1" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -183,7 +184,7 @@ process_cache = {}  # {pid: process_name}
 process_cache_lock = threading.Lock()
 
 # Maximum connections to process per refresh (performance limit)
-MAX_CONNECTIONS_PER_REFRESH = 500
+MAX_CONNECTIONS_PER_REFRESH = max_connection_list_filo_buffer_size
 
 class VideoGeneratorSignals(QObject):
     """Signals for video generation worker"""
@@ -461,6 +462,21 @@ class TCPConnectionViewer(QMainWindow):
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(2)  # Limit concurrent background tasks
 
+        # Video button flash animation timer
+        self._video_btn_flash_timer = None
+        self._video_btn_flash_state = False
+        self._video_generating = False  # Flag to block clicks during generation
+
+        # Start capture button flash animation timer
+        self._start_capture_flash_timer = None
+        self._start_capture_flash_state = False
+        self._start_capture_flash_stop_timer = None  # Timer to auto-stop flash after duration
+
+        # Stop button wave animation timer
+        self._stop_btn_wave_timer = None
+        self._stop_btn_wave_index = 0
+        self._stop_btn_wave_patterns = ["....", "0...", ".0..", "..0.", "...0"]
+
         self.load_databases()
         self._check_and_download_leaflet_resources()
 
@@ -478,6 +494,9 @@ class TCPConnectionViewer(QMainWindow):
         self.timer.timeout.connect(self.refresh_connections)
         self.timer.start(map_refresh_interval)  # Refresh every 5 seconds
         self.timer_replay_connections.timeout.connect(self.replay_connections)
+
+        # Start wave animation on stop button (since capture starts automatically)
+        self._start_stop_button_wave()
 
         # Set up cleanup timer for public IP DNS attempt cache
         self.public_ip_dns_cache_cleanup_timer = QTimer(self)
@@ -919,7 +938,8 @@ class TCPConnectionViewer(QMainWindow):
                 global table_column_sort_index, table_column_sort_reverse
                 global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots
 
-                max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
+                MAX_CONNECTIONS_PER_REFRESH = max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
+                
                 do_c2_check = settings.get('do_c2_check', do_c2_check)
                 show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
                 show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
@@ -1441,6 +1461,10 @@ class TCPConnectionViewer(QMainWindow):
             self.start_capture_btn.setVisible(True)
             self.stop_capture_btn.setVisible(False)
             self.toggle_button.setVisible(True)
+            # Stop wave animation when capture stops
+            self._stop_stop_button_wave()
+            # Start flashing to indicate ready to start
+            self._start_capture_button_flash()
 
         if self.connection_list: 
            idx = min(value, len(self.connection_list) - 1)
@@ -1530,8 +1554,12 @@ class TCPConnectionViewer(QMainWindow):
             # Update UI buttons
             if hasattr(self, 'start_capture_btn'):
                 self.start_capture_btn.setVisible(True)
+                # Start flashing to indicate ready to start
+                self._start_capture_button_flash()
             if hasattr(self, 'stop_capture_btn'):
                 self.stop_capture_btn.setVisible(False)
+                # Stop wave animation
+                self._stop_stop_button_wave()
 
             # Trigger screenshot cleanup if enabled (to match new buffer size)
             global do_capture_screenshots
@@ -1549,8 +1577,12 @@ class TCPConnectionViewer(QMainWindow):
                     self.timer.start(map_refresh_interval)
                     if hasattr(self, 'start_capture_btn'):
                         self.start_capture_btn.setVisible(False)
+                        # Stop flashing when capture resumes
+                        self._stop_capture_button_flash()
                     if hasattr(self, 'stop_capture_btn'):
                         self.stop_capture_btn.setVisible(True)
+                        # Start wave animation when capture resumes
+                        self._start_stop_button_wave()
                     if hasattr(self, 'status_label'):
                         self.status_label.setText("Auto-refreshing connections.")
 
@@ -1673,7 +1705,11 @@ class TCPConnectionViewer(QMainWindow):
             self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)))
             self.update_map(self.connections)
             self.start_capture_btn.setVisible(True)
-            self.stop_capture_btn.setVisible(False)        
+            self.stop_capture_btn.setVisible(False)
+            # Stop wave animation when capture stops
+            self._stop_stop_button_wave()
+            # Start flashing to indicate ready to start
+            self._start_capture_button_flash()
 
     def save_connection_list_to_csv(self):
         """
@@ -1827,20 +1863,28 @@ class TCPConnectionViewer(QMainWindow):
                 return  # Already running
 
             self.status_label.setText("Replaying connections.")
-            
+
             # Start refresh timer or process here
             self.timer_replay_connections.start(map_refresh_interval)
 
             self.start_capture_btn.setVisible(False)
-            self.stop_capture_btn.setVisible(False) 
+            self.stop_capture_btn.setVisible(False)
+            # Stop wave animation when replay starts
+            self._stop_stop_button_wave()
+            # Stop flashing when replay starts
+            self._stop_capture_button_flash()
 
         else:
             self.status_label.setText("Connection replay paused.")
-            
+
             # Stop refresh timer or process here
             self.timer_replay_connections.stop()
             self.start_capture_btn.setVisible(True)
-            self.stop_capture_btn.setVisible(False)             
+            self.stop_capture_btn.setVisible(False)
+            # Stop wave animation when replay stops
+            self._stop_stop_button_wave()
+            # Start flashing to indicate ready to start
+            self._start_capture_button_flash()
 
     def init_ui(self):
         self.connection_list = []
@@ -1868,19 +1912,23 @@ class TCPConnectionViewer(QMainWindow):
         # Save Button
         self.save_connections_btn = QPushButton("Save connection list to CSV file")
         self.save_connections_btn.clicked.connect(self.save_all_connection_list_to_csv)
-        
+
         self.save_connections_btn.setVisible(True)
 
-        # Refresh button
-        self.start_capture_btn = QPushButton(START_CAPTURE_BUTTON_TEXT)
+        # Get play and stop icons from Qt's standard icons
+        style = self.style()
+        play_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        stop_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+
+        # Refresh button with play icon (centered)
+        self.start_capture_btn = QPushButton(play_icon, START_CAPTURE_BUTTON_TEXT)
         self.start_capture_btn.clicked.connect(self.refresh_connections)
-        
         self.start_capture_btn.setVisible(False)
 
-        self.stop_capture_btn = QPushButton(STOP_CAPTURE_BUTTON_TEXT)
+        # Stop button with stop icon (centered)
+        self.stop_capture_btn = QPushButton(stop_icon, STOP_CAPTURE_BUTTON_TEXT)
         self.stop_capture_btn.clicked.connect(self.stop_capture_connections)
-        
-        self.stop_capture_btn.setVisible(True)        
+        self.stop_capture_btn.setVisible(True)
         
         # Connection table
         self.connection_table = QTableWidget(0, LOCATION_LON_ROW_INDEX+1)
@@ -1946,27 +1994,6 @@ class TCPConnectionViewer(QMainWindow):
         self.map_initialized = False
         self._map_reload_attempts = 0  # Track reload attempts to prevent infinite loops
 
-        # Pulse indicator - small green circle that fades in/out on refresh
-        self.pulse_indicator = QFrame()
-        self.pulse_indicator.setFixedSize(14, 14)
-        self.pulse_indicator.setStyleSheet("background-color: #33cc33; border-radius: 7px;")
-        self.pulse_indicator.setVisible(False)
-        self.pulse_indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.pulse_indicator.setToolTip("Refreshing...")
-
-        # opacity effect + animation
-        self._pulse_opacity = QGraphicsOpacityEffect(self.pulse_indicator)
-        self.pulse_indicator.setGraphicsEffect(self._pulse_opacity)
-        self._pulse_anim = QPropertyAnimation(self._pulse_opacity, b"opacity", self)
-        self._pulse_anim.setDuration(800)  # total pulse duration (ms)
-
-        # fade in quickly, hold, then fade out
-        self._pulse_anim.setKeyValueAt(0.0, 0.0)
-        self._pulse_anim.setKeyValueAt(0.12, 1.0)
-        self._pulse_anim.setKeyValueAt(0.88, 1.0)
-        self._pulse_anim.setKeyValueAt(1.0, 0.0)
-        self._pulse_anim.finished.connect(lambda: self.pulse_indicator.setVisible(False))
-
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.setHandleWidth(6)
 
@@ -1975,17 +2002,6 @@ class TCPConnectionViewer(QMainWindow):
         self.controls_layout = QVBoxLayout(self.controls_widget)
         self.controls_layout.setContentsMargins(0, 0, 0, 0)
         self.controls_layout.setSpacing(6)
-
-        # Create a fixed-size container for the pulse using a QGridLayout so its size is reserved.
-        self.pulse_container = QWidget()
-        # choose a height that fits the pulse and a small margin; width will stretch with the layout
-        self.pulse_container.setFixedHeight(36)
-        pulse_layout = QGridLayout(self.pulse_container)
-        pulse_layout.setContentsMargins(0, 0, 6, 0)  # right margin so indicator sits inset
-        pulse_layout.addWidget(self.pulse_indicator, 0, 0, Qt.AlignRight | Qt.AlignTop)
-
-        # add pulse container to controls
-        self.controls_layout.addWidget(self.pulse_container)
 
         # Add control widgets to controls_layout (moved from right_layout)
         self.controls_layout.addWidget(self.start_capture_btn)
@@ -2838,14 +2854,13 @@ class TCPConnectionViewer(QMainWindow):
             return None, None
             
     def _pulse_map_indicator(self):
-        """Show and start the pulse animation (non-blocking)."""
-
+        """Trigger green pulse animation on the map overlay (JavaScript-based)."""
         try:
-            self.pulse_indicator.setVisible(True)
-            self._pulse_anim.stop()
-            self._pulse_anim.start()
+            # Call JavaScript to show the pulse overlay on the map
+            js_code = "if (typeof window.triggerPulse === 'function') { window.triggerPulse(); }"
+            self.map_view.page().runJavaScript(js_code)
         except Exception:
-            # defensive: ignore if animations not ready yet
+            # defensive: ignore if map not ready yet
             pass
 
     def _do_map_update(self):
@@ -3083,10 +3098,22 @@ class TCPConnectionViewer(QMainWindow):
                            0%, 100% { opacity:1; transform:scale(1); }
                            50% { opacity:0.3; transform:scale(0.85); }
                        }
+                       /* green refresh pulse indicator (top-right) */
+                       #refresh-pulse { position:absolute; top:12px; right:12px; z-index:1000;
+                                        width:14px; height:14px; background-color:#33cc33; border-radius:50%;
+                                        pointer-events:none; opacity:0; transition:opacity 0.1s ease-in; }
+                       #refresh-pulse.active { animation:pulse-green 0.8s ease-in-out; }
+                       @keyframes pulse-green {
+                           0% { opacity:0; transform:scale(0.9); }
+                           12% { opacity:1; transform:scale(1); }
+                           88% { opacity:1; transform:scale(1); }
+                           100% { opacity:0; transform:scale(0.9); }
+                       }
                 </style>
             </head>
             <body>
                 <div id="map"></div>
+                <div id="refresh-pulse"></div>
                 <div id="map-stats"></div>
                 <div id="map-datetime">
                     <span id="recording-indicator"></span>
@@ -3377,11 +3404,32 @@ class TCPConnectionViewer(QMainWindow):
                                         } catch(e) {}
                                     }
 
+                                    function triggerPulse() {
+                                        try {
+                                            var pulse = document.getElementById('refresh-pulse');
+                                            if (pulse) {
+                                                // Remove class to reset animation if already running
+                                                pulse.classList.remove('active');
+                                                // Force reflow to restart animation
+                                                void pulse.offsetWidth;
+                                                // Add class to trigger animation
+                                                pulse.classList.add('active');
+                                                // Remove class after animation completes (800ms)
+                                                setTimeout(function() {
+                                                    pulse.classList.remove('active');
+                                                }, 800);
+                                            }
+                                        } catch(e) {
+                                            console.error('[Pulse] Error triggering pulse:', e);
+                                        }
+                                    }
+
                                     // expose to the host Python code
                                     window.updateConnections = updateConnections;
                                     window.setStats = setStats;
                                     window.setDateTime = setDateTime;
                                     window.setRecordingIndicator = setRecordingIndicator;
+                                    window.triggerPulse = triggerPulse;
 
                                     // Notify Python that map is fully initialized
                                     console.log('[Map Init] Notifying Python that map is ready');
@@ -3604,6 +3652,10 @@ class TCPConnectionViewer(QMainWindow):
             self.status_label.setText("Auto-refresh paused. Click 'Start Capture' to resume.")
             self.stop_capture_btn.setVisible(False)
             self.toggle_button.setVisible(True)
+            # Stop wave animation when capture stops
+            self._stop_stop_button_wave()
+            # Start flashing the start capture button to draw attention
+            self._start_capture_button_flash()
 
     def refresh_connections(self, slider_position=None):
 
@@ -3616,7 +3668,11 @@ class TCPConnectionViewer(QMainWindow):
                 self.start_capture_btn.setVisible(False)
                 self.status_label.setText("")
                 self.toggle_button.setVisible(False)
-                self.stop_capture_btn.setVisible(True)                
+                self.stop_capture_btn.setVisible(True)
+                # Stop flashing when capture starts
+                self._stop_capture_button_flash()
+                # Start wave animation on stop button
+                self._start_stop_button_wave()
 
         if self.timer_replay_connections.isActive():
             self.status_label.setText("Replaying connections.")
@@ -3843,6 +3899,10 @@ class TCPConnectionViewer(QMainWindow):
     def generate_video_from_screenshots(self):
         """Generate MP4 video from all screenshots in the screen_captures folder (async)"""
         try:
+            # Block if already generating
+            if self._video_generating:
+                return
+
             # Check if cv2 is available (quick check before starting worker)
             try:
                 import cv2
@@ -3883,8 +3943,9 @@ class TCPConnectionViewer(QMainWindow):
                 )
                 return
 
-            # Disable button and update text
-            self.generate_video_btn.setEnabled(False)
+            # Mark as generating and start flash animation
+            self._video_generating = True
+            self._start_video_button_flash()
             self.generate_video_btn.setText("Generating .mp4 video please wait...")
             logging.info(f"Starting async video generation with {screenshot_count} screenshots")
 
@@ -3899,9 +3960,9 @@ class TCPConnectionViewer(QMainWindow):
             self.thread_pool.start(worker)
 
         except Exception as e:
-            # Re-enable button on unexpected error
-            self.generate_video_btn.setEnabled(True)
-            self.generate_video_btn.setText("Generate .mp4 video file")
+            # Reset state on unexpected error
+            self._video_generating = False
+            self._stop_video_button_flash()
 
             QMessageBox.critical(
                 self,
@@ -3910,9 +3971,187 @@ class TCPConnectionViewer(QMainWindow):
             )
             logging.error(f"Error starting video generation: {e}")
 
+    def _start_video_button_flash(self):
+        """Start flashing animation for video button (high visibility in dark mode)"""
+        try:
+            # Create timer if it doesn't exist
+            if self._video_btn_flash_timer is None:
+                self._video_btn_flash_timer = QTimer(self)
+                self._video_btn_flash_timer.timeout.connect(self._toggle_video_button_flash)
+
+            # Start flashing at 500ms intervals
+            self._video_btn_flash_state = False
+            self._video_btn_flash_timer.start(500)
+
+        except Exception as e:
+            logging.error(f"Error starting video button flash: {e}")
+
+    def _stop_video_button_flash(self):
+        """Stop flashing animation and restore normal button style"""
+        try:
+            if self._video_btn_flash_timer is not None:
+                self._video_btn_flash_timer.stop()
+
+            # Restore normal button style
+            self.generate_video_btn.setStyleSheet("")
+
+        except Exception as e:
+            logging.error(f"Error stopping video button flash: {e}")
+
+    def _toggle_video_button_flash(self):
+        """Toggle button appearance for flashing effect"""
+        try:
+            self._video_btn_flash_state = not self._video_btn_flash_state
+
+            if self._video_btn_flash_state:
+                # Bright state - highly visible in both light and dark modes
+                self.generate_video_btn.setStyleSheet(
+                    "QPushButton { "
+                    "background-color: #2196F3; "  # Bright blue
+                    "color: white; "
+                    "font-weight: bold; "
+                    "border: 2px solid #1976D2; "
+                    "}"
+                )
+            else:
+                # Normal state with subtle highlight
+                self.generate_video_btn.setStyleSheet(
+                    "QPushButton { "
+                    "background-color: #1565C0; "  # Darker blue
+                    "color: white; "
+                    "font-weight: bold; "
+                    "}"
+                )
+
+        except Exception as e:
+            logging.error(f"Error toggling video button flash: {e}")
+
+    def _start_capture_button_flash(self):
+        """Start flashing animation for start capture button to draw attention"""
+        try:
+            # Create timer if it doesn't exist
+            if self._start_capture_flash_timer is None:
+                self._start_capture_flash_timer = QTimer(self)
+                self._start_capture_flash_timer.timeout.connect(self._toggle_start_capture_flash)
+
+            # Start flashing at 600ms intervals (slightly slower than video button)
+            self._start_capture_flash_state = False
+            self._start_capture_flash_timer.start(600)
+
+            # Create auto-stop timer to stop flashing after 10 seconds
+            if self._start_capture_flash_stop_timer is None:
+                self._start_capture_flash_stop_timer = QTimer(self)
+                self._start_capture_flash_stop_timer.setSingleShot(True)
+                self._start_capture_flash_stop_timer.timeout.connect(self._auto_stop_capture_flash)
+
+            # Schedule auto-stop after 10 seconds (10000 milliseconds)
+            self._start_capture_flash_stop_timer.start(10000)
+            logging.debug("Start capture button flash scheduled to auto-stop after 20 seconds")
+
+        except Exception as e:
+            logging.error(f"Error starting start capture button flash: {e}")
+
+    def _stop_capture_button_flash(self):
+        """Stop flashing animation and restore normal button style"""
+        try:
+            if self._start_capture_flash_timer is not None:
+                self._start_capture_flash_timer.stop()
+
+            # Also stop the auto-stop timer if it's running
+            if self._start_capture_flash_stop_timer is not None:
+                self._start_capture_flash_stop_timer.stop()
+
+            # Restore normal button style
+            self.start_capture_btn.setStyleSheet("")
+
+        except Exception as e:
+            logging.error(f"Error stopping start capture button flash: {e}")
+
+    def _auto_stop_capture_flash(self):
+        """Automatically stop flashing after timeout (called by timer)"""
+        try:
+            logging.debug("Auto-stopping start capture button flash after 20 seconds")
+            self._stop_capture_button_flash()
+        except Exception as e:
+            logging.error(f"Error in auto-stop capture flash: {e}")
+
+    def _toggle_start_capture_flash(self):
+        """Toggle start capture button appearance for flashing effect"""
+        try:
+            self._start_capture_flash_state = not self._start_capture_flash_state
+
+            if self._start_capture_flash_state:
+                # Bright state - green highlight to indicate "ready to start"
+                self.start_capture_btn.setStyleSheet(
+                    "QPushButton { "
+                    "background-color: #4CAF50; "  # Bright green
+                    "color: white; "
+                    "font-weight: bold; "
+                    "border: 2px solid #45a049; "
+                    "}"
+                )
+            else:
+                # Normal state with subtle highlight
+                self.start_capture_btn.setStyleSheet(
+                    "QPushButton { "
+                    "background-color: #388E3C; "  # Darker green
+                    "color: white; "
+                    "font-weight: bold; "
+                    "}"
+                )
+
+        except Exception as e:
+            logging.error(f"Error toggling start capture button flash: {e}")
+
+    def _start_stop_button_wave(self):
+        """Start wave animation for stop capture button text"""
+        try:
+            # Create timer if it doesn't exist
+            if self._stop_btn_wave_timer is None:
+                self._stop_btn_wave_timer = QTimer(self)
+                self._stop_btn_wave_timer.timeout.connect(self._update_stop_button_wave)
+
+            # Reset wave to first pattern and start
+            self._stop_btn_wave_index = 0
+            self._stop_btn_wave_timer.start(300)  # Update every 300ms for smooth wave
+
+        except Exception as e:
+            logging.error(f"Error starting stop button wave: {e}")
+
+    def _stop_stop_button_wave(self):
+        """Stop wave animation and restore normal button text"""
+        try:
+            if self._stop_btn_wave_timer is not None:
+                self._stop_btn_wave_timer.stop()
+
+            # Restore normal button text (without wave)
+            self.stop_capture_btn.setText(STOP_CAPTURE_BUTTON_TEXT)
+
+        except Exception as e:
+            logging.error(f"Error stopping stop button wave: {e}")
+
+    def _update_stop_button_wave(self):
+        """Update stop button text with next wave pattern"""
+        try:
+            # Get current wave pattern
+            wave_pattern = self._stop_btn_wave_patterns[self._stop_btn_wave_index]
+
+            # Update button text with wave suffix
+            self.stop_capture_btn.setText(f"{STOP_CAPTURE_BUTTON_TEXT} {wave_pattern}")
+
+            # Move to next pattern (cycle through)
+            self._stop_btn_wave_index = (self._stop_btn_wave_index + 1) % len(self._stop_btn_wave_patterns)
+
+        except Exception as e:
+            logging.error(f"Error updating stop button wave: {e}")
+
     def _on_video_generation_finished(self, success, message, stats):
         """Called when video generation completes successfully"""
         try:
+            # Stop flashing and reset state
+            self._video_generating = False
+            self._stop_video_button_flash()
+
             # Re-enable button and restore text
             screenshot_count = sum(
                 1 for f in os.listdir(SCREENSHOTS_DIR)
@@ -3923,8 +4162,6 @@ class TCPConnectionViewer(QMainWindow):
                 self.generate_video_btn.setText(f"Generate .mp4 video file ({screenshot_count} frames)")
             else:
                 self.generate_video_btn.setText("Generate .mp4 video file")
-
-            self.generate_video_btn.setEnabled(True)
 
             # Show success message
             if success:
@@ -3939,7 +4176,11 @@ class TCPConnectionViewer(QMainWindow):
     def _on_video_generation_error(self, error_message):
         """Called when video generation fails"""
         try:
-            # Re-enable button and restore text
+            # Stop flashing and reset state
+            self._video_generating = False
+            self._stop_video_button_flash()
+
+            # Restore button text
             screenshot_count = sum(
                 1 for f in os.listdir(SCREENSHOTS_DIR)
                 if f.startswith("tcp_geo_map_") and f.endswith(".jpg")
@@ -3949,8 +4190,6 @@ class TCPConnectionViewer(QMainWindow):
                 self.generate_video_btn.setText(f"Generate .mp4 video file ({screenshot_count} frames)")
             else:
                 self.generate_video_btn.setText("Generate .mp4 video file")
-
-            self.generate_video_btn.setEnabled(True)
 
             # Show error message
             QMessageBox.critical(
@@ -3964,7 +4203,7 @@ class TCPConnectionViewer(QMainWindow):
     def _on_video_generation_progress(self, current_frame, total_frames):
         """Called when video generation makes progress"""
         try:
-            # Update button text with progress
+            # Update button text with progress (frame count)
             progress_text = f"Generating video... {current_frame}/{total_frames} frames"
             self.generate_video_btn.setText(progress_text)
             logging.debug(f"Video generation progress: {current_frame}/{total_frames}")
