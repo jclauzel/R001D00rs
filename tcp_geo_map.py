@@ -51,6 +51,10 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
 import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, logging
 from concurrent.futures import ThreadPoolExecutor
 
+# Suppress Qt WebEngine Chromium warnings (must be set before QApplication)
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.webenginecontext.debug=false'
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-logging --log-level=3'
+
 # Configure logging
 logging.basicConfig(
     level=logging.WARNING,  # Changed to INFO to see cleanup diagnostic messages
@@ -66,7 +70,7 @@ from PySide6.QtWidgets import QStyle
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "3.0.1" # Current script version
+VERSION = "3.0.2" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -475,7 +479,7 @@ class TCPConnectionViewer(QMainWindow):
         # Stop button wave animation timer
         self._stop_btn_wave_timer = None
         self._stop_btn_wave_index = 0
-        self._stop_btn_wave_patterns = ["....", "0...", ".0..", "..0.", "...0"]
+        self._stop_btn_wave_patterns = ["....", "*...", ".*..", "..*.", "...*"]
 
         self.load_databases()
         self._check_and_download_leaflet_resources()
@@ -1929,6 +1933,8 @@ class TCPConnectionViewer(QMainWindow):
         self.stop_capture_btn = QPushButton(stop_icon, STOP_CAPTURE_BUTTON_TEXT)
         self.stop_capture_btn.clicked.connect(self.stop_capture_connections)
         self.stop_capture_btn.setVisible(True)
+        # Use monospace font to prevent text shifting during wave animation (all chars same width)
+        self.stop_capture_btn.setStyleSheet("font-family: 'Consolas', 'Courier New', monospace;")
         
         # Connection table
         self.connection_table = QTableWidget(0, LOCATION_LON_ROW_INDEX+1)
