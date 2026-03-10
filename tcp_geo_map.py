@@ -65,7 +65,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QOb
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-VERSION = "2.9.9" # Current script version
+VERSION = "3.0.0" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -173,6 +173,17 @@ public_ip_dns_attempts_lock = threading.Lock()
 
 PUBLIC_IP_ENQUEUE_MAX_CACHE_SIZE = 10000 # maximum number of public IPs to keep in the enqueue cache to avoid unbounded growth
 PUBLIC_IP_ENQUEUE_TIMER_INTERVAL = 10000 # timer scavanger in milliseconds
+
+# Global geolocation cache for performance
+geo_cache = {}  # {ip: (lat, lng)}
+geo_cache_lock = threading.Lock()
+
+# Global process name cache by PID
+process_cache = {}  # {pid: process_name}
+process_cache_lock = threading.Lock()
+
+# Maximum connections to process per refresh (performance limit)
+MAX_CONNECTIONS_PER_REFRESH = 500
 
 class VideoGeneratorSignals(QObject):
     """Signals for video generation worker"""
@@ -410,7 +421,23 @@ class TCPConnectionViewer(QMainWindow):
         self.reader_ipv4 = None
         self.reader_ipv6 = None
         self.reader_c2_tracker = None
+        self.reader_c2_tracker_set = None  # Fast O(1) lookup set
         self.connections = []
+
+        # Track previous connections for incremental updates
+        self.previous_connections = set()
+
+        # HTTP session for public IP checks (connection pooling)
+        self._http_session = requests.Session()
+
+        # Debounced map update
+        self._map_update_timer = QTimer()
+        self._map_update_timer.setSingleShot(True)
+        self._map_update_timer.timeout.connect(self._do_map_update)
+        self._pending_map_data = None
+
+        # Summary table needs update flag
+        self._summary_needs_update = True
         
         self.load_ip_cache()
  
@@ -2186,8 +2213,9 @@ class TCPConnectionViewer(QMainWindow):
             self.reader_ipv4 = maxminddb.open_database(IPV4_DB_PATH)
             self.reader_ipv6 = maxminddb.open_database(IPV6_DB_PATH)
 
-            # Load C2-TRACKER into a simple dict
+            # Load C2-TRACKER into both set (fast lookup) and dict (details)
             self.reader_c2_tracker = {}
+            self.reader_c2_tracker_set = set()
             if os.path.exists(C2_TRACKER_DB_PATH):
                 with open(C2_TRACKER_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
@@ -2196,6 +2224,7 @@ class TCPConnectionViewer(QMainWindow):
                             continue
                         parts = line.split("\t")
                         ip = parts[0]
+                        self.reader_c2_tracker_set.add(ip)  # Fast O(1) lookup
                         typ = parts[1] if len(parts) > 1 else ""
                         info = parts[2] if len(parts) > 2 else ""
                         self.reader_c2_tracker[ip] = (typ, info)
@@ -2204,11 +2233,12 @@ class TCPConnectionViewer(QMainWindow):
             QMessageBox.critical(self, "Database Error", f"Failed to load databases: {str(e)}, nothing may show on map.")
     
     def check_ip_is_present_in_c2_tracker(self, ip_address):
-        """Check if an IP address is present in the C2-TRACKER database"""
+        """Check if an IP address is present in the C2-TRACKER database (optimized)"""
         try:
-            table = self.reader_c2_tracker
-            if table:
-                entry = table.get(ip_address)
+            # Fast O(1) lookup in set first
+            if self.reader_c2_tracker_set and ip_address in self.reader_c2_tracker_set:
+                # Get details from dict only if found
+                entry = self.reader_c2_tracker.get(ip_address)
                 if entry:
                     return True, entry[0], entry[1]
             return False, None, None
@@ -2475,15 +2505,34 @@ class TCPConnectionViewer(QMainWindow):
         - Build ip collection and perform reverse DNS in batches only when enabled.
         - Write to `self.connection_list` with minimum temporary allocations.
         - Captures both TCP (ESTABLISHED) and UDP (all) connections.
+        - Caches geolocation and process names for performance.
+        - Limits max connections per refresh to prevent slowdown.
         """
 
         connections = []
         c2_connections = []
-        global do_capture_screenshots
+        global do_capture_screenshots, geo_cache, geo_cache_lock, process_cache, process_cache_lock
 
+        # Performance timing
+        import time as time_module
+        start_time = time_module.perf_counter()
 
         # Get all connections once (both TCP and UDP)
         all_connections = psutil.net_connections(kind='inet')
+
+        # Rate limiting: if too many connections, prioritize TCP ESTABLISHED
+        if len(all_connections) > MAX_CONNECTIONS_PER_REFRESH:
+            tcp_established = [c for c in all_connections 
+                             if c.type == socket.SOCK_STREAM and c.status == psutil.CONN_ESTABLISHED]
+            udp_conns = [c for c in all_connections 
+                        if c.type == socket.SOCK_DGRAM]
+
+            all_connections = tcp_established[:MAX_CONNECTIONS_PER_REFRESH]
+            if len(all_connections) < MAX_CONNECTIONS_PER_REFRESH:
+                remaining = MAX_CONNECTIONS_PER_REFRESH - len(all_connections)
+                all_connections.extend(udp_conns[:remaining])
+
+            logging.warning(f"Rate limiting: processing {len(all_connections)}/{len(psutil.net_connections(kind='inet'))} connections")
 
         # Collect remote IPs for DNS resolution (only those we care about)
         ips_to_resolve = set()
@@ -2562,8 +2611,21 @@ class TCPConnectionViewer(QMainWindow):
 
             try:
                 pid = conn.pid
-                process = psutil.Process(pid) if pid else None
-                process_name = process.name() if process else "Unknown"
+
+                # Use cached process name if available
+                if pid:
+                    with process_cache_lock:
+                        if pid in process_cache:
+                            process_name = process_cache[pid]
+                        else:
+                            try:
+                                process = psutil.Process(pid)
+                                process_name = process.name()
+                                process_cache[pid] = process_name
+                            except Exception:
+                                process_name = "Unknown"
+                else:
+                    process_name = "Unknown"
 
                 laddr = getattr(conn, "laddr", None)
                 raddr = getattr(conn, "raddr", None)
@@ -2571,8 +2633,18 @@ class TCPConnectionViewer(QMainWindow):
                 local_addr = f"{laddr.ip}" if laddr else ""
                 local_port = str(getattr(laddr, "port", "")) if laddr else ""
 
-                remote_addr = f"{raddr.ip}" if raddr else ""
-                remote_port = str(getattr(raddr, "port", "")) if raddr else ""
+                # UDP connections may not have a remote address (connectionless protocol)
+                if raddr:
+                    remote_addr = f"{raddr.ip}"
+                    remote_port = str(getattr(raddr, "port", ""))
+                else:
+                    # No remote peer connected (common for UDP listening sockets)
+                    if is_udp:
+                        remote_addr = "*:*"
+                        remote_port = ""
+                    else:
+                        remote_addr = ""
+                        remote_port = ""
 
                 # Determine IP type
                 family = getattr(conn, "family", None)
@@ -2584,21 +2656,30 @@ class TCPConnectionViewer(QMainWindow):
                 # obtain IP string for lookup (strip any appended hostname)
                 ip_lookup = remote_addr.split(' ')[0].split(':')[0]
 
-                if ip_lookup and ip_lookup not in ('127.0.0.1', '::1'):
-                    # geolocation lookup
-                    try:
-                        if ip_type == "IPv4" and reader_ipv4:
-                            res = reader_ipv4.get(ip_lookup)
-                            if res is not None:
-                                lat = res.get('latitude') or res.get('location', {}).get('latitude')
-                                lng = res.get('longitude') or res.get('location', {}).get('longitude')
-                        elif ip_type == "IPv6" and reader_ipv6:
-                            res = reader_ipv6.get(ip_lookup)
-                            if res is not None:
-                                lat = res.get('latitude') or res.get('location', {}).get('latitude')
-                                lng = res.get('longitude') or res.get('location', {}).get('longitude')
-                    except Exception:
-                        lat = lng = None
+                # Skip geolocation/DNS for UDP connections without remote peer
+                if ip_lookup and ip_lookup not in ('127.0.0.1', '::1', 'N/A'):
+                    # Check geolocation cache first
+                    with geo_cache_lock:
+                        if ip_lookup in geo_cache:
+                            lat, lng = geo_cache[ip_lookup]
+                        else:
+                            # geolocation lookup from database
+                            try:
+                                if ip_type == "IPv4" and reader_ipv4:
+                                    res = reader_ipv4.get(ip_lookup)
+                                    if res is not None:
+                                        lat = res.get('latitude') or res.get('location', {}).get('latitude')
+                                        lng = res.get('longitude') or res.get('location', {}).get('longitude')
+                                elif ip_type == "IPv6" and reader_ipv6:
+                                    res = reader_ipv6.get(ip_lookup)
+                                    if res is not None:
+                                        lat = res.get('latitude') or res.get('location', {}).get('latitude')
+                                        lng = res.get('longitude') or res.get('location', {}).get('longitude')
+                                # Cache the result (even if None)
+                                geo_cache[ip_lookup] = (lat, lng)
+                            except Exception:
+                                lat = lng = None
+                                geo_cache[ip_lookup] = (None, None)
 
                     # reverse DNS result from batched lookup
                     if do_reverse_dns:
@@ -2607,8 +2688,8 @@ class TCPConnectionViewer(QMainWindow):
                             remote_addr = f"{remote_addr} ({hostname})"
                             name = hostname
 
-                    # c2 check
-                    if do_c2 and reader_c2 is not None:
+                    # c2 check (optimized with set lookup)
+                    if do_c2 and self.reader_c2_tracker_set is not None:
                         try:
                             is_c2, c2_type, c2_info = self.check_ip_is_present_in_c2_tracker(ip_lookup)
                             if is_c2:
@@ -2625,14 +2706,13 @@ class TCPConnectionViewer(QMainWindow):
                                     'ip_type': ip_type,
                                     'lat': lat,
                                     'lng': lng,
-                                    'connection': conn,
                                     'icon': 'redIcon'
                                 })
                         except Exception:
                             # ignore C2 lookup failures
                             pass
 
-                # append standard connection entry
+                # append standard connection entry (without heavy psutil object)
                 connections.append({
                     'process': process_name,
                     'pid': str(pid) if pid else "",
@@ -2646,7 +2726,6 @@ class TCPConnectionViewer(QMainWindow):
                     'ip_type': ip_type,
                     'lat': lat,
                     'lng': lng,
-                    'connection': conn,
                     'icon': 'greenIcon'
                 })
 
@@ -2720,6 +2799,14 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
+            # Mark summary as needing update
+            self._summary_needs_update = True
+
+            # Performance logging
+            elapsed = time_module.perf_counter() - start_time
+            if elapsed > 1.0:  # Log if took more than 1 second
+                logging.warning(f"get_active_tcp_connections took {elapsed:.2f}s to process {len(connections)} connections")
+
         return connections
     
     def get_coordinates(self, ip_address, ip_type):
@@ -2760,6 +2847,24 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             # defensive: ignore if animations not ready yet
             pass
+
+    def _do_map_update(self):
+        """Execute pending debounced map update (if any)"""
+        try:
+            if self._pending_map_data is not None:
+                # Extract the pending data
+                data = self._pending_map_data
+                self._pending_map_data = None
+
+                # Call update_map with the pending data
+                # The data is expected to be a tuple: (connection_data, force_show_tooltip, stats_text, datetime_text)
+                if isinstance(data, tuple) and len(data) == 4:
+                    self.update_map(data[0], data[1], data[2], data[3])
+                elif isinstance(data, dict):
+                    # Fallback: if it's just connection data
+                    self.update_map(data)
+        except Exception as e:
+            logging.error(f"Error in _do_map_update: {e}")
 
     def _call_update_js(self, js, connection_data=None, force_show_tooltip=False, retries=10, delay_ms=200):
         """
@@ -2818,9 +2923,9 @@ class TCPConnectionViewer(QMainWindow):
                 pass
 
     def get_public_ip(self):
-        """Get public IP address using ipify API. Returns empty string on error."""
+        """Get public IP address using ipify API with connection pooling. Returns empty string on error."""
         try:
-            response = requests.get('https://api.ipify.org', timeout=5)
+            response = self._http_session.get('https://api.ipify.org', timeout=5)
             if response.status_code == 200:
                 return response.text.strip()
             else:
@@ -2911,7 +3016,6 @@ class TCPConnectionViewer(QMainWindow):
                             'ip_type': ip_type,
                             'lat': lat,
                             'lng': lng,
-                            'connection': None,
                             'icon': 'redCircle'
                         })
             except Exception:
@@ -3722,10 +3826,10 @@ class TCPConnectionViewer(QMainWindow):
                 if success:
                     logging.info(f"Screenshot saved: {filepath}")
 
-                    # Immediately cleanup old screenshots after saving new one
-                    # This ensures we maintain the buffer size limit
+                    # Immediately cleanup old screenshots after saving new one (async)
+                    # This ensures we maintain the buffer size limit without blocking
                     try:
-                        self._cleanup_old_screenshots()
+                        self._cleanup_old_screenshots_async()
                     except Exception as cleanup_error:
                         logging.error(f"Failed to cleanup after screenshot save: {cleanup_error}")
                 else:
@@ -3867,6 +3971,16 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error updating video generation progress: {e}")
 
+    def _cleanup_old_screenshots_async(self):
+        """Run screenshot cleanup in background thread to avoid blocking UI"""
+        def cleanup_worker():
+            try:
+                self._cleanup_old_screenshots()
+            except Exception as e:
+                logging.error(f"Async cleanup error: {e}")
+
+        threading.Thread(target=cleanup_worker, daemon=True).start()
+
     def _cleanup_old_screenshots(self):
         """Delete old screenshot files to keep only the most recent max_connection_list_filo_buffer_size files"""
         global max_connection_list_filo_buffer_size
@@ -3958,11 +4072,14 @@ class TCPConnectionViewer(QMainWindow):
             logging.warning(f"Error updating video button visibility: {e}")
 
     def on_tab_changed(self, index):
-        """Called when user switches tabs - update Summary tab if selected"""
+        """Called when user switches tabs - update Summary tab if selected (lazy loading)"""
         try:
             # Index 1 is the Summary tab (0=Main, 1=Summary, 2=Settings)
             if index == 1:
-                self.update_summary_table()
+                # Only refresh if data has changed
+                if self._summary_needs_update:
+                    self.update_summary_table()
+                    self._summary_needs_update = False
         except Exception as e:
             logging.error(f"Error updating summary tab: {e}")
 
@@ -4094,7 +4211,6 @@ class TCPConnectionViewer(QMainWindow):
                 'name': name,
                 'lat': lat,
                 'lng': lng,
-                'connection': {},  # Placeholder if needed
                 'icon': icon  # default icon; change as needed based on conditions
             }]
 
