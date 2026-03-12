@@ -65,12 +65,13 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayo
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget) 
 from PySide6.QtGui import QIcon, QAction
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot
 from PySide6.QtWidgets import QStyle
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
+from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.2" # Current script version
+VERSION = "3.0.3" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -187,8 +188,20 @@ geo_cache_lock = threading.Lock()
 process_cache = {}  # {pid: process_name}
 process_cache_lock = threading.Lock()
 
-# Maximum connections to process per refresh (performance limit)
-MAX_CONNECTIONS_PER_REFRESH = max_connection_list_filo_buffer_size
+class MapBridge(QObject):
+    """Bridge class to enable JavaScript-to-Python communication for map marker clicks"""
+
+    def __init__(self, viewer):
+        super().__init__()
+        self.viewer = viewer
+
+    @Slot(str, str, str, str)
+    def selectConnection(self, process, pid, remote, local):
+        """Called from JavaScript when a map marker is clicked"""
+        try:
+            self.viewer.select_table_row_by_connection(process, pid, remote, local)
+        except Exception as e:
+            logging.error(f"Error selecting connection from map: {e}")
 
 class VideoGeneratorSignals(QObject):
     """Signals for video generation worker"""
@@ -465,6 +478,11 @@ class TCPConnectionViewer(QMainWindow):
         # Initialize thread pool for async operations (video generation, etc.)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(2)  # Limit concurrent background tasks
+
+        # Set up QWebChannel for JavaScript-to-Python communication (map marker clicks)
+        self.map_bridge = MapBridge(self)
+        self.channel = QWebChannel()
+        self.channel.registerObject('mapBridge', self.map_bridge)
 
         # Video button flash animation timer
         self._video_btn_flash_timer = None
@@ -942,8 +960,8 @@ class TCPConnectionViewer(QMainWindow):
                 global table_column_sort_index, table_column_sort_reverse
                 global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots
 
-                MAX_CONNECTIONS_PER_REFRESH = max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
-                
+                max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
+
                 do_c2_check = settings.get('do_c2_check', do_c2_check)
                 show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
                 show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
@@ -1977,12 +1995,8 @@ class TCPConnectionViewer(QMainWindow):
         # Map view
         self.map_view = QWebEngineView()
         self.map_view.setMinimumSize(MAP_TABLE_MIN_WIDTH, MAP_TABLE_MIN_HEIGHT)
-        self.map_view.setHtml("<html><body><h2>Loading map...</h2></body></html>")
 
         # Enable developer console logging (for debugging)
-        def _on_console_message(level, message, line, source):
-            logging.debug(f"[WebEngine Console] {message} (line {line})")
-
         try:
             from PySide6.QtWebEngineCore import QWebEnginePage
 
@@ -1990,10 +2004,24 @@ class TCPConnectionViewer(QMainWindow):
                 def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
                     logging.debug(f"[JS Console] {message} (line {lineNumber} in {sourceID})")
 
+            # Create debug page FIRST
             debug_page = DebugPage(self.map_view)
+
+            # Set WebChannel on the debug page BEFORE setting it as the page
+            debug_page.setWebChannel(self.channel)
+
+            # Now assign the debug page to the view
             self.map_view.setPage(debug_page)
         except Exception as e:
             logging.warning(f"Could not enable console logging: {e}")
+            # Fallback: set webchannel on default page if debug page creation fails
+            try:
+                self.map_view.page().setWebChannel(self.channel)
+            except Exception:
+                pass
+
+        # Set initial loading HTML after page is configured
+        self.map_view.setHtml("<html><body><h2>Loading map...</h2></body></html>")
 
         self.map_redraw = True
         self.map_objects = 0
@@ -2528,7 +2556,6 @@ class TCPConnectionViewer(QMainWindow):
         - Write to `self.connection_list` with minimum temporary allocations.
         - Captures both TCP (ESTABLISHED) and UDP (all) connections.
         - Caches geolocation and process names for performance.
-        - Limits max connections per refresh to prevent slowdown.
         """
 
         connections = []
@@ -2541,20 +2568,6 @@ class TCPConnectionViewer(QMainWindow):
 
         # Get all connections once (both TCP and UDP)
         all_connections = psutil.net_connections(kind='inet')
-
-        # Rate limiting: if too many connections, prioritize TCP ESTABLISHED
-        if len(all_connections) > MAX_CONNECTIONS_PER_REFRESH:
-            tcp_established = [c for c in all_connections 
-                             if c.type == socket.SOCK_STREAM and c.status == psutil.CONN_ESTABLISHED]
-            udp_conns = [c for c in all_connections 
-                        if c.type == socket.SOCK_DGRAM]
-
-            all_connections = tcp_established[:MAX_CONNECTIONS_PER_REFRESH]
-            if len(all_connections) < MAX_CONNECTIONS_PER_REFRESH:
-                remaining = MAX_CONNECTIONS_PER_REFRESH - len(all_connections)
-                all_connections.extend(udp_conns[:remaining])
-
-            logging.warning(f"Rate limiting: processing {len(all_connections)}/{len(psutil.net_connections(kind='inet'))} connections")
 
         # Collect remote IPs for DNS resolution (only those we care about)
         ips_to_resolve = set()
@@ -3084,10 +3097,12 @@ class TCPConnectionViewer(QMainWindow):
             <head>
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <!-- QWebChannel for JavaScript-to-Python communication -->
+                <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
                 <!-- Try CDN first; if it fails we inject a local fallback (resources/leaflet/) -->
                 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
                       onerror="try{injectLocalLeaflet(true)}catch(e){}" />
-                <style> html, body { height:100%; margin:0; } #map { height:100%; width:100%; } 
+                <style> html, body { height:100%; margin:0; } #map { height:100%; width:100%; }
                        /* stats overlay at top center */ 
                        #map-stats { position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:1000; 
                                     background:rgba(255,255,255,0.85); padding:6px 10px; border-radius:6px; 
@@ -3235,6 +3250,25 @@ class TCPConnectionViewer(QMainWindow):
                     }
 
                     waitForLeaflet(function() {
+                        // Initialize QWebChannel for marker click callbacks to Python (async, non-blocking)
+                        var mapBridge = null;
+
+                        // Attempt to initialize QWebChannel asynchronously (don't block map initialization)
+                        setTimeout(function() {
+                            try {
+                                if (typeof qt !== 'undefined' && qt.webChannelTransport) {
+                                    new QWebChannel(qt.webChannelTransport, function(channel) {
+                                        mapBridge = channel.objects.mapBridge;
+                                        console.log('[QWebChannel] mapBridge initialized successfully');
+                                    });
+                                } else {
+                                    console.warn('[QWebChannel] qt.webChannelTransport not available - marker clicks will not work');
+                                }
+                            } catch(e) {
+                                console.error('[QWebChannel] Failed to initialize:', e);
+                            }
+                        }, 100);  // Delay to allow webChannelTransport to become available
+
                         // Prepare remote and local icon URLs
                         // Determine the script directory for local resources
                         var localBase = 'resources/leaflet/';
@@ -3365,6 +3399,28 @@ class TCPConnectionViewer(QMainWindow):
                                                                     "Remote: " + (conn.remote || '') + "<br>" +
                                                                     "Local: " + (conn.local || '') + "<br>";
                                                     marker.bindPopup(popupHtml);
+
+                                                    // Add click handler to select corresponding table row in Python
+                                                    (function(connection) {
+                                                        marker.on('click', function() {
+                                                            try {
+                                                                if (mapBridge && typeof mapBridge.selectConnection === 'function') {
+                                                                    console.log('[Marker Click] Calling Python selectConnection:', connection.process, connection.pid, connection.remote, connection.local);
+                                                                    mapBridge.selectConnection(
+                                                                        connection.process || '',
+                                                                        connection.pid || '',
+                                                                        connection.remote || '',
+                                                                        connection.local || ''
+                                                                    );
+                                                                } else {
+                                                                    console.warn('[Marker Click] mapBridge not ready yet');
+                                                                }
+                                                            } catch(e) {
+                                                                console.error('[Marker Click] Error calling selectConnection:', e);
+                                                            }
+                                                        });
+                                                    })(conn);
+
                                                     liveMarkers.push(marker);
 
                                                     // Save marker coordinates for line drawing
@@ -3684,16 +3740,33 @@ class TCPConnectionViewer(QMainWindow):
             self.status_label.setText("Replaying connections.")
 
         number_of_previous_objects = self.map_objects
-        
+
         self.connections = self.get_active_tcp_connections(slider_position)
 
-        
+
         if len(self.connections) != number_of_previous_objects:
             self.map_redraw = True
             self.map_objects = len(self.connections)
 
             self.left_panel.setTitle(f"Active TCP/UDP Connections - {self.map_objects} connections")
-        
+
+        # Save currently selected row before clearing table
+        selected_connection = None
+        try:
+            selected_rows = self.connection_table.selectedItems()
+            if selected_rows:
+                selected_row = selected_rows[0].row()
+                # Save the connection identifiers to restore selection later
+                selected_connection = {
+                    'process': self.connection_table.item(selected_row, PROCESS_ROW_INDEX).text() if self.connection_table.item(selected_row, PROCESS_ROW_INDEX) else '',
+                    'pid': self.connection_table.item(selected_row, PID_ROW_INDEX).text() if self.connection_table.item(selected_row, PID_ROW_INDEX) else '',
+                    'remote': self.connection_table.item(selected_row, REMOTE_ADDRESS_ROW_INDEX).text() if self.connection_table.item(selected_row, REMOTE_ADDRESS_ROW_INDEX) else '',
+                    'local': self.connection_table.item(selected_row, LOCAL_ADDRESS_ROW_INDEX).text() if self.connection_table.item(selected_row, LOCAL_ADDRESS_ROW_INDEX) else ''
+                }
+        except Exception as e:
+            logging.debug(f"No selection to preserve: {e}")
+            selected_connection = None
+
         # Update table
         self.connection_table.setRowCount(0)
 
@@ -3786,7 +3859,30 @@ class TCPConnectionViewer(QMainWindow):
         self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line, datetime_text=datetime_text)
 
         if table_column_sort_index>-1:
-            self.column_resort(table_column_sort_index)  
+            self.column_resort(table_column_sort_index)
+
+        # Restore selection if we had one before refresh
+        if selected_connection:
+            try:
+                for row in range(self.connection_table.rowCount()):
+                    row_process = self.connection_table.item(row, PROCESS_ROW_INDEX)
+                    row_pid = self.connection_table.item(row, PID_ROW_INDEX)
+                    row_remote = self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX)
+                    row_local = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX)
+
+                    if (row_process and row_process.text() == selected_connection['process'] and
+                        row_pid and row_pid.text() == selected_connection['pid'] and
+                        row_remote and row_remote.text() == selected_connection['remote'] and
+                        row_local and row_local.text() == selected_connection['local']):
+
+                        # Found matching row - restore selection
+                        self.connection_table.selectRow(row)
+                        # Optionally scroll to keep it visible
+                        self.connection_table.scrollToItem(row_process)
+                        logging.debug(f"Restored selection to row {row}")
+                        break
+            except Exception as e:
+                logging.debug(f"Could not restore selection: {e}")
     
     def on_map_loaded(self, success):
         if not success:
@@ -4413,6 +4509,35 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error populating summary table: {e}")
 
+    def select_table_row_by_connection(self, process, pid, remote, local):
+        """Find and select the table row matching the connection details (called from map marker click)"""
+        try:
+            # Search for matching row in the connection table
+            for row in range(self.connection_table.rowCount()):
+                # Match by process, pid, remote address, and local address
+                row_process = self.connection_table.item(row, PROCESS_ROW_INDEX)
+                row_pid = self.connection_table.item(row, PID_ROW_INDEX)
+                row_remote = self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX)
+                row_local = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX)
+
+                if (row_process and row_process.text() == process and
+                    row_pid and row_pid.text() == pid and
+                    row_remote and row_remote.text() == remote and
+                    row_local and row_local.text() == local):
+
+                    # Found matching row - select it and scroll to make it visible
+                    self.connection_table.selectRow(row)
+                    self.connection_table.scrollToItem(row_process)
+
+                    # Switch to Main tab if not already there (table is on Main tab)
+                    if hasattr(self, 'tab_widget') and self.tab_widget.currentIndex() != 0:
+                        self.tab_widget.setCurrentIndex(0)
+
+                    logging.debug(f"Selected table row {row} from map marker click")
+                    break
+        except Exception as e:
+            logging.error(f"Error selecting table row from map: {e}")
+
     def on_table_cell_clicked(self, row, column):
         # Get the connection data for the clicked row
         lat, lng = None, None
@@ -4426,18 +4551,18 @@ class TCPConnectionViewer(QMainWindow):
             process_name = self.connection_table.item(row, PROCESS_ROW_INDEX).text()
             pid = self.connection_table.item(row, PID_ROW_INDEX).text()
             local_address = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX).text()
-            
+
             # Process IP and hostname
             ip = remote_address
             ip = ip.split(' (')[0]  # Remove any appended hostname
             if ip not in ('127.0.0.1','::1'):
-                
+
                 lat = self.connection_table.item(row, LOCATION_LAT_ROW_INDEX).text()
                 lng = self.connection_table.item(row, LOCATION_LON_ROW_INDEX).text()                
 
                 if do_reverse_dns:
                     hostname = self.connection_table.item(row, NAME_ROW_INDEX).text()
-            
+
             # Check if the connection is marked as suspect
             suspect = (self.connection_table.item(row, SUSPECT_ROW_INDEX).text() == 'Yes')
 
