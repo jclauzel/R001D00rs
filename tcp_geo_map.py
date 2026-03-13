@@ -71,7 +71,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.3" # Current script version
+VERSION = "3.0.4" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -497,7 +497,7 @@ class TCPConnectionViewer(QMainWindow):
         # Stop button wave animation timer
         self._stop_btn_wave_timer = None
         self._stop_btn_wave_index = 0
-        self._stop_btn_wave_patterns = ["....", "*...", ".*..", "..*.", "...*"]
+        self._stop_btn_wave_patterns = ["....", ">...", ".>..", "..>.", "...>"]
 
         self.load_databases()
         self._check_and_download_leaflet_resources()
@@ -1884,6 +1884,11 @@ class TCPConnectionViewer(QMainWindow):
             if self.timer_replay_connections.isActive():
                 return  # Already running
 
+            try:
+                self.toggle_action.setIcon(self._toggle_stop_icon)
+            except Exception:
+                pass
+
             self.status_label.setText("Replaying connections.")
 
             # Start refresh timer or process here
@@ -1897,6 +1902,11 @@ class TCPConnectionViewer(QMainWindow):
             self._stop_capture_button_flash()
 
         else:
+            try:
+                self.toggle_action.setIcon(self._toggle_play_icon)
+            except Exception:
+                pass
+
             self.status_label.setText("Connection replay paused.")
 
             # Stop refresh timer or process here
@@ -1941,14 +1951,22 @@ class TCPConnectionViewer(QMainWindow):
         style = self.style()
         play_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
         stop_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+        self._toggle_play_icon = play_icon
+        self._toggle_stop_icon = stop_icon
 
-        # Refresh button with play icon (centered)
-        self.start_capture_btn = QPushButton(play_icon, START_CAPTURE_BUTTON_TEXT)
+        # Refresh button with play icon
+        self.start_capture_btn = QToolButton()
+        self.start_capture_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.start_capture_btn.setIcon(play_icon)
+        self.start_capture_btn.setText(START_CAPTURE_BUTTON_TEXT)
         self.start_capture_btn.clicked.connect(self.refresh_connections)
         self.start_capture_btn.setVisible(False)
 
-        # Stop button with stop icon (centered)
-        self.stop_capture_btn = QPushButton(stop_icon, STOP_CAPTURE_BUTTON_TEXT)
+        # Stop button with stop icon
+        self.stop_capture_btn = QToolButton()
+        self.stop_capture_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.stop_capture_btn.setIcon(stop_icon)
+        self.stop_capture_btn.setText(STOP_CAPTURE_BUTTON_TEXT)
         self.stop_capture_btn.clicked.connect(self.stop_capture_connections)
         self.stop_capture_btn.setVisible(True)
         # Use monospace font to prevent text shifting during wave animation (all chars same width)
@@ -2052,9 +2070,9 @@ class TCPConnectionViewer(QMainWindow):
         # Add play/pause button
         self.toggle_button = QToolButton()
         self.toggle_button.setVisible(False)
-        self.refresh_action = self.toggle_button.addAction(QIcon('play.png'), 'Play')
-        self.pause_action = self.toggle_button.addAction(QIcon('pause.png'), 'Pause')
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.toggle_action = QAction("Replay connections", self)
+        self.toggle_action.setIcon(self._toggle_play_icon)
         self.toggle_action.setCheckable(True)
         self.toggle_action.toggled.connect(self.toggle_auto_refresh_replay_connections)
         self.toggle_button.setDefaultAction(self.toggle_action)
@@ -2075,10 +2093,6 @@ class TCPConnectionViewer(QMainWindow):
         # Save button
         self.controls_layout.addWidget(self.save_connections_btn)
         self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
-
-        self.reset_connections_btn = QPushButton("Reset connections")
-        self.reset_connections_btn.clicked.connect(self.reset_connections)
-        self.controls_layout.addWidget(self.reset_connections_btn)
 
         # Generate video button (shown only when screenshots exist)
         self.generate_video_btn = QPushButton("Generate .mp4 video file")
@@ -2211,6 +2225,10 @@ class TCPConnectionViewer(QMainWindow):
         buffer_size_layout.addStretch()
 
         settings_tab_layout.addLayout(buffer_size_layout)
+
+        self.reset_connections_btn = QPushButton("Clear existing captured live connections")
+        self.reset_connections_btn.clicked.connect(self.reset_connections)
+        settings_tab_layout.addWidget(self.reset_connections_btn)
 
         # Add stretch to push settings to the top
         settings_tab_layout.addStretch()
@@ -2531,7 +2549,7 @@ class TCPConnectionViewer(QMainWindow):
         return (
             conn1['process'] == conn2['process'] and
             conn1['pid'] == conn2['pid'] and
-            conn1.get('protocol', 'TCP') == conn2.get('protocol', 'TCP') and
+            conn1['protocol'] == conn2['protocol'] and
             conn1['local'] == conn2['local'] and
             conn1['localport'] == conn2['localport'] and
             conn1['remote'] == conn2['remote'] and
@@ -4185,7 +4203,7 @@ class TCPConnectionViewer(QMainWindow):
             if self._start_capture_flash_state:
                 # Bright state - green highlight to indicate "ready to start"
                 self.start_capture_btn.setStyleSheet(
-                    "QPushButton { "
+                    "QToolButton { "
                     "background-color: #4CAF50; "  # Bright green
                     "color: white; "
                     "font-weight: bold; "
@@ -4195,7 +4213,7 @@ class TCPConnectionViewer(QMainWindow):
             else:
                 # Normal state with subtle highlight
                 self.start_capture_btn.setStyleSheet(
-                    "QPushButton { "
+                    "QToolButton { "
                     "background-color: #388E3C; "  # Darker green
                     "color: white; "
                     "font-weight: bold; "
