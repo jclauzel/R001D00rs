@@ -15,6 +15,8 @@ In the settings tab the "Capture screenshots of the map to disk" feature may be 
 Ever wondered, is this machine clean? To what endpoints and geographical destination is this host connecting to such as to sending telemetry or simply understand this machine "network" behavior based on what processes (running programs) on it? 
 This GeoInt OSINT script UI shows on the earth map live network connections made and will warn based on the C2-Tracker list maintained by montysecurity if the machine connects to a suspicious C2 endpoint.
 
+Each process / connection entry allows right clicking to collect traces on table of connections, dumps for Windows (using sysinternals toolset) and Linux (gcore, htop)
+
 # Tested on
 - (Kali, Bazzite) Linux
 - Windows 11
