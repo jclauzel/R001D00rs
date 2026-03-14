@@ -59,6 +59,7 @@ tcp_geo_map uses:
 * psutil
 * folium / OpenStreetMap
 * opencv-python
+* procmon-parser
 * https://github.com/pointhi/leaflet-color-markers
 
 When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process performing such a call will be tagged in red and "C2" column will mark "Yes".
