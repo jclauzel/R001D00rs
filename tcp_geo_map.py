@@ -2,7 +2,7 @@
 
 # R001D00rs tcp_geo_map https://github.com/jclauzel/R001D00rs/
 
-# pip install psutil, maxminddb, PySide6, opencv-python
+# pip install psutil, maxminddb, PySide6, opencv-python, procmon-parser
 
 # using https://github.com/pointhi/leaflet-color-markers for colored map markers
 # using https://github.com/sapics/ip-location-db/tree/main/geolite2-city this script is using the MaxMind GeoLite2 database and is attributed accordingly for its usage.
@@ -41,14 +41,14 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
     git clone https://github.com/jclauzel/R001D00rs
     python3 -m venv ./venv
     source venv/bin/activate
-    pip3 install pyside6 requests maxminddb opencv-python
+    pip3 install pyside6 requests maxminddb opencv-python procmon-parser
     python3 tcp_geo_map.py
 
     Windows:
-    pip3 install pyside6 requests maxminddb opencv-python
+    pip3 install pyside6 requests maxminddb opencv-python procmon-parser
 """
 
-import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, logging
+import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, logging, platform, subprocess, procmon_parser
 from concurrent.futures import ThreadPoolExecutor
 
 # Suppress Qt WebEngine Chromium warnings (must be set before QApplication)
@@ -63,15 +63,15 @@ logging.basicConfig(
 )
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QTableWidget, QTableWidgetItem, QLabel, 
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget) 
+                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu) 
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot
 from PySide6.QtWidgets import QStyle
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.4" # Current script version
+VERSION = "3.0.5" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -165,6 +165,7 @@ do_resolve_public_ip = False  # Set to True to resolve public IP addresses to ho
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
 do_c2_check = False    # Set to True to enable C2-TRACKER checks
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
+do_pause_table_sorting = False  # Set to True to pause table sorting without stopping updates
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
  
@@ -422,6 +423,15 @@ class DNSWorker(threading.Thread):
                 pass
 
 
+class TileRequestInterceptor(QWebEngineUrlRequestInterceptor):
+    """Injects required User-Agent and Referer headers into OpenStreetMap tile requests."""
+    def interceptRequest(self, info):
+        if b'openstreetmap.org' in info.requestUrl().host().encode():
+            info.setHttpHeader(b'User-Agent',
+                f'TCPGeoMap/{VERSION} (+https://github.com/jclauzel/R001D00rs)'.encode())
+            info.setHttpHeader(b'Referer', b'https://www.openstreetmap.org/')
+
+
 class TCPConnectionViewer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -483,6 +493,10 @@ class TCPConnectionViewer(QMainWindow):
         self.map_bridge = MapBridge(self)
         self.channel = QWebChannel()
         self.channel.registerObject('mapBridge', self.map_bridge)
+
+        # Inject required OSM tile headers (User-Agent + Referer) to satisfy OSM tile usage policy
+        self._tile_interceptor = TileRequestInterceptor()
+        QWebEngineProfile.defaultProfile().setUrlRequestInterceptor(self._tile_interceptor)
 
         # Video button flash animation timer
         self._video_btn_flash_timer = None
@@ -870,7 +884,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -880,6 +894,7 @@ class TCPConnectionViewer(QMainWindow):
             'do_reverse_dns': do_reverse_dns,
             'do_resolve_public_ip': do_resolve_public_ip,
             'do_capture_screenshots': do_capture_screenshots,
+            'do_pause_table_sorting': do_pause_table_sorting,
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
@@ -958,7 +973,7 @@ class TCPConnectionViewer(QMainWindow):
                 global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections
                 global show_only_remote_connections, do_reverse_dns, map_refresh_interval
                 global table_column_sort_index, table_column_sort_reverse
-                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots
+                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
@@ -968,6 +983,7 @@ class TCPConnectionViewer(QMainWindow):
                 do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
                 do_resolve_public_ip = settings.get('do_resolve_public_ip', do_resolve_public_ip)
                 do_capture_screenshots = settings.get('do_capture_screenshots', do_capture_screenshots)
+                do_pause_table_sorting = settings.get('do_pause_table_sorting', do_pause_table_sorting)
                 map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
                 table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                 table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
@@ -1075,6 +1091,7 @@ class TCPConnectionViewer(QMainWindow):
                 self.c2_check.setChecked(do_c2_check)
                 self.resolve_public_ip.setChecked(do_resolve_public_ip)
                 self.capture_screenshots_check.setChecked(do_capture_screenshots)
+                self.pause_table_sorting_check.setChecked(do_pause_table_sorting)
 
                 # Update buffer size input field
                 if hasattr(self, 'buffer_size_input'):
@@ -1304,10 +1321,280 @@ class TCPConnectionViewer(QMainWindow):
 
 
 
+    def on_connection_table_context_menu(self, pos):
+        """Show a right-click context menu for the connection table row under the cursor."""
+        index = self.connection_table.indexAt(pos)
+        if not index.isValid():
+            return
+
+        row = index.row()
+        pid_item = self.connection_table.item(row, PID_ROW_INDEX)
+        pid = pid_item.text().strip() if pid_item else ""
+        process_item = self.connection_table.item(row, PROCESS_ROW_INDEX)
+        process_name = process_item.text().strip() if process_item else ""
+
+        menu = QMenu(self)
+
+        if platform.system() == "Windows":
+            action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
+            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
+            action_procmon = menu.addAction(f"Open {process_name} pid:{pid} in Process Monitor")
+        else:
+            action_open = menu.addAction(f"Open {process_name} pid:{pid} in htop")
+            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} memory")
+
+        chosen = menu.exec(self.connection_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        if not pid:
+            QMessageBox.warning(self, "No PID", "Could not determine the PID for the selected row.")
+            return
+
+        if platform.system() == "Windows":
+            if chosen == action_open:
+                try:
+                    # procexp /p:<pid> selects the process; fall back to plain procexp
+                    subprocess.Popen(["procexp", f"/s:{pid}"])
+                except FileNotFoundError:
+                    QMessageBox.warning(self, "Process Explorer not found",
+                                        "Process Explorer (procexp.exe) was not found on PATH.\n"
+                                        "Download it from https://learn.microsoft.com/sysinternals/downloads/process-explorer")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+            elif chosen == action_memory:
+                try:
+                    # procdump -ma <pid> writes a full minidump to the current directory.
+                    # CREATE_NEW_CONSOLE gives the child its own console window and implicitly
+                    # detaches it from ours. CREATE_NEW_PROCESS_GROUP puts it in an independent
+                    # process group so closing that window never signals our process.
+                    # NOTE: DETACHED_PROCESS and CREATE_NEW_CONSOLE are mutually exclusive.
+                    CREATE_NEW_PROCESS_GROUP = 0x00000200
+                    CREATE_NEW_CONSOLE = 0x00000010
+                    subprocess.Popen(
+                        ["procdump", "-ma", pid],
+                        creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                        close_fds=True,
+                    )
+                except FileNotFoundError:
+                    QMessageBox.warning(self, "ProcDump not found",
+                                        "ProcDump (procdump.exe) was not found on PATH.\n"
+                                        "Download it from https://learn.microsoft.com/sysinternals/downloads/procdump")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+            elif chosen == action_procmon:
+                try:
+                    try:
+                        from procmon_parser import dump_configuration, Rule
+                    except ImportError as e:
+                        QMessageBox.warning(self, "procmon-parser not found",
+                                            "procmon-parser is required to generate Process Monitor configurations.\n\n"
+                                            "Install it using:\npip install procmon-parser\n\n"
+                                            "See: https://github.com/eronnen/procmon-parser")
+                        return
+
+                    procmon_dir = "procmon"
+                    os.makedirs(procmon_dir, exist_ok=True)
+
+                    timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+                    safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in process_name)
+                    pmc_filename = f"tcp_geo_map_{timestamp}_{safe_name}_{pid}.pmc"
+                    pmc_path = os.path.join(procmon_dir, pmc_filename)
+
+                    config = {
+                        "DestructiveFilter": 0,
+                        "FilterRules": [
+                            Rule('PID', 'is', pid, 'include'),
+                            Rule('Process_Name', 'is', process_name, 'include'),
+                        ],
+                    }
+
+                    with open(pmc_path, "wb") as f:
+                        dump_configuration(config, f)
+
+                    abs_pmc = os.path.abspath(pmc_path)
+                    CREATE_NEW_PROCESS_GROUP = 0x00000200
+                    CREATE_NEW_CONSOLE = 0x00000010
+                    procmon_launched = False
+                    for procmon_exe in ("Procmon64.exe", "Procmon.exe"):
+                        try:
+                            subprocess.Popen(
+                                [procmon_exe, "/LoadConfig", abs_pmc],
+                                creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                                close_fds=True,
+                            )
+                            procmon_launched = True
+                            break
+                        except FileNotFoundError:
+                            continue
+                    if not procmon_launched:
+                        QMessageBox.warning(self, "Process Monitor not found",
+                                            "Process Monitor (Procmon64.exe / Procmon.exe) was not found on PATH.\n"
+                                            "Download it from https://learn.microsoft.com/en-us/sysinternals/downloads/process-monitor")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+        else:
+            if chosen == action_open:
+                try:
+                    # Open htop filtered to the selected PID in a new terminal
+                    for term in ("x-terminal-emulator", "xterm", "gnome-terminal", "konsole"):
+                        try:
+                            subprocess.Popen([term, "-e", f"htop -p {pid}"])
+                            break
+                        except FileNotFoundError:
+                            continue
+                    else:
+                        QMessageBox.warning(self, "Terminal not found",
+                                            "Could not find a terminal emulator to open htop.\n"
+                                            "Install xterm or another terminal emulator.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+            elif chosen == action_memory:
+                try:
+                    # gcore dumps the full process memory to core.<pid>
+                    subprocess.Popen(["gcore", pid])
+                except FileNotFoundError:
+                    QMessageBox.warning(self, "gcore not found",
+                                        "gcore was not found on PATH.\n"
+                                        "Install it via: sudo apt install gdb  (or equivalent)")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+
+    def on_summary_table_context_menu(self, pos):
+        """Show the same right-click context menu for the summary table row under the cursor."""
+        index = self.summary_table.indexAt(pos)
+        if not index.isValid():
+            return
+
+        row = index.row()
+        pid_item = self.summary_table.item(row, 1)   # PID column
+        pid = pid_item.text().strip() if pid_item else ""
+        process_item = self.summary_table.item(row, 0)  # Process column
+        process_name = process_item.text().strip() if process_item else ""
+
+        menu = QMenu(self)
+
+        if platform.system() == "Windows":
+            action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
+            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
+            action_procmon = menu.addAction(f"Open {process_name} pid:{pid} in Process Monitor")
+        else:
+            action_open = menu.addAction(f"Open {process_name} pid:{pid} in htop")
+            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} memory")
+
+        chosen = menu.exec(self.summary_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        if not pid:
+            QMessageBox.warning(self, "No PID", "Could not determine the PID for the selected row.")
+            return
+
+        if platform.system() == "Windows":
+            if chosen == action_open:
+                try:
+                    subprocess.Popen(["procexp", f"/s:{pid}"])
+                except FileNotFoundError:
+                    QMessageBox.warning(self, "Process Explorer not found",
+                                        "Process Explorer (procexp.exe) was not found on PATH.\n"
+                                        "Download it from https://learn.microsoft.com/sysinternals/downloads/process-explorer")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+            elif chosen == action_memory:
+                try:
+                    CREATE_NEW_PROCESS_GROUP = 0x00000200
+                    CREATE_NEW_CONSOLE = 0x00000010
+                    subprocess.Popen(
+                        ["procdump", "-ma", pid],
+                        creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                        close_fds=True,
+                    )
+                except FileNotFoundError:
+                    QMessageBox.warning(self, "ProcDump not found",
+                                        "ProcDump (procdump.exe) was not found on PATH.\n"
+                                        "Download it from https://learn.microsoft.com/sysinternals/downloads/procdump")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+            elif chosen == action_procmon:
+                try:
+                    try:
+                        from procmon_parser import dump_configuration, Rule
+                    except ImportError:
+                        QMessageBox.warning(self, "procmon-parser not found",
+                                            "procmon-parser is required to generate Process Monitor configurations.\n\n"
+                                            "Install it using:\npip install procmon-parser\n\n"
+                                            "See: https://github.com/eronnen/procmon-parser")
+                        return
+
+                    procmon_dir = "procmon"
+                    os.makedirs(procmon_dir, exist_ok=True)
+
+                    timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+                    safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in process_name)
+                    pmc_filename = f"tcp_geo_map_{timestamp}_{safe_name}_{pid}.pmc"
+                    pmc_path = os.path.join(procmon_dir, pmc_filename)
+
+                    config = {
+                        "DestructiveFilter": 0,
+                        "FilterRules": [
+                            Rule('PID', 'is', pid, 'include'),
+                            Rule('Process_Name', 'is', process_name, 'include'),
+                        ],
+                    }
+
+                    with open(pmc_path, "wb") as f:
+                        dump_configuration(config, f)
+
+                    abs_pmc = os.path.abspath(pmc_path)
+                    CREATE_NEW_PROCESS_GROUP = 0x00000200
+                    CREATE_NEW_CONSOLE = 0x00000010
+                    procmon_launched = False
+                    for procmon_exe in ("Procmon64.exe", "Procmon.exe"):
+                        try:
+                            subprocess.Popen(
+                                [procmon_exe, "/LoadConfig", abs_pmc],
+                                creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                                close_fds=True,
+                            )
+                            procmon_launched = True
+                            break
+                        except FileNotFoundError:
+                            continue
+                    if not procmon_launched:
+                        QMessageBox.warning(self, "Process Monitor not found",
+                                            "Process Monitor (Procmon64.exe / Procmon.exe) was not found on PATH.\n"
+                                            "Download it from https://learn.microsoft.com/en-us/sysinternals/downloads/process-monitor")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+        else:
+            if chosen == action_open:
+                try:
+                    for term in ("x-terminal-emulator", "xterm", "gnome-terminal", "konsole"):
+                        try:
+                            subprocess.Popen([term, "-e", f"htop -p {pid}"])
+                            break
+                        except FileNotFoundError:
+                            continue
+                    else:
+                        QMessageBox.warning(self, "Terminal not found",
+                                            "Could not find a terminal emulator to open htop.\n"
+                                            "Install xterm or another terminal emulator.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+            elif chosen == action_memory:
+                try:
+                    subprocess.Popen(["gcore", pid])
+                except FileNotFoundError:
+                    QMessageBox.warning(self, "gcore not found",
+                                        "gcore was not found on PATH.\n"
+                                        "Install it via: sudo apt install gdb  (or equivalent)")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", str(e))
+
     def on_header_clicked(self, index):
         """
         Handles sorting when a column header is clicked.
-        
+
         Args:
             index (int): The column index that was clicked.
         """
@@ -1696,6 +1983,10 @@ class TCPConnectionViewer(QMainWindow):
 
         self.refresh_connections()
     
+    def update_pause_table_sorrting(self):
+        global do_pause_table_sorting
+        do_pause_table_sorting = self.pause_table_sorting_check.isChecked()
+
     def update_refresh_interval(self):
         global map_refresh_interval
 
@@ -1984,6 +2275,8 @@ class TCPConnectionViewer(QMainWindow):
         self.connection_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.connection_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.connection_table.cellClicked.connect(self.on_table_cell_clicked)
+        self.connection_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.connection_table.customContextMenuRequested.connect(self.on_connection_table_context_menu)
 
         # Ensure header is interactive and enforce a minimum width for the "C2" column (index = SUSPECT_ROW_INDEX)
         self.connection_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -2090,15 +2383,10 @@ class TCPConnectionViewer(QMainWindow):
         self.status_label.setAlignment(Qt.AlignTop)
         self.controls_layout.addWidget(self.status_label)
 
-        # Save button
-        self.controls_layout.addWidget(self.save_connections_btn)
-        self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
-
         # Generate video button (shown only when screenshots exist)
         self.generate_video_btn = QPushButton("Generate .mp4 video file")
         self.generate_video_btn.clicked.connect(self.generate_video_from_screenshots)
         self.generate_video_btn.setVisible(False)  # Hidden by default, shown when screenshots exist
-        self.controls_layout.addWidget(self.generate_video_btn)
 
         # Put map and controls into the vertical splitter (map on top, controls below)
         self.right_splitter.addWidget(self.map_view)
@@ -2146,10 +2434,10 @@ class TCPConnectionViewer(QMainWindow):
         summary_title_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
         summary_tab_layout.addWidget(summary_title_label)
 
-        # Create summary table with 6 columns
-        self.summary_table = QTableWidget(0, 6)
+        # Create summary table with 9 columns
+        self.summary_table = QTableWidget(0, 9)
         self.summary_table.setHorizontalHeaderLabels([
-            "Process", "PID", "C2", "Remote Address", "Name", "Count"
+            "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count"
         ])
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -2158,6 +2446,8 @@ class TCPConnectionViewer(QMainWindow):
 
         # Connect the header clicked signal to the summary table sort function
         self.summary_table.horizontalHeader().sectionClicked.connect(self.on_summary_header_clicked)
+        self.summary_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.summary_table.customContextMenuRequested.connect(self.on_summary_table_context_menu)
 
         summary_tab_layout.addWidget(self.summary_table)
 
@@ -2226,17 +2516,36 @@ class TCPConnectionViewer(QMainWindow):
 
         settings_tab_layout.addLayout(buffer_size_layout)
 
-        self.reset_connections_btn = QPushButton("Clear existing captured live connections")
-        self.reset_connections_btn.clicked.connect(self.reset_connections)
-        settings_tab_layout.addWidget(self.reset_connections_btn)
+        # Pause table sorting checkbox
+        self.pause_table_sorting_check = QCheckBox("Pause main tab connection table sorting")
+        self.pause_table_sorting_check.setChecked(False)
+        self.pause_table_sorting_check.stateChanged.connect(self.update_pause_table_sorrting)
+        settings_tab_layout.addWidget(self.pause_table_sorting_check)
 
         # Add stretch to push settings to the top
         settings_tab_layout.addStretch()
+
+        # Actions tab
+        actions_tab_widget = QWidget()
+        actions_tab_layout = QVBoxLayout()
+        actions_tab_widget.setLayout(actions_tab_layout)
+
+        self.reset_connections_btn = QPushButton("Clear existing captured live connections")
+        self.reset_connections_btn.clicked.connect(self.reset_connections)
+        actions_tab_layout.addWidget(self.reset_connections_btn)
+
+        self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
+        actions_tab_layout.addWidget(self.save_connections_btn)
+
+        actions_tab_layout.addWidget(self.generate_video_btn)
+
+        actions_tab_layout.addStretch()
 
         # Create QTabWidget and add all tabs
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(main_tab_widget, "Main")
         self.tab_widget.addTab(summary_tab_widget, "Summary")
+        self.tab_widget.addTab(actions_tab_widget, "Actions")
         self.tab_widget.addTab(settings_tab_widget, "Settings")
 
         # Connect tab change event to update summary when Summary tab is selected
@@ -3876,7 +4185,7 @@ class TCPConnectionViewer(QMainWindow):
         stats_line = f"Geo resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses}"
         self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line, datetime_text=datetime_text)
 
-        if table_column_sort_index>-1:
+        if table_column_sort_index > -1 and not do_pause_table_sorting:
             self.column_resort(table_column_sort_index)
 
         # Restore selection if we had one before refresh
@@ -4466,7 +4775,10 @@ class TCPConnectionViewer(QMainWindow):
                     process = conn.get('process', '')
                     pid = conn.get('pid', '')
                     suspect = conn.get('suspect', '')
+                    protocol = conn.get('protocol', '')
+                    local = conn.get('local', '')
                     remote = conn.get('remote', '')
+                    ip_type = conn.get('ip_type', '')
                     name = conn.get('name', '')
 
                     # Filter out local connections if show_only_remote_connections is enabled
@@ -4478,7 +4790,7 @@ class TCPConnectionViewer(QMainWindow):
                             continue
 
                     # Use tuple as dictionary key for grouping
-                    key = (process, pid, suspect, remote, name)
+                    key = (process, pid, suspect, protocol, local, remote, ip_type, name)
 
                     # Increment count for this unique connection
                     if key in connection_stats:
@@ -4490,16 +4802,19 @@ class TCPConnectionViewer(QMainWindow):
             sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1], reverse=True)
 
             # Populate table with sorted results
-            for (process, pid, suspect, remote, name), count in sorted_stats:
+            for (process, pid, suspect, protocol, local, remote, ip_type, name), count in sorted_stats:
                 row = self.summary_table.rowCount()
                 self.summary_table.insertRow(row)
 
                 self.summary_table.setItem(row, 0, QTableWidgetItem(process))
                 self.summary_table.setItem(row, 1, QTableWidgetItem(pid))
                 self.summary_table.setItem(row, 2, QTableWidgetItem(suspect))
-                self.summary_table.setItem(row, 3, QTableWidgetItem(remote))
-                self.summary_table.setItem(row, 4, QTableWidgetItem(name))
-                self.summary_table.setItem(row, 5, QTableWidgetItem(str(count)))
+                self.summary_table.setItem(row, 3, QTableWidgetItem(protocol))
+                self.summary_table.setItem(row, 4, QTableWidgetItem(local))
+                self.summary_table.setItem(row, 5, QTableWidgetItem(remote))
+                self.summary_table.setItem(row, 6, QTableWidgetItem(ip_type))
+                self.summary_table.setItem(row, 7, QTableWidgetItem(name))
+                self.summary_table.setItem(row, 8, QTableWidgetItem(str(count)))
 
                 # Highlight suspect connections in red
                 if suspect == "Yes":
