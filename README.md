@@ -47,6 +47,9 @@ C2 Tracker is a free-to-use-community-driven IOC feed that searches to collect I
 When prompted for download and agreed the script will fetch the following file containing the list of C2 Suspect IP addresses and save it in the database subfolder:
 - https://github.com/montysecurity/C2-Tracker/raw/refs/heads/main/data/all.txt
 
+* procmon-parser
+When right clicking on a table item sysinternals procmon can be started to automaticaly start capturing process activity. To generate the procmon capture profile it uses https://github.com/eronnen/procmon-parser .
+
 tcp_geo_map uses:
 
 * maxminddb
@@ -91,7 +94,7 @@ python3 -m venv ./R001D00rs
 
 source R001D00rs/bin/activate
 
-pip3 install pyside6 requests maxminddb psutil opencv-python
+pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser
 
 or
 
@@ -112,7 +115,7 @@ Download source from latest "release" located on the right side of https://githu
 
 Install required packages:
 
-pip3 install pyside6 requests maxminddb opencv-python
+pip3 install pyside6 requests maxminddb opencv-python procmon-parser
 
 or
 
