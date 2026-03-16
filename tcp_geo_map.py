@@ -61,9 +61,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                             QWidget, QTableWidget, QTableWidgetItem, QLabel, 
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox,QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu) 
+from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+                             QWidget, QTableWidget, QTableWidgetItem, QLabel,
+                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit) 
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot
 from PySide6.QtWidgets import QStyle
@@ -71,7 +71,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.5" # Current script version
+VERSION = "3.0.6" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -148,8 +148,8 @@ IP_TYPE_COLUMN_SIZE = 20
 
 TIME_SLIDER_TEXT = "Time slider position: "
 
-START_CAPTURE_BUTTON_TEXT = "Start capture live connections"
-STOP_CAPTURE_BUTTON_TEXT = "Stop capture live connections" 
+START_CAPTURE_BUTTON_TEXT = "Start capturing live connections"
+STOP_CAPTURE_BUTTON_TEXT = "Stop capturing live connections" 
 
 max_connection_list_filo_buffer_size = 1000  # Maximum number of connection snapshots to keep in memory. The larger this value the more memory will be used. When the max size is reached the oldest connection snapshot will be removed from memory.
 show_tooltip = False # Show tooltips on map markers
@@ -1591,6 +1591,40 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", str(e))
 
+    def _sync_filter_widths(self):
+        """Resize filter bar inputs to match the current connection table column widths."""
+        try:
+            vh_width = self.connection_table.verticalHeader().width()
+            self._connection_filter_vheader_spacer.setFixedWidth(vh_width)
+            total_width = vh_width
+            for i, le in enumerate(self._connection_filter_inputs):
+                col_width = self.connection_table.columnWidth(i)
+                le.setFixedWidth(col_width)
+                total_width += col_width
+            self._connection_filter_inner.setFixedWidth(total_width)
+        except Exception:
+            pass
+
+    def apply_connection_table_filter(self):
+        """Show/hide connection table rows based on the active per-column filter inputs."""
+        try:
+            filters = [le.text().strip().lower() for le in self._connection_filter_inputs]
+            has_filter = any(filters)
+            for row in range(self.connection_table.rowCount()):
+                if not has_filter:
+                    self.connection_table.setRowHidden(row, False)
+                    continue
+                visible = True
+                for col, f in enumerate(filters):
+                    if f:
+                        item = self.connection_table.item(row, col)
+                        if f not in (item.text().lower() if item else ""):
+                            visible = False
+                            break
+                self.connection_table.setRowHidden(row, not visible)
+        except Exception:
+            pass
+
     def on_header_clicked(self, index):
         """
         Handles sorting when a column header is clicked.
@@ -1611,6 +1645,7 @@ class TCPConnectionViewer(QMainWindow):
 
         for row in range(self.connection_table.rowCount()):
             self.sort_table_by_column(index, table_column_sort_reverse)
+        self.apply_connection_table_filter()
 
 
     def column_resort(self, index):
@@ -2290,6 +2325,39 @@ class TCPConnectionViewer(QMainWindow):
 
         self.connection_table.horizontalHeader().setMinimumSectionSize(SUSPECT_COLUMN_SIZE)
 
+        # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
+        _filter_placeholders = [
+            "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port",
+            "Remote Addr", "Remote Port", "Name", "IP Type", "Lat", "Lon"
+        ]
+        self._connection_filter_inner = QWidget()
+        _filter_inner_layout = QHBoxLayout(self._connection_filter_inner)
+        _filter_inner_layout.setContentsMargins(0, 0, 0, 0)
+        _filter_inner_layout.setSpacing(0)
+        self._connection_filter_vheader_spacer = QWidget()
+        _filter_inner_layout.addWidget(self._connection_filter_vheader_spacer)
+        self._connection_filter_inputs = []
+        for placeholder in _filter_placeholders:
+            le = QLineEdit()
+            le.setPlaceholderText(placeholder)
+            le.setClearButtonEnabled(True)
+            le.setFixedHeight(24)
+            le.textChanged.connect(self.apply_connection_table_filter)
+            self._connection_filter_inputs.append(le)
+            _filter_inner_layout.addWidget(le)
+        self._connection_filter_scroll = QScrollArea()
+        self._connection_filter_scroll.setWidget(self._connection_filter_inner)
+        self._connection_filter_scroll.setWidgetResizable(False)
+        self._connection_filter_scroll.setFixedHeight(28)
+        self._connection_filter_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._connection_filter_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._connection_filter_scroll.setFrameShape(QFrame.NoFrame)
+        self.connection_table.horizontalScrollBar().valueChanged.connect(
+            self._connection_filter_scroll.horizontalScrollBar().setValue)
+        self.connection_table.horizontalHeader().sectionResized.connect(
+            lambda *_: self._sync_filter_widths())
+
+        self.left_layout.addWidget(self._connection_filter_scroll)
         self.left_layout.addWidget(self.connection_table)
         
         # Respect minimum sizes and set sensible initial sizes for the splitter children
@@ -2505,7 +2573,6 @@ class TCPConnectionViewer(QMainWindow):
         buffer_size_label.setToolTip("Controls how many historical connection snapshots are stored.\nAlso determines how many screenshot files to keep on disk.")
         buffer_size_layout.addWidget(buffer_size_label)
 
-        from PySide6.QtWidgets import QLineEdit
         self.buffer_size_input = QLineEdit()
         self.buffer_size_input.setText(str(max_connection_list_filo_buffer_size))
         self.buffer_size_input.setMaximumWidth(100)
@@ -2538,6 +2605,33 @@ class TCPConnectionViewer(QMainWindow):
         actions_tab_layout.addWidget(self.save_connections_btn)
 
         actions_tab_layout.addWidget(self.generate_video_btn)
+
+        # Database status table
+        db_group = QGroupBox("Databases")
+        db_group_layout = QVBoxLayout()
+        db_group.setLayout(db_group_layout)
+
+        self.db_status_table = QTableWidget(0, 4)
+        self.db_status_table.setHorizontalHeaderLabels(["Database", "Last Downloaded", "Expires", ""])
+        self.db_status_table.horizontalHeader().setStretchLastSection(False)
+        self.db_status_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.db_status_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.db_status_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.db_status_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.db_status_table.verticalHeader().setVisible(False)
+        self.db_status_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.db_status_table.setSelectionMode(QTableWidget.NoSelection)
+        self.db_status_table.setMinimumHeight(130)
+        self.db_status_table.setSizeAdjustPolicy(QTableWidget.AdjustToContents)
+        db_group_layout.addWidget(self.db_status_table)
+
+        self.refresh_all_db_btn = QPushButton("Refresh All Databases")
+        self.refresh_all_db_btn.clicked.connect(self._refresh_all_databases)
+        db_group_layout.addWidget(self.refresh_all_db_btn)
+
+        actions_tab_layout.addWidget(db_group)
+
+        self._populate_db_status_table()
 
         actions_tab_layout.addStretch()
 
@@ -2574,7 +2668,113 @@ class TCPConnectionViewer(QMainWindow):
 
         # Connect the web view's load finished signal
         self.map_view.loadFinished.connect(self.on_map_loaded)
-        
+        # Defer initial filter bar width sync until the layout is finalized
+        QTimer.singleShot(0, self._sync_filter_widths)
+
+    def _populate_db_status_table(self):
+        """Fill (or refresh) the database status table in the Actions tab."""
+        try:
+            db_entries = [
+                ("GeoLite2 IPv4", IPV4_DB_PATH, GEOLITE2_IPV4_DOWNLOAD_URL),
+                ("GeoLite2 IPv6", IPV6_DB_PATH, GEOLITE2_IPV6_DOWNLOAD_URL),
+                ("C2 Tracker",    C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
+            ]
+
+            self.db_status_table.setRowCount(0)
+
+            for db_name, db_path, db_url in db_entries:
+                row = self.db_status_table.rowCount()
+                self.db_status_table.insertRow(row)
+
+                self.db_status_table.setItem(row, 0, QTableWidgetItem(db_name))
+
+                if os.path.exists(db_path):
+                    mtime = os.path.getmtime(db_path)
+                    downloaded_dt = datetime.datetime.fromtimestamp(mtime)
+                    expires_dt = downloaded_dt + datetime.timedelta(days=DATABASE_EXPIRE_AFTER_DAYS)
+                    downloaded_str = downloaded_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    expires_str = expires_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    expires_item = QTableWidgetItem(expires_str)
+                    if datetime.datetime.now() > expires_dt:
+                        expires_item.setForeground(Qt.red)
+                else:
+                    downloaded_str = "Not downloaded"
+                    expires_item = QTableWidgetItem("N/A")
+
+                self.db_status_table.setItem(row, 1, QTableWidgetItem(downloaded_str))
+                self.db_status_table.setItem(row, 2, expires_item)
+
+                refresh_btn = QPushButton("Refresh")
+                refresh_btn.clicked.connect(lambda checked=False, p=db_path, u=db_url: self._refresh_single_database(p, u))
+                self.db_status_table.setCellWidget(row, 3, refresh_btn)
+
+        except Exception as e:
+            logging.error(f"Error populating DB status table: {e}")
+
+    def _refresh_single_database(self, db_path, db_url):
+        """Download a single database, reload it into memory, and update the status table."""
+        try:
+            was_capturing = hasattr(self, 'timer') and self.timer.isActive()
+            if was_capturing:
+                self.timer.stop()
+
+            self.download_database(db_path, db_url)
+
+            # Reload the relevant in-memory reader
+            try:
+                if db_path == IPV4_DB_PATH:
+                    if self.reader_ipv4 is not None:
+                        self.reader_ipv4.close()
+                    self.reader_ipv4 = maxminddb.open_database(IPV4_DB_PATH)
+                elif db_path == IPV6_DB_PATH:
+                    if self.reader_ipv6 is not None:
+                        self.reader_ipv6.close()
+                    self.reader_ipv6 = maxminddb.open_database(IPV6_DB_PATH)
+                elif db_path == C2_TRACKER_DB_PATH:
+                    self.reader_c2_tracker = {}
+                    self.reader_c2_tracker_set = set()
+                    if os.path.exists(C2_TRACKER_DB_PATH):
+                        with open(C2_TRACKER_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith("#"):
+                                    continue
+                                parts = line.split("\t")
+                                ip = parts[0]
+                                self.reader_c2_tracker_set.add(ip)
+                                typ = parts[1] if len(parts) > 1 else ""
+                                info = parts[2] if len(parts) > 2 else ""
+                                self.reader_c2_tracker[ip] = (typ, info)
+            except Exception as reload_err:
+                logging.error(f"Failed to reload database {db_path}: {reload_err}")
+                QMessageBox.warning(self, "Reload Error", f"Database downloaded but failed to reload: {reload_err}")
+
+            # Refresh the status table display
+            self._populate_db_status_table()
+
+            if was_capturing:
+                self.timer.start(map_refresh_interval)
+
+        except Exception as e:
+            logging.error(f"Error refreshing database {db_path}: {e}")
+
+    def _refresh_all_databases(self):
+        """Download all databases in sequence, reload them, then update the status table."""
+        db_entries = [
+            (IPV4_DB_PATH, GEOLITE2_IPV4_DOWNLOAD_URL),
+            (IPV6_DB_PATH, GEOLITE2_IPV6_DOWNLOAD_URL),
+            (C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
+        ]
+        was_capturing = hasattr(self, 'timer') and self.timer.isActive()
+        if was_capturing:
+            self.timer.stop()
+        try:
+            for db_path, db_url in db_entries:
+                self._refresh_single_database(db_path, db_url)
+        finally:
+            if was_capturing and not self.timer.isActive():
+                self.timer.start(map_refresh_interval)
+
     def load_databases(self):
         try:
             # Ensure database directory exists
@@ -4210,7 +4410,8 @@ class TCPConnectionViewer(QMainWindow):
                         break
             except Exception as e:
                 logging.debug(f"Could not restore selection: {e}")
-    
+        self.apply_connection_table_filter()
+
     def on_map_loaded(self, success):
         if not success:
             self.status_label.setText("Error loading map")
@@ -4291,39 +4492,58 @@ class TCPConnectionViewer(QMainWindow):
             logging.warning(f"Failed to show first run message: {e}")
 
     def _capture_map_screenshot(self):
-        """Capture screenshot of the map widget and save to disk as JPG"""
+        """Capture screenshot of the map widget and save to disk as JPG.
+
+        When the window is minimized the WebEngine compositor stops rendering and
+        grab() returns a blank image.  To avoid popping the window visibly we
+        make it fully transparent, restore it off-screen, wait 500 ms for
+        WebEngine to repaint, grab the frame, then re-minimize and restore the
+        original opacity — all invisible to the user.
+        """
         try:
-            # Ensure screenshot directory exists
-            os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-
-            # Generate filename with timestamp
-            timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-            filename = f"tcp_geo_map_{timestamp}.jpg"
-            filepath = os.path.join(SCREENSHOTS_DIR, filename)
-
-            # Capture the map widget as QPixmap
-            if hasattr(self, 'map_view') and self.map_view is not None:
-                pixmap = self.map_view.grab()
-
-                # Save as JPG with quality 95
-                success = pixmap.save(filepath, 'JPG', 95)
-
-                if success:
-                    logging.info(f"Screenshot saved: {filepath}")
-
-                    # Immediately cleanup old screenshots after saving new one (async)
-                    # This ensures we maintain the buffer size limit without blocking
-                    try:
-                        self._cleanup_old_screenshots_async()
-                    except Exception as cleanup_error:
-                        logging.error(f"Failed to cleanup after screenshot save: {cleanup_error}")
-                else:
-                    logging.warning(f"Failed to save screenshot: {filepath}")
-            else:
+            if not (hasattr(self, 'map_view') and self.map_view is not None):
                 logging.warning("Cannot capture screenshot - map_view not available")
+                return
+
+            os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+            filepath = os.path.join(SCREENSHOTS_DIR, f"tcp_geo_map_{timestamp}.jpg")
+
+            is_minimized = self.isMinimized() or bool(self.windowState() & Qt.WindowMinimized)
+            if is_minimized:
+                # Make window fully transparent so the restore is invisible
+                original_opacity = self.windowOpacity()
+                self.setWindowOpacity(0.0)
+                self.showNormal()
+                QApplication.processEvents()
+                QTimer.singleShot(500, lambda: self._finish_capture_screenshot(filepath, True, original_opacity))
+            else:
+                self._finish_capture_screenshot(filepath, False, None)
 
         except Exception as e:
             logging.error(f"Error capturing screenshot: {e}")
+
+    def _finish_capture_screenshot(self, filepath, re_minimize, original_opacity):
+        """Grab the map view, save to *filepath*, then re-minimize if requested."""
+        try:
+            pixmap = self.map_view.grab()
+
+            if re_minimize:
+                self.showMinimized()
+                if original_opacity is not None:
+                    self.setWindowOpacity(original_opacity)
+
+            success = pixmap.save(filepath, 'JPG', 95)
+            if success:
+                logging.info(f"Screenshot saved: {filepath}")
+                try:
+                    self._cleanup_old_screenshots_async()
+                except Exception as cleanup_error:
+                    logging.error(f"Failed to cleanup after screenshot save: {cleanup_error}")
+            else:
+                logging.warning(f"Failed to save screenshot: {filepath}")
+        except Exception as e:
+            logging.error(f"Error finishing screenshot capture: {e}")
 
     def generate_video_from_screenshots(self):
         """Generate MP4 video from all screenshots in the screen_captures folder (async)"""
