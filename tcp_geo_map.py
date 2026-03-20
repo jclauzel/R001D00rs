@@ -41,7 +41,7 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
     git clone https://github.com/jclauzel/R001D00rs
     python3 -m venv ./venv
     source venv/bin/activate
-    pip3 install pyside6 requests maxminddb opencv-python procmon-parser
+    pip3 install psutil pyside6 requests maxminddb opencv-python procmon-parser
     python3 tcp_geo_map.py
 
     Windows:
@@ -71,11 +71,12 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.6" # Current script version
+VERSION = "3.0.7" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
 DATABASE_EXPIRE_AFTER_DAYS = 7 # Databases expiration time in days from download date, default 7 days (1 week)
+DATABASE_EXPIRE_TIME_CHECK_INTERVAL = 600000 # Check for database expiration every 10 minutes (600000 ms)
 DB_DIR = "databases" # Database location are contained in this subdirectory under the main script directory
 SCREENSHOTS_DIR = "screen_captures"  # Screenshot directory for captured map images
 
@@ -540,6 +541,11 @@ class TCPConnectionViewer(QMainWindow):
         # Start timer only if reverse DNS is enabled (runs every 60 seconds = 60000 ms)
         if do_reverse_dns:
             self.public_ip_dns_cache_cleanup_timer.start(60000)
+
+        # Set up periodic database expiration check timer (every 10 minutes = DATABASE_EXPIRE_TIME_CHECK_INTERVAL ms)
+        self.database_refresh_timer = QTimer(self)
+        self.database_refresh_timer.timeout.connect(self._on_database_refresh_timer)
+        self.database_refresh_timer.start(DATABASE_EXPIRE_TIME_CHECK_INTERVAL)
 
 
     def _verify_map_ready(self):
@@ -2774,6 +2780,61 @@ class TCPConnectionViewer(QMainWindow):
         finally:
             if was_capturing and not self.timer.isActive():
                 self.timer.start(map_refresh_interval)
+
+    def _is_any_database_expired(self):
+        """Return True if any of the tracked databases is missing or older than DATABASE_EXPIRE_AFTER_DAYS."""
+        for db_path in (IPV4_DB_PATH, IPV6_DB_PATH, C2_TRACKER_DB_PATH):
+            if not os.path.exists(db_path):
+                return True
+            modification_time = os.path.getmtime(db_path)
+            days_old = (datetime.datetime.now() - datetime.datetime.fromtimestamp(modification_time)).days
+            if days_old > DATABASE_EXPIRE_AFTER_DAYS:
+                return True
+        return False
+
+    def _on_database_refresh_timer(self):
+        """Periodic callback (every 10 minutes) that checks database expiration and refreshes expired databases."""
+        try:
+            if not self._is_any_database_expired():
+                return
+
+            logging.info("Database refresh timer: expired database(s) detected, starting refresh.")
+
+            was_capturing = hasattr(self, 'timer') and self.timer.isActive()
+            if was_capturing:
+                self.timer.stop()
+
+            # Stop the refresh timer itself while updating to avoid re-entry
+            self.database_refresh_timer.stop()
+
+            try:
+                for db_path, db_url in [
+                    (IPV4_DB_PATH, GEOLITE2_IPV4_DOWNLOAD_URL),
+                    (IPV6_DB_PATH, GEOLITE2_IPV6_DOWNLOAD_URL),
+                    (C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
+                ]:
+                    if not os.path.exists(db_path):
+                        self._refresh_single_database(db_path, db_url)
+                    else:
+                        modification_time = os.path.getmtime(db_path)
+                        days_old = (datetime.datetime.now() - datetime.datetime.fromtimestamp(modification_time)).days
+                        if days_old > DATABASE_EXPIRE_AFTER_DAYS:
+                            self._refresh_single_database(db_path, db_url)
+            finally:
+                # Restart the periodic database refresh timer
+                self.database_refresh_timer.start(DATABASE_EXPIRE_TIME_CHECK_INTERVAL)
+
+                # Resume capture if it was running before
+                if was_capturing and not self.timer.isActive():
+                    self.timer.start(map_refresh_interval)
+
+            logging.info("Database refresh timer: refresh complete.")
+
+        except Exception as e:
+            logging.error(f"Error in database refresh timer: {e}")
+            # Ensure the timer keeps running even after an error
+            if not self.database_refresh_timer.isActive():
+                self.database_refresh_timer.start(DATABASE_EXPIRE_TIME_CHECK_INTERVAL)
 
     def load_databases(self):
         try:
