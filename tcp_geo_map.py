@@ -71,7 +71,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.7" # Current script version
+VERSION = "3.0.8" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -567,6 +567,8 @@ class TCPConnectionViewer(QMainWindow):
                 else:
                     logging.error("Map failed to initialize after 10 retries")
                     self._map_ready_retries = 0
+                    # Show error on the loading overlay since the map never initialized
+                    self._show_map_init_error("Map failed to initialize after multiple retries (no internet connectivity?)")
 
         check_code = """
         (function() {
@@ -586,6 +588,28 @@ class TCPConnectionViewer(QMainWindow):
             self.map_view.page().runJavaScript(check_code, on_check)
         except Exception as e:
             logging.error(f"Error verifying map ready: {e}")
+
+    def _show_map_init_error(self, error_msg):
+        """Inject an error message into the map loading overlay via JavaScript."""
+        escaped = error_msg.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+        js = f"""
+        (function() {{
+            try {{
+                var ov = document.getElementById('map-loading-overlay');
+                if (ov) {{ ov.style.display = ''; }}
+                var errEl = document.getElementById('map-loading-error');
+                if (errEl) {{
+                    errEl.innerText = 'Failed connecting to the internet and initialize OpenStreetMap with error: ' + '{escaped}';
+                }}
+                var spinners = document.querySelectorAll('#map-loading-overlay .spinner');
+                for (var i = 0; i < spinners.length; i++) {{ spinners[i].style.display = 'none'; }}
+            }} catch(e) {{}}
+        }})();
+        """
+        try:
+            self.map_view.page().runJavaScript(js)
+        except Exception as e:
+            logging.error(f"Error showing map init error: {e}")
 
     def _toggle_fullscreen(self):
         """Toggle between fullscreen and normal state (defensive)."""
@@ -3718,10 +3742,25 @@ class TCPConnectionViewer(QMainWindow):
                            88% { opacity:1; transform:scale(1); }
                            100% { opacity:0; transform:scale(0.9); }
                        }
+                       /* loading overlay centered on map */
+                       #map-loading-overlay { position:absolute; top:0; left:0; width:100%; height:100%; z-index:2000;
+                                              display:flex; flex-direction:column; align-items:center; justify-content:center;
+                                              background:rgba(255,255,255,0.92); pointer-events:none;
+                                              font-family:Arial, sans-serif; text-align:center; }
+                       #map-loading-overlay .loading-text { font-size:18px; color:#333; }
+                       #map-loading-overlay .loading-error { font-size:14px; color:#cc0000; margin-top:10px; white-space:pre-wrap; max-width:80%; }
+                       @keyframes spin-loader { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+                       #map-loading-overlay .spinner { width:36px; height:36px; border:4px solid #ccc; border-top:4px solid #333;
+                                                       border-radius:50%; animation:spin-loader 1s linear infinite; margin-bottom:14px; }
                 </style>
             </head>
             <body>
                 <div id="map"></div>
+                <div id="map-loading-overlay">
+                    <div class="spinner"></div>
+                    <div class="loading-text">Loading OpenStreetMap from the internet, please wait...</div>
+                    <div class="loading-error" id="map-loading-error"></div>
+                </div>
                 <div id="refresh-pulse"></div>
                 <div id="map-stats"></div>
                 <div id="map-datetime">
@@ -3825,11 +3864,22 @@ class TCPConnectionViewer(QMainWindow):
                         try {
                             if (typeof L !== 'undefined') { cb(); return; }
                             if (retries <= 0) {
+                                var errMsg = 'Leaflet library did not load. Check network or ensure local files exist at resources/leaflet/';
                                 try {
                                     var el = document.getElementById('map-stats');
                                     if (el) {
-                                        el.innerText = 'Error: Leaflet did not load. Check network or ensure local files exist at resources/leaflet/';
+                                        el.innerText = 'Error: ' + errMsg;
                                     }
+                                } catch(e){}
+                                // Also update loading overlay with failure message
+                                try {
+                                    var errEl = document.getElementById('map-loading-error');
+                                    if (errEl) {
+                                        errEl.innerText = 'Failed connecting to the internet and initialize OpenStreetMap with error: ' + errMsg;
+                                    }
+                                    // Stop the spinner since we know it failed
+                                    var spinners = document.querySelectorAll('#map-loading-overlay .spinner');
+                                    for (var i = 0; i < spinners.length; i++) { spinners[i].style.display = 'none'; }
                                 } catch(e){}
                                 return;
                             }
@@ -3929,9 +3979,58 @@ class TCPConnectionViewer(QMainWindow):
                                     map.createPane('publicIpPane');
                                     map.getPane('publicIpPane').style.zIndex = 650;  // Above markers (600) but below tooltips (700)
 
+                                    // Track tile loading success/failure for overlay logic
+                                    window._tileHadError = false;
+                                    window._tileHadSuccess = false;
+
                                     L.tileLayer('https://{s}.""" + TILE_OPENSTREETMAP_SERVER + """/{z}/{x}/{y}.png', {
                                         attribution: '&copy; OpenStreetMap contributors'
-                                    }).addTo(map);
+                                    }).addTo(map)
+                                      .on('tileload', function() {
+                                          // At least one tile loaded successfully
+                                          window._tileHadSuccess = true;
+                                      })
+                                      .on('load', function() {
+                                          // Tile loading queue is empty.
+                                          // Only remove overlay if at least one tile succeeded
+                                          // and no errors were recorded.
+                                          if (window._tileHadSuccess && !window._tileHadError) {
+                                              var ov = document.getElementById('map-loading-overlay');
+                                              if (ov) { ov.style.display = 'none'; }
+                                          }
+                                      })
+                                      .on('tileerror', function(err) {
+                                          window._tileHadError = true;
+                                          // A tile failed to load - build a human-readable error message
+                                          var msg = 'Could not load map tiles (no internet connection or server unreachable)';
+                                          try {
+                                              var tileUrl = (err && err.tile && err.tile.src) ? err.tile.src : '';
+                                              // Extract just the hostname from the tile URL for a cleaner message
+                                              var host = '';
+                                              try { host = new URL(tileUrl).hostname; } catch(_) {}
+                                              // err.error is a DOM Event, not a JS Error; check its type
+                                              var evtType = (err && err.error && err.error.type) ? err.error.type : '';
+                                              if (evtType === 'error' && host) {
+                                                  msg = 'Could not connect to tile server "' + host + '" (no internet connection or server unreachable)';
+                                              } else if (host) {
+                                                  msg = 'Failed to load map tile from "' + host + '"' + (evtType ? ' (' + evtType + ')' : '');
+                                              }
+                                          } catch(e) { /* keep default msg */ }
+                                          // Store for the watchdog timer
+                                          try { if (window._tileErrorMessages && window._tileErrorMessages.length < 5) { window._tileErrorMessages.push(msg); } } catch(e){}
+                                          // Show error on the overlay immediately and keep it visible
+                                          var ov = document.getElementById('map-loading-overlay');
+                                          if (ov) { ov.style.display = ''; }
+                                          var errEl = document.getElementById('map-loading-error');
+                                          if (errEl) {
+                                              errEl.innerText = 'Failed connecting to the internet and initialize OpenStreetMap with error: ' + msg;
+                                          }
+                                          // Stop spinner on first error
+                                          try {
+                                              var spinners = document.querySelectorAll('#map-loading-overlay .spinner');
+                                              for (var i = 0; i < spinners.length; i++) { spinners[i].style.display = 'none'; }
+                                          } catch(e){}
+                                      });
                                     console.log('Tile layer added successfully');
 
                                     var liveMarkers = [];
@@ -4084,6 +4183,13 @@ class TCPConnectionViewer(QMainWindow):
                                     // Notify Python that map is fully initialized
                                     console.log('[Map Init] Notifying Python that map is ready');
                                     try {
+                                        // Only remove overlay here if tiles loaded without errors
+                                        // (tileerror handler keeps it visible when there are failures)
+                                        if (!window._tileHadError) {
+                                            var loadOv = document.getElementById('map-loading-overlay');
+                                            if (loadOv) { loadOv.style.display = 'none'; }
+                                        }
+
                                         // Call a Python-registered callback to signal map is ready
                                         if (typeof window.qt !== 'undefined' && window.qt.webChannelTransport) {
                                             // QWebChannel is available (not used here, but could be)
@@ -4098,6 +4204,28 @@ class TCPConnectionViewer(QMainWindow):
                             }, 3000);
                         });
                     });
+
+                    // Watchdog: if the map has not initialized within 45 seconds, show error on overlay
+                    window._tileErrorMessages = [];
+                    setTimeout(function() {
+                        try {
+                            if (window._map_ready) { return; } // map loaded fine
+                            var ov = document.getElementById('map-loading-overlay');
+                            if (ov && ov.style.display !== 'none') {
+                                var errEl = document.getElementById('map-loading-error');
+                                if (errEl && !errEl.innerText) {
+                                    var detail = 'Timed out waiting for map tiles to load (no internet connectivity?)';
+                                    if (window._tileErrorMessages && window._tileErrorMessages.length > 0) {
+                                        detail = window._tileErrorMessages[0];
+                                    }
+                                    errEl.innerText = 'Failed connecting to the internet and initialize OpenStreetMap with error: ' + detail;
+                                }
+                                // Stop spinner
+                                var spinners = document.querySelectorAll('#map-loading-overlay .spinner');
+                                for (var i = 0; i < spinners.length; i++) { spinners[i].style.display = 'none'; }
+                            }
+                        } catch(e) {}
+                    }, 45000);
                 </script>
             </body>
             </html>
