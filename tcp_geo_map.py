@@ -9,9 +9,34 @@
 # using OpenStreetMap and leaflet for map display and location data
 
 # Summary
-# - Desktop tool that enumerates active TCP connections (via `psutil`), resolves geolocation using (MaxMind GeoLite2) and optional reverse DNS/C2 checks. 
-#   Displays results in a Qt GUI (`PySide6`) with a Leaflet map embedded in `QWebEngineView` using OpenStreetMap.
-# - Main UI handler class: `TCPConnectionViewer`.
+# R001D00rs tcp_geo_map is a cross-platform desktop network visibility and threat-hunting tool built with Python and PySide6.
+#
+# Core features:
+#   - Live capture: enumerates active TCP/UDP connections in real time using psutil, with a configurable refresh interval.
+#   - Geolocation: resolves remote IP addresses (IPv4 and IPv6) to city/country using the MaxMind GeoLite2 database (.mmdb).
+#   - Interactive map: displays connections on a Leaflet/OpenStreetMap map embedded in a QWebEngineView, with colored markers
+#       (green = normal, red = suspect/C2), polylines between local and remote endpoints, and clickable popups per connection.
+#       A loading overlay with spinner is shown on map startup and replaced with a human-readable error if tiles fail to load
+#       (e.g. no internet connectivity).
+#   - C2/threat intel: optional cross-reference of remote IPs against the C2-Tracker community IOC feed (Shodan/Censys-sourced).
+#   - Reverse DNS: background resolution of remote hostnames via a persistent DNS worker thread with in-memory and optional
+#       on-disk cache (ip_cache.json) to accelerate repeated lookups.
+#   - Connection table: sortable, filterable table of active connections showing process, PID, protocol, local/remote address
+#       and port, resolved hostname, IP type, geolocation, and suspect flag.
+#   - Summary table: per-process/IP aggregation view for quick traffic profiling.
+#   - Time-travel replay: a FILO buffer (up to 1000 snapshots) with a time slider to replay historical connection states.
+#   - Database management: automatic expiration check (7-day TTL) at startup and every 10 minutes at runtime; expired or missing
+#       databases trigger a guided download flow (with --accept_eula flag for unattended automation).
+#   - Screenshot capture: periodic JPEG snapshots of the map view saved to screen_captures/ for later review.
+#   - Video export: assembles captured screenshots into an .mp4 timelapse using OpenCV.
+#   - CSV export: exports the current connection table or full snapshot history to CSV.
+#   - Process tools (Windows): right-click a connection to open its process in Task Manager, launch ProcDump for memory dump,
+#       or auto-generate and launch a Process Monitor (.pmc) filter configuration scoped to that PID/process name.
+#   - Settings persistence: UI state (map position/zoom, toggles, sort order, window geometry) saved to settings.json on exit
+#       and restored on next launch.
+#   - Offline resilience: Leaflet JS/CSS and marker icons can be downloaded locally (resources/leaflet/) and are used as
+#       automatic CDN fallback so the map renders without internet access.
+#   - Main UI handler class: `TCPConnectionViewer`.
 
 """ 
 
