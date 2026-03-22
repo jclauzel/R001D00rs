@@ -96,7 +96,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.8" # Current script version
+VERSION = "3.0.9" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -3182,6 +3182,67 @@ class TCPConnectionViewer(QMainWindow):
                 return True
         return False
 
+    def _parse_netstat_udp(self):
+        """Parse 'netstat -ano -p UDP' on Windows to obtain remote addresses for connected UDP sockets.
+
+        psutil's GetExtendedUdpTable only reports local bindings; netstat can show
+        real remote addresses for UDP sockets that have called connect().
+
+        Returns a dict: (local_ip, local_port, pid) -> (remote_ip, remote_port)
+        Only entries with a meaningful remote address (not *:*  or 0.0.0.0:0) are included.
+        """
+        lookup = {}
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "UDP"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line.startswith("UDP"):
+                    continue
+                parts = line.split()
+                # Expected format: UDP  local_addr:port  remote_addr:port  PID
+                if len(parts) < 4:
+                    continue
+                local_raw = parts[1]
+                remote_raw = parts[2]
+                pid_str = parts[3]
+
+                # Skip entries where remote is *:* or 0.0.0.0:0 or [::]:0
+                if remote_raw in ("*:*", "0.0.0.0:0", "[::]:0"):
+                    continue
+
+                # Parse local address
+                l_ip, l_port = self._split_netstat_addr(local_raw)
+                # Parse remote address
+                r_ip, r_port = self._split_netstat_addr(remote_raw)
+
+                if r_ip and r_ip not in ("*", "0.0.0.0", "::", ""):
+                    lookup[(l_ip, l_port, pid_str)] = (r_ip, r_port)
+        except Exception:
+            pass
+        return lookup
+
+    @staticmethod
+    def _split_netstat_addr(addr_str):
+        """Split a netstat address string like '192.168.1.1:443' or '[::1]:443' into (ip, port)."""
+        try:
+            if addr_str.startswith("["):
+                # IPv6: [::1]:port
+                bracket_end = addr_str.index("]")
+                ip = addr_str[1:bracket_end]
+                port = addr_str[bracket_end + 2:]  # skip ]:
+            else:
+                # IPv4: 1.2.3.4:port  — split on the last colon
+                last_colon = addr_str.rfind(":")
+                ip = addr_str[:last_colon]
+                port = addr_str[last_colon + 1:]
+            return ip, port
+        except Exception:
+            return addr_str, ""
+
     def get_active_tcp_connections(self, position_timeline=None):
         """
         Enumerate TCP and UDP connections and build the connection snapshot.
@@ -3193,6 +3254,8 @@ class TCPConnectionViewer(QMainWindow):
         - Write to `self.connection_list` with minimum temporary allocations.
         - Captures both TCP (ESTABLISHED) and UDP (all) connections.
         - Caches geolocation and process names for performance.
+        - On Windows, supplements psutil UDP data with netstat output to obtain
+          real remote addresses for connected UDP sockets.
         """
 
         connections = []
@@ -3205,6 +3268,15 @@ class TCPConnectionViewer(QMainWindow):
 
         # Get all connections once (both TCP and UDP)
         all_connections = psutil.net_connections(kind='inet')
+
+        # On Windows, psutil's GetExtendedUdpTable does not report remote addresses
+        # for connected UDP sockets. Supplement with netstat output.
+        udp_remote_lookup = {}  # (local_ip, local_port, pid) -> (remote_ip, remote_port)
+        if platform.system() == "Windows":
+            try:
+                udp_remote_lookup = self._parse_netstat_udp()
+            except Exception:
+                pass
 
         # Collect remote IPs for DNS resolution (only those we care about)
         ips_to_resolve = set()
@@ -3221,6 +3293,11 @@ class TCPConnectionViewer(QMainWindow):
                 raddr_ip = getattr(c.raddr, "ip", None)
                 if raddr_ip and raddr_ip not in ('127.0.0.1', '::1'):
                     ips_to_resolve.add(raddr_ip)
+
+        # Also collect remote IPs discovered via netstat for UDP
+        for (l_ip, l_port, pid_str), (r_ip, r_port) in udp_remote_lookup.items():
+            if r_ip and r_ip not in ('127.0.0.1', '::1', '*', '0.0.0.0', '::'):
+                ips_to_resolve.add(r_ip)
 
         ip_hostnames = {}
         if do_reverse_dns and ips_to_resolve:
@@ -3306,14 +3383,30 @@ class TCPConnectionViewer(QMainWindow):
                 local_port = str(getattr(laddr, "port", "")) if laddr else ""
 
                 # UDP connections may not have a remote address (connectionless protocol)
+                # psutil may return raddr=() (falsy), or raddr with ip='0.0.0.0'/'::'  port=0
+                has_real_raddr = False
                 if raddr:
+                    raddr_ip = getattr(raddr, "ip", None)
+                    raddr_port = getattr(raddr, "port", None)
+                    if raddr_ip and raddr_ip not in ("0.0.0.0", "::", "*", "") and raddr_port:
+                        has_real_raddr = True
+
+                if has_real_raddr:
                     remote_addr = f"{raddr.ip}"
-                    remote_port = str(getattr(raddr, "port", ""))
+                    remote_port = str(raddr.port)
                 else:
-                    # No remote peer connected (common for UDP listening sockets)
-                    if is_udp:
-                        remote_addr = "*:*"
-                        remote_port = ""
+                    # psutil reported no useful remote peer; try the netstat lookup for UDP
+                    if is_udp and udp_remote_lookup:
+                        pid_str = str(pid) if pid else ""
+                        ns_remote = udp_remote_lookup.get((local_addr, local_port, pid_str))
+                        if ns_remote:
+                            remote_addr, remote_port = ns_remote
+                        else:
+                            remote_addr = "*"
+                            remote_port = "*"
+                    elif is_udp:
+                        remote_addr = "*"
+                        remote_port = "*"
                     else:
                         remote_addr = ""
                         remote_port = ""
@@ -3329,7 +3422,7 @@ class TCPConnectionViewer(QMainWindow):
                 ip_lookup = remote_addr.split(' ')[0].split(':')[0]
 
                 # Skip geolocation/DNS for UDP connections without remote peer
-                if ip_lookup and ip_lookup not in ('127.0.0.1', '::1', 'N/A'):
+                if ip_lookup and ip_lookup not in ('127.0.0.1', '::1', 'N/A', '*', '0.0.0.0', '::'):
                     # Check geolocation cache first
                     with geo_cache_lock:
                         if ip_lookup in geo_cache:
@@ -4109,7 +4202,8 @@ class TCPConnectionViewer(QMainWindow):
                                                                     "Protocol: " + (conn.protocol || 'TCP') + "<br>" +
                                                                     "PID: " + (conn.pid || '') + "<br>" +
                                                                     "Remote: " + (conn.remote || '') + "<br>" +
-                                                                    "Local: " + (conn.local || '') + "<br>";
+                                                                    "Local: " + (conn.local || '') + "<br>" +
+                                                                    (conn.name ? "Name: " + conn.name + "<br>" : "");
                                                     marker.bindPopup(popupHtml);
 
                                                     // Add click handler to select corresponding table row in Python
@@ -5318,6 +5412,10 @@ class TCPConnectionViewer(QMainWindow):
             process_name = self.connection_table.item(row, PROCESS_ROW_INDEX).text()
             pid = self.connection_table.item(row, PID_ROW_INDEX).text()
             local_address = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX).text()
+            protocol = self.connection_table.item(row, PROTOCOL_ROW_INDEX).text() if self.connection_table.item(row, PROTOCOL_ROW_INDEX) else 'TCP'
+            local_port = self.connection_table.item(row, LOCAL_PORT_ROW_INDEX).text() if self.connection_table.item(row, LOCAL_PORT_ROW_INDEX) else ''
+            remote_port = self.connection_table.item(row, REMOTE_PORT_ROW_INDEX).text() if self.connection_table.item(row, REMOTE_PORT_ROW_INDEX) else ''
+            ip_type = self.connection_table.item(row, IP_TYPE_ROW_INDEX).text() if self.connection_table.item(row, IP_TYPE_ROW_INDEX) else ''
 
             # Process IP and hostname
             ip = remote_address
@@ -5328,7 +5426,7 @@ class TCPConnectionViewer(QMainWindow):
                 lng = self.connection_table.item(row, LOCATION_LON_ROW_INDEX).text()                
 
                 if do_reverse_dns:
-                    hostname = self.connection_table.item(row, NAME_ROW_INDEX).text()
+                    name = self.connection_table.item(row, NAME_ROW_INDEX).text() if self.connection_table.item(row, NAME_ROW_INDEX) else ''
 
             # Check if the connection is marked as suspect
             suspect = (self.connection_table.item(row, SUSPECT_ROW_INDEX).text() == 'Yes')
@@ -5343,9 +5441,13 @@ class TCPConnectionViewer(QMainWindow):
                 'process': process_name,
                 'pid': pid,
                 'suspect': suspect,
+                'protocol': protocol,
                 'local': local_address,
+                'localport': local_port,
                 'remote': remote_address,
+                'remoteport': remote_port,
                 'name': name,
+                'ip_type': ip_type,
                 'lat': lat,
                 'lng': lng,
                 'icon': icon  # default icon; change as needed based on conditions
