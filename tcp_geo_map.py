@@ -96,7 +96,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.0.9" # Current script version
+VERSION = "3.1.0" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -144,12 +144,14 @@ LEAFLET_JS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
 LEAFLET_MARKER_RED_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png"
 LEAFLET_MARKER_GREEN_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png"
 LEAFLET_MARKER_BLUE_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png"
+LEAFLET_MARKER_YELLOW_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-yellow.png"
 
 LEAFLET_CSS_PATH = os.path.join(LEAFLET_DIR, "leaflet.css")
 LEAFLET_JS_PATH = os.path.join(LEAFLET_DIR, "leaflet.js")
 LEAFLET_MARKER_RED_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-red.png")
 LEAFLET_MARKER_GREEN_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-green.png")
 LEAFLET_MARKER_BLUE_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-blue.png")
+LEAFLET_MARKER_YELLOW_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-yellow.png")
 
 LEAFLET_RESOURCES_ABOUT_TITLE = "About Leaflet Resources and pointhi marker icons"
 LEAFLET_RESOURCES_ABOUT_TEXT = """Leaflet is an open-source JavaScript library for interactive maps.\n\nThis application uses:\n- Leaflet library (https://leafletjs.com/)\n- Colored map markers from https://github.com/pointhi/leaflet-color-markers\n\nDownloading these resources locally will:\n- Speed up application startup time\n- Enable offline map functionality\n- Reduce dependency on external CDN availability\n\nBy downloading, you agree to comply with the Leaflet license (BSD 2-Clause) and respective marker icon licenses."""
@@ -229,6 +231,29 @@ class MapBridge(QObject):
             self.viewer.select_table_row_by_connection(process, pid, remote, local)
         except Exception as e:
             logging.error(f"Error selecting connection from map: {e}")
+
+    @Slot(str, str, str, str, str, str, str, str)
+    def pinConnection(self, process, pid, protocol, local, localport, remote, remoteport, ip_type):
+        """Called from JavaScript when a map marker is clicked — pins it as yellow."""
+        try:
+            self.viewer.pin_connection_from_map(process, pid, protocol, local, localport, remote, remoteport, ip_type)
+        except Exception as e:
+            logging.error(f"Error pinning connection from map: {e}")
+
+    @Slot(int)
+    def notifyPopupClosed(self, generation):
+        """Called from JavaScript when the user manually closes the pinned popup.
+        Only honoured when *generation* matches the current counter, so stale
+        close events from old markers are silently ignored."""
+        try:
+            if generation == self.viewer._pinned_popup_generation:
+                self.viewer._pinned_popup_open = False
+                logging.debug("Pinned popup closed by user (gen %d)", generation)
+            else:
+                logging.debug("Ignored stale popupclose (got gen %d, current %d)",
+                              generation, self.viewer._pinned_popup_generation)
+        except Exception as e:
+            logging.error(f"Error handling popup close notification: {e}")
 
 class VideoGeneratorSignals(QObject):
     """Signals for video generation worker"""
@@ -371,25 +396,27 @@ class VideoGeneratorWorker(QRunnable):
             self.signals.error.emit(error_msg)
             logging.error(f"Error generating video: {e}")
 
-class DNSWorker(threading.Thread):
+class DNSWorker:
     """
-    Background DNS worker that continuously warms the ip_cache.
+    Background DNS worker pool that continuously warms the ip_cache.
 
     - Receives IPs via `enqueue_many` / `enqueue`.
-    - Resolves with blocking socket.gethostbyaddr inside the worker (off the UI thread).
+    - Resolves with blocking socket.gethostbyaddr across multiple threads (off the UI thread).
     - Updates shared `ip_cache` under `cache_lock`.
     - Optionally calls `on_resolve(ip, hostname)` for each positive resolution
       (this callback must be thread-safe; the viewer uses QTimer.singleShot to marshal to UI).
     - Call `stop()` to request shutdown and `join()` to wait for termination.
     """
-    def __init__(self, cache, lock, on_resolve=None, max_queue=10000, idle_sleep=0.05):
-        super().__init__(daemon=True)
+    def __init__(self, cache, lock, on_resolve=None, max_queue=10000, idle_sleep=0.05,
+                 num_workers=16):
         self.cache = cache
         self.lock = lock
         self.on_resolve = on_resolve
         self.queue = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self.idle_sleep = idle_sleep
+        self.num_workers = num_workers
+        self._threads = []
 
     def enqueue(self, ip):
         try:
@@ -405,7 +432,19 @@ class DNSWorker(threading.Thread):
     def stop(self):
         self._stop.set()
 
-    def run(self):
+    def start(self):
+        """Launch the pool of worker threads."""
+        for i in range(self.num_workers):
+            t = threading.Thread(target=self._worker, daemon=True,
+                                 name=f"DNSWorker-{i}")
+            t.start()
+            self._threads.append(t)
+
+    def join(self, timeout=None):
+        for t in self._threads:
+            t.join(timeout=timeout)
+
+    def _worker(self):
         while not self._stop.is_set():
             try:
                 ip = self.queue.get(timeout=0.5)
@@ -415,12 +454,19 @@ class DNSWorker(threading.Thread):
                 continue
 
             if not ip:
+                try:
+                    self.queue.task_done()
+                except Exception:
+                    pass
                 continue
 
             # skip if already in cache
             with self.lock:
                 if ip in self.cache:
-                    self.queue.task_done()
+                    try:
+                        self.queue.task_done()
+                    except Exception:
+                        pass
                     continue
 
             # perform resolution
@@ -480,6 +526,17 @@ class TCPConnectionViewer(QMainWindow):
 
         # Track previous connections for incremental updates
         self.previous_connections = set()
+
+        # Pinned (double-clicked) connection — persists across refreshes, shown as yellow marker
+        self._pinned_connection = None
+        self._pinned_popup_open = False  # True while the pinned popup should stay open
+        self._pinned_popup_generation = 0  # Monotonic counter — stale JS close events are ignored
+
+        # Deferred single-click timer — allows double-click to cancel the single-click action
+        self._click_timer = QTimer()
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._execute_deferred_click)
+        self._pending_click = None  # (row, column) awaiting execution
 
         # HTTP session for public IP checks (connection pooling)
         self._http_session = requests.Session()
@@ -1390,6 +1447,12 @@ class TCPConnectionViewer(QMainWindow):
 
         menu = QMenu(self)
 
+        # Copy cell value — always the first action
+        cell_item = self.connection_table.item(row, index.column())
+        cell_text = cell_item.text() if cell_item else ""
+        action_copy = menu.addAction("Copy")
+        menu.addSeparator()
+
         if platform.system() == "Windows":
             action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
             action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
@@ -1400,6 +1463,10 @@ class TCPConnectionViewer(QMainWindow):
 
         chosen = menu.exec(self.connection_table.viewport().mapToGlobal(pos))
         if chosen is None:
+            return
+
+        if chosen == action_copy:
+            QApplication.clipboard().setText(cell_text)
             return
 
         if not pid:
@@ -1698,8 +1765,7 @@ class TCPConnectionViewer(QMainWindow):
             
         table_column_sort_index = index
 
-        for row in range(self.connection_table.rowCount()):
-            self.sort_table_by_column(index, table_column_sort_reverse)
+        self.sort_table_by_column(index, table_column_sort_reverse)
         self.apply_connection_table_filter()
 
 
@@ -1722,6 +1788,9 @@ class TCPConnectionViewer(QMainWindow):
         - Snapshot every row as a list of strings.
         - Detect numeric values for numeric sort (ints/floats).
         - Fall back to case-insensitive string comparison.
+        - Uses a (type_rank, value) tuple key so that numeric and string
+          values never compare against each other (avoids Python 3 TypeError).
+        - Empty cells always sort to the end regardless of direction.
         - Rebuild the table from the sorted snapshot (stable).
         """
         # collect snapshot of all rows
@@ -1736,25 +1805,28 @@ class TCPConnectionViewer(QMainWindow):
                 row_values.append(item.text() if item is not None else "")
             # determine key from the sort column
             raw_key = row_values[column_index] if column_index < len(row_values) else ""
-            # try numeric conversion (int then float)
-            sort_key = raw_key
-            try:
-                if raw_key != "":
+            # Build a (type_rank, value) tuple so mixed types never compare directly.
+            # type_rank: 0 = numeric, 1 = non-empty string, 2 = empty (always last)
+            if raw_key == "":
+                sort_key = (2, "")
+            else:
+                try:
                     if raw_key.isdigit():
-                        sort_key = int(raw_key)
+                        sort_key = (0, int(raw_key))
                     else:
-                        # attempt float parsing after removing common thousands separators
                         normalized = raw_key.replace(",", "")
-                        sort_key = float(normalized)
-                else:
-                    sort_key = ""  # keep empty strings sorted consistently
-            except Exception:
-                # fallback to case-insensitive string
-                sort_key = raw_key.lower()
+                        sort_key = (0, float(normalized))
+                except Exception:
+                    sort_key = (1, raw_key.lower())
             rows.append((sort_key, row_values))
 
-        # stable sort by computed key
+        # stable sort — empty cells always sort to the end
         rows.sort(key=lambda x: x[0], reverse=reverse)
+        if reverse:
+            # When reversed, empties (rank 2) would move to the front; push them back
+            empties = [r for r in rows if r[0][0] == 2]
+            non_empties = [r for r in rows if r[0][0] != 2]
+            rows = non_empties + empties
 
         # repopulate table from sorted snapshot
         self.connection_table.setRowCount(0)
@@ -1791,6 +1863,9 @@ class TCPConnectionViewer(QMainWindow):
         - Snapshot every row as a list of strings.
         - Detect numeric values for numeric sort (ints/floats).
         - Fall back to case-insensitive string comparison.
+        - Uses a (type_rank, value) tuple key so that numeric and string
+          values never compare against each other (avoids Python 3 TypeError).
+        - Empty cells always sort to the end regardless of direction.
         - Rebuild the table from the sorted snapshot (stable).
         - Preserve red highlighting for suspect connections.
         """
@@ -1810,25 +1885,28 @@ class TCPConnectionViewer(QMainWindow):
 
             # determine key from the sort column
             raw_key = row_values[column_index] if column_index < len(row_values) else ""
-            # try numeric conversion (int then float)
-            sort_key = raw_key
-            try:
-                if raw_key != "":
+            # Build a (type_rank, value) tuple so mixed types never compare directly.
+            # type_rank: 0 = numeric, 1 = non-empty string, 2 = empty (always last)
+            if raw_key == "":
+                sort_key = (2, "")
+            else:
+                try:
                     if raw_key.isdigit():
-                        sort_key = int(raw_key)
+                        sort_key = (0, int(raw_key))
                     else:
-                        # attempt float parsing after removing common thousands separators
                         normalized = raw_key.replace(",", "")
-                        sort_key = float(normalized)
-                else:
-                    sort_key = ""  # keep empty strings sorted consistently
-            except Exception:
-                # fallback to case-insensitive string
-                sort_key = raw_key.lower()
+                        sort_key = (0, float(normalized))
+                except Exception:
+                    sort_key = (1, raw_key.lower())
             rows.append((sort_key, row_values, row_colors))
 
-        # stable sort by computed key
+        # stable sort — empty cells always sort to the end
         rows.sort(key=lambda x: x[0], reverse=reverse)
+        if reverse:
+            # When reversed, empties (rank 2) would move to the front; push them back
+            empties = [r for r in rows if r[0][0] == 2]
+            non_empties = [r for r in rows if r[0][0] != 2]
+            rows = non_empties + empties
 
         # repopulate table from sorted snapshot
         self.summary_table.setRowCount(0)
@@ -2364,7 +2442,8 @@ class TCPConnectionViewer(QMainWindow):
         self.connection_table.setMinimumSize(CONNECTION_TABLE_MIN_WIDTH, CONNECTION_TABLE_MIN_HEIGHT)
         self.connection_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.connection_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.connection_table.cellClicked.connect(self.on_table_cell_clicked)
+        self.connection_table.cellClicked.connect(self._on_table_cell_clicked_deferred)
+        self.connection_table.cellDoubleClicked.connect(self.on_table_cell_double_clicked)
         self.connection_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.connection_table.customContextMenuRequested.connect(self.on_connection_table_context_menu)
 
@@ -3047,6 +3126,7 @@ class TCPConnectionViewer(QMainWindow):
                 (LEAFLET_MARKER_RED_PATH, LEAFLET_MARKER_RED_URL, "Red marker icon"),
                 (LEAFLET_MARKER_GREEN_PATH, LEAFLET_MARKER_GREEN_URL, "Green marker icon"),
                 (LEAFLET_MARKER_BLUE_PATH, LEAFLET_MARKER_BLUE_URL, "Blue marker icon"),
+                (LEAFLET_MARKER_YELLOW_PATH, LEAFLET_MARKER_YELLOW_URL, "Yellow marker icon"),
             ]
 
             # Check which resources are missing
@@ -3176,6 +3256,29 @@ class TCPConnectionViewer(QMainWindow):
             conn1['ip_type'] == conn2['ip_type'] 
         )
 
+    def _is_pinned_connection(self, conn):
+        """Check if *conn* matches the pinned (double-clicked) connection.
+
+        Uses a relaxed comparison that strips hostname suffixes from the remote
+        address and ignores PID (which may change across process restarts) so
+        that the pin survives refreshes reliably.
+        """
+        pin = self._pinned_connection
+        if pin is None:
+            return False
+        # Strip " (hostname)" suffix for comparison
+        def _bare_remote(r):
+            return r.split(' (')[0] if r else r
+        return (
+            conn.get('process') == pin.get('process') and
+            conn.get('protocol') == pin.get('protocol') and
+            conn.get('local') == pin.get('local') and
+            conn.get('localport') == pin.get('localport') and
+            _bare_remote(conn.get('remote', '')) == _bare_remote(pin.get('remote', '')) and
+            conn.get('remoteport') == pin.get('remoteport') and
+            conn.get('ip_type') == pin.get('ip_type')
+        )
+
     def is_connection_in_list(self, connection, connection_list):
         for conn in connection_list:
             if self.are_connections_identical(conn, connection):
@@ -3183,10 +3286,16 @@ class TCPConnectionViewer(QMainWindow):
         return False
 
     def _parse_netstat_udp(self):
-        """Parse 'netstat -ano -p UDP' on Windows to obtain remote addresses for connected UDP sockets.
+        """Run a single 'netstat -ano' on Windows and extract connected UDP/UDPv6 remote addresses.
 
-        psutil's GetExtendedUdpTable only reports local bindings; netstat can show
-        real remote addresses for UDP sockets that have called connect().
+        psutil's GetExtendedUdpTable (and the per-process variant) only reports
+        local bindings – the MIB_UDPROW_OWNER_PID struct has no remote-address
+        fields.  This is a documented limitation of the Win32 IP Helper API.
+        netstat.exe obtains connected-UDP remote addresses via undocumented
+        Network Store Interface (NSI) calls that are not exposed to user code.
+
+        A single 'netstat -ano' invocation returns both UDP (IPv4) and UDPv6
+        lines, so one subprocess call covers everything.
 
         Returns a dict: (local_ip, local_port, pid) -> (remote_ip, remote_port)
         Only entries with a meaningful remote address (not *:*  or 0.0.0.0:0) are included.
@@ -3194,12 +3303,13 @@ class TCPConnectionViewer(QMainWindow):
         lookup = {}
         try:
             result = subprocess.run(
-                ["netstat", "-ano", "-p", "UDP"],
-                capture_output=True, text=True, timeout=5,
+                ["netstat", "-ano"],
+                capture_output=True, text=True, timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
             for line in result.stdout.splitlines():
                 line = line.strip()
+                # Only process UDP lines (covers both "UDP" and "UDPv6" protocol labels)
                 if not line.startswith("UDP"):
                     continue
                 parts = line.split()
@@ -3270,7 +3380,10 @@ class TCPConnectionViewer(QMainWindow):
         all_connections = psutil.net_connections(kind='inet')
 
         # On Windows, psutil's GetExtendedUdpTable does not report remote addresses
-        # for connected UDP sockets. Supplement with netstat output.
+        # for connected UDP sockets (the MIB_UDPROW_OWNER_PID struct lacks remote
+        # fields — a documented Win32 API limitation).  No Python library can work
+        # around this; netstat.exe uses undocumented NSI calls to obtain the data.
+        # A single 'netstat -ano' captures both UDP (IPv4) and UDPv6 lines.
         udp_remote_lookup = {}  # (local_ip, local_port, pid) -> (remote_ip, remote_port)
         if platform.system() == "Windows":
             try:
@@ -3582,23 +3695,29 @@ class TCPConnectionViewer(QMainWindow):
                 # Get coordinates from the database
                 result = self.reader_ipv4.get(ip_address)
                 if result is not None:
-                    return result['latitude'], result['longitude']                     
+                    lat = result.get('latitude') or result.get('location', {}).get('latitude')
+                    lng = result.get('longitude') or result.get('location', {}).get('longitude')
+                    if lat is not None and lng is not None:
+                        return lat, lng
             except:
                 pass
-        
+
             return None, None
-                            
+
         elif ip_type == "IPv6":
             try:
                 # Get coordinates from the database
                 result = self.reader_ipv6.get(ip_address)
                 if result is not None:
-                    return result['latitude'], result['longitude']                     
+                    lat = result.get('latitude') or result.get('location', {}).get('latitude')
+                    lng = result.get('longitude') or result.get('location', {}).get('longitude')
+                    if lat is not None and lng is not None:
+                        return lat, lng
             except:
                 pass
-        
+
             return None, None
-        
+
         else:
             return None, None
             
@@ -3870,6 +3989,10 @@ class TCPConnectionViewer(QMainWindow):
                        @keyframes spin-loader { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
                        #map-loading-overlay .spinner { width:36px; height:36px; border:4px solid #ccc; border-top:4px solid #333;
                                                        border-radius:50%; animation:spin-loader 1s linear infinite; margin-bottom:14px; }
+                       /* Fit-all / reset-view control button */
+                       .leaflet-control-fitall a { font-size:18px; font-weight:bold; line-height:26px; text-align:center;
+                                                   text-decoration:none; color:#333; }
+                       .leaflet-control-fitall a:hover { background-color:#f4f4f4; }
                 </style>
             </head>
             <body>
@@ -4044,6 +4167,10 @@ class TCPConnectionViewer(QMainWindow):
                             blue: {
                                 remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png',
                                 local: localBase + 'marker-icon-2x-blue.png'
+                            },
+                            yellow: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-yellow.png',
+                                local: localBase + 'marker-icon-2x-yellow.png'
                             }
                         };
 
@@ -4061,6 +4188,7 @@ class TCPConnectionViewer(QMainWindow):
                                         'redIcon': new L.Icon({iconUrl: resolved.red, iconSize:[25,41], iconAnchor:[12,41]}),
                                         'greenIcon': new L.Icon({iconUrl: resolved.green, iconSize:[25,41], iconAnchor:[12,41]}),
                                         'blueIcon': new L.Icon({iconUrl: resolved.blue, iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'yellowIcon': new L.Icon({iconUrl: resolved.yellow, iconSize:[25,41], iconAnchor:[12,41]}),
                                     };
 
                                     // initialize map AFTER icons resolved
@@ -4089,13 +4217,60 @@ class TCPConnectionViewer(QMainWindow):
                                     }
 
                                     // Create map instance as global (window.map) so get_map_state() can access it
-                                    window.map = L.map('map').setView([initialLat, initialLng], initialZoom);
+                                    // Disable double-click zoom so marker double-clicks don't zoom the map
+                                    window.map = L.map('map', {doubleClickZoom: false}).setView([initialLat, initialLng], initialZoom);
                                     var map = window.map;  // Local reference for convenience
                                     console.log('Map created successfully at position:', initialLat, initialLng, 'zoom:', initialZoom);
 
                                     // Create custom pane for public IP circle with high z-index (above markers)
                                     map.createPane('publicIpPane');
                                     map.getPane('publicIpPane').style.zIndex = 650;  // Above markers (600) but below tooltips (700)
+
+                                    // Create custom pane for pinned (yellow) marker so it renders above normal markers
+                                    map.createPane('pinnedPane');
+                                    map.getPane('pinnedPane').style.zIndex = 640;  // Above markers (600) but below public IP (650)
+
+                                    // Fit-all / reset-view control (bottom-left) — fits map to all markers or resets to world view
+                                    var FitAllControl = L.Control.extend({
+                                        options: { position: 'bottomleft' },
+                                        onAdd: function(map) {
+                                            var container = L.DomUtil.create('div', 'leaflet-control-fitall leaflet-bar');
+                                            var link = L.DomUtil.create('a', '', container);
+                                            link.href = '#';
+                                            link.title = 'Fit all markers';
+                                            link.innerHTML = '&#x26F6;';  // ⛶  (square four corners)
+                                            link.setAttribute('role', 'button');
+                                            link.setAttribute('aria-label', 'Fit all markers');
+                                            L.DomEvent.disableClickPropagation(container);
+                                            L.DomEvent.on(link, 'click', function(e) {
+                                                L.DomEvent.preventDefault(e);
+                                                try { window._fitAllMarkers(); } catch(ex) { console.error('[FitAll]', ex); }
+                                            });
+                                            return container;
+                                        }
+                                    });
+                                    map.addControl(new FitAllControl());
+
+                                    // Global helper called by the fit-all button
+                                    window._fitAllMarkers = function() {
+                                        var bounds = [];
+                                        for (var i = 0; i < liveMarkers.length; i++) {
+                                            try {
+                                                var m = liveMarkers[i];
+                                                if (typeof m.getLatLng === 'function') {
+                                                    bounds.push(m.getLatLng());
+                                                } else if (typeof m.getBounds === 'function') {
+                                                    bounds.push(m.getBounds().getCenter());
+                                                }
+                                            } catch(ex) {}
+                                        }
+                                        if (bounds.length > 0) {
+                                            map.fitBounds(L.latLngBounds(bounds).pad(0.15));
+                                        } else {
+                                            // No markers — reset to default world view
+                                            map.setView([20, 0], 2);
+                                        }
+                                    };
 
                                     // Track tile loading success/failure for overlay logic
                                     window._tileHadError = false;
@@ -4154,9 +4329,15 @@ class TCPConnectionViewer(QMainWindow):
                                     var liveMarkers = [];
 
                                     function updateConnections(conns, showTooltip, drawLines) {
+                                        // Guard: suppress popupclose handlers during programmatic marker removal
+                                        // Unbind popupclose on all markers BEFORE removing them to avoid
+                                        // async events falsely setting _pinnedPopupDismissed.
+                                        window._removingMarkers = true;
                                         for (var i=0; i<liveMarkers.length; i++) {
+                                            try { liveMarkers[i].off('popupclose'); } catch(e) {}
                                             try { map.removeLayer(liveMarkers[i]); } catch(e) {}
                                         }
+                                        window._removingMarkers = false;
                                         liveMarkers = [];
 
                                         if (!conns || !Array.isArray(conns)) { return; }
@@ -4191,7 +4372,12 @@ class TCPConnectionViewer(QMainWindow):
                                                 } else {
                                                     // Regular marker
                                                     var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
-                                                    var marker = L.marker([conn.lat, conn.lng], { icon: icon }).addTo(map);
+                                                    var markerOptions = { icon: icon };
+                                                    // Pinned (yellow) markers render on a higher pane so they stay on top
+                                                    if (iconName === 'yellowIcon') {
+                                                        markerOptions.pane = 'pinnedPane';
+                                                    }
+                                                    var marker = L.marker([conn.lat, conn.lng], markerOptions).addTo(map);
                                                     var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
 
                                                     // Include protocol in tooltip
@@ -4204,28 +4390,57 @@ class TCPConnectionViewer(QMainWindow):
                                                                     "Remote: " + (conn.remote || '') + "<br>" +
                                                                     "Local: " + (conn.local || '') + "<br>" +
                                                                     (conn.name ? "Name: " + conn.name + "<br>" : "");
-                                                    marker.bindPopup(popupHtml);
+                                                    marker.bindPopup(popupHtml, {autoClose: false, closeOnClick: false});
 
-                                                    // Add click handler to select corresponding table row in Python
-                                                    (function(connection) {
-                                                        marker.on('click', function() {
+                                                    // Add click handler to select corresponding table row in Python.
+                                                    // We unbind the popup before calling pinConnection so that
+                                                    // Leaflet's internal click-to-open-popup path doesn't fire
+                                                    // a popup that will immediately be destroyed by the refresh.
+                                                    (function(connection, m) {
+                                                        m.on('click', function(e) {
                                                             try {
-                                                                if (mapBridge && typeof mapBridge.selectConnection === 'function') {
-                                                                    console.log('[Marker Click] Calling Python selectConnection:', connection.process, connection.pid, connection.remote, connection.local);
-                                                                    mapBridge.selectConnection(
+                                                                // Prevent Leaflet from opening / re-opening the popup
+                                                                // on this click — the refresh will handle it.
+                                                                m.closePopup();
+                                                                m.off('popupclose');
+                                                                if (mapBridge && typeof mapBridge.pinConnection === 'function') {
+                                                                    console.log('[Marker Click] Calling Python pinConnection:', connection.process, connection.pid, connection.remote, connection.local);
+                                                                    mapBridge.pinConnection(
                                                                         connection.process || '',
                                                                         connection.pid || '',
+                                                                        connection.protocol || 'TCP',
+                                                                        connection.local || '',
+                                                                        connection.localport || '',
                                                                         connection.remote || '',
-                                                                        connection.local || ''
+                                                                        connection.remoteport || '',
+                                                                        connection.ip_type || ''
                                                                     );
                                                                 } else {
                                                                     console.warn('[Marker Click] mapBridge not ready yet');
                                                                 }
                                                             } catch(e) {
-                                                                console.error('[Marker Click] Error calling selectConnection:', e);
+                                                                console.error('[Marker Click] Error calling pinConnection:', e);
                                                             }
                                                         });
-                                                    })(conn);
+                                                    })(conn, marker);
+
+                                                    // Auto-open popup when triggered by pinned connection
+                                                    if (conn.autoPopup) {
+                                                        marker.openPopup();
+                                                        // Notify Python when the user manually closes the popup.
+                                                        // Pass the generation counter so Python can ignore stale events.
+                                                        (function(gen) {
+                                                            marker.on('popupclose', function() {
+                                                                if (!window._removingMarkers) {
+                                                                    try {
+                                                                        if (mapBridge && typeof mapBridge.notifyPopupClosed === 'function') {
+                                                                            mapBridge.notifyPopupClosed(gen);
+                                                                        }
+                                                                    } catch(e) {}
+                                                                }
+                                                            });
+                                                        })(conn.popupGeneration || 0);
+                                                    }
 
                                                     liveMarkers.push(marker);
 
@@ -4610,14 +4825,15 @@ class TCPConnectionViewer(QMainWindow):
         resolved_addresses = 0
         unresolved_addresses = 0
         local_addresses = 0
-        
+        udp_no_remote = 0
+
         for conn in self.connections:
             # Add to table
 
             if not show_only_new_active_connections or (show_only_new_active_connections and conn['icon'] == 'blueIcon'):
                 if conn['icon'] == 'blueIcon':
                     force_tooltip = True
-                
+
                 lat, lng = None, None
 
                 # Get coordinates for map
@@ -4643,7 +4859,10 @@ class TCPConnectionViewer(QMainWindow):
                     self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
                     self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
 
-                if ip not in ('127.0.0.1','::1'):
+                if ip in ('*', '0.0.0.0', '::', ''):
+                    # UDP listener with no remote peer — not a real unresolved address
+                    udp_no_remote += 1
+                elif ip not in ('127.0.0.1','::1'):
 
                     ip = conn['remote'].split(' ')[0]
                     ip = ip.split(' (')[0]  # Remove any appended hostname                    
@@ -4670,6 +4889,19 @@ class TCPConnectionViewer(QMainWindow):
                 
                 connections_to_show_on_map.append(conn)
 
+        # Apply yellow icon override for the pinned (double-clicked) connection
+        if self._pinned_connection is not None:
+            for conn in connections_to_show_on_map:
+                if self._is_pinned_connection(conn):
+                    # Only override non-suspect connections (red stays red)
+                    if conn['icon'] != 'redIcon':
+                        conn['icon'] = 'yellowIcon'
+                    # Re-open popup only if user hasn't manually closed it
+                    if self._pinned_popup_open:
+                        conn['autoPopup'] = True
+                        conn['popupGeneration'] = self._pinned_popup_generation
+                    break
+
         # Get datetime for the current view (live or timeline)
         datetime_text = ""
         if slider_position is None or slider_position is False:
@@ -4690,7 +4922,7 @@ class TCPConnectionViewer(QMainWindow):
                         datetime_text = ""
 
         # Build single-line stats string and update map with it
-        stats_line = f"Geo resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses}"
+        stats_line = f"Geo resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses} - UDP *: {udp_no_remote}"
         self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line, datetime_text=datetime_text)
 
         if table_column_sort_index > -1 and not do_pause_table_sorting:
@@ -5399,7 +5631,96 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error selecting table row from map: {e}")
 
-    def on_table_cell_clicked(self, row, column):
+    def pin_connection_from_map(self, process, pid, protocol, local, localport, remote, remoteport, ip_type):
+        """Pin a connection as yellow marker when clicked on the map. Same logic as table double-click."""
+        new_pinned = {
+            'process': process,
+            'pid': pid,
+            'protocol': protocol,
+            'local': local,
+            'localport': localport,
+            'remote': remote,
+            'remoteport': remoteport,
+            'ip_type': ip_type,
+        }
+
+        # If clicking the same pinned connection, unpin it
+        if self._pinned_connection is not None and self._is_pinned_connection(new_pinned):
+            self._pinned_connection = None
+            self._pinned_popup_open = False
+            logging.debug("Unpinned connection (clicked same marker on map)")
+        else:
+            self._pinned_connection = new_pinned
+            self._pinned_popup_open = True
+            self._pinned_popup_generation += 1
+            logging.debug(f"Pinned connection from map: {process} {remote} (gen {self._pinned_popup_generation})")
+
+        # Select the matching table row
+        self.select_table_row_by_connection(process, pid, remote, local)
+
+        # Refresh to apply yellow icon + persistent popup
+        try:
+            self.refresh_connections(slider_position=self.slider.value())
+        except Exception:
+            pass
+
+    def _on_table_cell_clicked_deferred(self, row, column):
+        """Defer the single-click action briefly so a double-click can cancel it."""
+        self._pending_click = (row, column)
+        self._click_timer.start(300)  # ms — slightly above the OS double-click interval
+
+    def _execute_deferred_click(self):
+        """Run the single-click handler after the double-click window has elapsed."""
+        if self._pending_click is not None:
+            row, column = self._pending_click
+            self._pending_click = None
+            self.on_table_cell_clicked(row, column)
+
+    def on_table_cell_double_clicked(self, row, column):
+        """Pin a connection as yellow marker on double-click. Persists across refreshes."""
+        # Cancel any pending single-click so the map isn't redrawn twice
+        self._click_timer.stop()
+        self._pending_click = None
+
+        if row >= self.connection_table.rowCount():
+            return
+
+        # Build a connection identity dict from the table row
+        process_name = self.connection_table.item(row, PROCESS_ROW_INDEX).text() if self.connection_table.item(row, PROCESS_ROW_INDEX) else ''
+        pid = self.connection_table.item(row, PID_ROW_INDEX).text() if self.connection_table.item(row, PID_ROW_INDEX) else ''
+        protocol = self.connection_table.item(row, PROTOCOL_ROW_INDEX).text() if self.connection_table.item(row, PROTOCOL_ROW_INDEX) else 'TCP'
+        local_address = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX).text() if self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX) else ''
+        local_port = self.connection_table.item(row, LOCAL_PORT_ROW_INDEX).text() if self.connection_table.item(row, LOCAL_PORT_ROW_INDEX) else ''
+        remote_address = self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX).text() if self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX) else ''
+        remote_port = self.connection_table.item(row, REMOTE_PORT_ROW_INDEX).text() if self.connection_table.item(row, REMOTE_PORT_ROW_INDEX) else ''
+        ip_type = self.connection_table.item(row, IP_TYPE_ROW_INDEX).text() if self.connection_table.item(row, IP_TYPE_ROW_INDEX) else ''
+
+        new_pinned = {
+            'process': process_name,
+            'pid': pid,
+            'protocol': protocol,
+            'local': local_address,
+            'localport': local_port,
+            'remote': remote_address,
+            'remoteport': remote_port,
+            'ip_type': ip_type,
+        }
+
+        # If double-clicking the same pinned connection, unpin it
+        if self._pinned_connection is not None and self._is_pinned_connection(new_pinned):
+            self._pinned_connection = None
+            self._pinned_popup_open = False
+            logging.debug("Unpinned connection (double-clicked same row)")
+        else:
+            self._pinned_connection = new_pinned
+            self._pinned_popup_open = True
+            self._pinned_popup_generation += 1
+            logging.debug(f"Pinned connection: {process_name} {remote_address} (gen {self._pinned_popup_generation})")
+
+        # Trigger the single-click handler to show the marker immediately (with correct color and auto-open popup)
+        self.on_table_cell_clicked(row, column, auto_popup=True)
+
+    def on_table_cell_clicked(self, row, column, auto_popup=False):
         # Get the connection data for the clicked row
         lat, lng = None, None
 
@@ -5425,6 +5746,15 @@ class TCPConnectionViewer(QMainWindow):
                 lat = self.connection_table.item(row, LOCATION_LAT_ROW_INDEX).text()
                 lng = self.connection_table.item(row, LOCATION_LON_ROW_INDEX).text()                
 
+                # If table cells are empty, try a live geolocation lookup
+                if not lat or not lng:
+                    ip_for_geo = remote_address.split(' ')[0].split('(')[0].strip()
+                    if ip_for_geo and ip_for_geo not in ('*', '0.0.0.0', '::', 'N/A'):
+                        geo_lat, geo_lng = self.get_coordinates(ip_for_geo, ip_type)
+                        if geo_lat is not None and geo_lng is not None:
+                            lat = str(geo_lat)
+                            lng = str(geo_lng)
+
                 if do_reverse_dns:
                     name = self.connection_table.item(row, NAME_ROW_INDEX).text() if self.connection_table.item(row, NAME_ROW_INDEX) else ''
 
@@ -5433,6 +5763,12 @@ class TCPConnectionViewer(QMainWindow):
 
             if suspect:
                 icon = 'redIcon'
+            elif self._pinned_connection is not None and self._is_pinned_connection(
+                    {'process': process_name, 'pid': pid, 'protocol': protocol,
+                     'local': local_address, 'localport': local_port,
+                     'remote': remote_address, 'remoteport': remote_port,
+                     'ip_type': ip_type}):
+                icon = 'yellowIcon'
             else:
                 icon = 'greenIcon'
 
@@ -5450,10 +5786,12 @@ class TCPConnectionViewer(QMainWindow):
                 'ip_type': ip_type,
                 'lat': lat,
                 'lng': lng,
-                'icon': icon  # default icon; change as needed based on conditions
+                'icon': icon,  # default icon; change as needed based on conditions
+                'autoPopup': auto_popup,
+                'popupGeneration': self._pinned_popup_generation if auto_popup else 0
             }]
 
-            if lat is not None or lng is not None:
+            if lat and lng:
                 self.update_map(focused_data)
 
 def main():
