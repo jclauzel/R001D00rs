@@ -7,3 +7,4 @@ requests>=2.31.0
 folium>=0.14.0
 opencv-python>=4.8.0
 procmon-parser>=0.3.3
+flask>=3.0.0
