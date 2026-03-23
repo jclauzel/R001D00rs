@@ -60,6 +60,7 @@ tcp_geo_map uses:
 * folium / OpenStreetMap
 * opencv-python
 * procmon-parser
+* flask
 * https://github.com/pointhi/leaflet-color-markers
 
 When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process performing such a call will be tagged in red and "C2" column will mark "Yes".
@@ -99,7 +100,7 @@ python3 -m venv ./R001D00rs
 
 source R001D00rs/bin/activate
 
-pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser
+pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser flask
 
 or
 
@@ -120,7 +121,7 @@ Download source from latest "release" located on the right side of https://githu
 
 Install required packages:
 
-pip3 install pyside6 requests maxminddb opencv-python procmon-parser
+pip3 install pyside6 requests maxminddb opencv-python procmon-parser flask
 
 or
 
