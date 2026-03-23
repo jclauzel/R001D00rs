@@ -96,7 +96,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.1.0" # Current script version
+VERSION = "3.2.0" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -145,6 +145,7 @@ LEAFLET_MARKER_RED_URL = "https://raw.githubusercontent.com/pointhi/leaflet-colo
 LEAFLET_MARKER_GREEN_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png"
 LEAFLET_MARKER_BLUE_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png"
 LEAFLET_MARKER_YELLOW_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-yellow.png"
+LEAFLET_MARKER_ORANGE_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-orange.png"
 
 LEAFLET_CSS_PATH = os.path.join(LEAFLET_DIR, "leaflet.css")
 LEAFLET_JS_PATH = os.path.join(LEAFLET_DIR, "leaflet.js")
@@ -152,22 +153,24 @@ LEAFLET_MARKER_RED_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-red.png")
 LEAFLET_MARKER_GREEN_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-green.png")
 LEAFLET_MARKER_BLUE_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-blue.png")
 LEAFLET_MARKER_YELLOW_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-yellow.png")
+LEAFLET_MARKER_ORANGE_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-orange.png")
 
 LEAFLET_RESOURCES_ABOUT_TITLE = "About Leaflet Resources and pointhi marker icons"
 LEAFLET_RESOURCES_ABOUT_TEXT = """Leaflet is an open-source JavaScript library for interactive maps.\n\nThis application uses:\n- Leaflet library (https://leafletjs.com/)\n- Colored map markers from https://github.com/pointhi/leaflet-color-markers\n\nDownloading these resources locally will:\n- Speed up application startup time\n- Enable offline map functionality\n- Reduce dependency on external CDN availability\n\nBy downloading, you agree to comply with the Leaflet license (BSD 2-Clause) and respective marker icon licenses."""
 
-PROCESS_ROW_INDEX = 0     # Index of the 'Process' column in the table
-PID_ROW_INDEX = 1         # Index of the 'PID' column in the table
-SUSPECT_ROW_INDEX = 2     # Index of the 'Suspect' column in the table
-PROTOCOL_ROW_INDEX = 3    # Index of the 'Protocol' column in the table (TCP/UDP)
-LOCAL_ADDRESS_ROW_INDEX = 4    # Index of the 'Local Address' column in the table
-LOCAL_PORT_ROW_INDEX = 5      # Index of the 'Local Port' column in the table
-REMOTE_ADDRESS_ROW_INDEX = 6  # Index of the 'Remote Address' column in the table
-REMOTE_PORT_ROW_INDEX = 7     # Index of the 'Remote Port' column in the table
-NAME_ROW_INDEX = 8        # Index of the 'Name' column in the table
-IP_TYPE_ROW_INDEX = 9      # Index of the 'IP Type' column in the table
-LOCATION_LAT_ROW_INDEX = 10   # Index of the 'Location' column in the table
-LOCATION_LON_ROW_INDEX = 11  # Index of the 'Location' column in the table
+HOSTNAME_ROW_INDEX = 0    # Index of the 'Hostname' column in the table
+PROCESS_ROW_INDEX = 1     # Index of the 'Process' column in the table
+PID_ROW_INDEX = 2         # Index of the 'PID' column in the table
+SUSPECT_ROW_INDEX = 3     # Index of the 'Suspect' column in the table
+PROTOCOL_ROW_INDEX = 4    # Index of the 'Protocol' column in the table (TCP/UDP)
+LOCAL_ADDRESS_ROW_INDEX = 5    # Index of the 'Local Address' column in the table
+LOCAL_PORT_ROW_INDEX = 6      # Index of the 'Local Port' column in the table
+REMOTE_ADDRESS_ROW_INDEX = 7  # Index of the 'Remote Address' column in the table
+REMOTE_PORT_ROW_INDEX = 8     # Index of the 'Remote Port' column in the table
+NAME_ROW_INDEX = 9        # Index of the 'Name' column in the table
+IP_TYPE_ROW_INDEX = 10     # Index of the 'IP Type' column in the table
+LOCATION_LAT_ROW_INDEX = 11   # Index of the 'Location' column in the table
+LOCATION_LON_ROW_INDEX = 12  # Index of the 'Location' column in the table
 PID_COLUMN_SIZE = 60
 SUSPECT_COLUMN_SIZE = 30
 PROTOCOL_COLUMN_SIZE = 55
@@ -195,6 +198,28 @@ do_c2_check = False    # Set to True to enable C2-TRACKER checks
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
 do_pause_table_sorting = False  # Set to True to pause table sorting without stopping updates
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
+
+# Server / Agent mode globals
+enable_server_mode = False  # When True the app runs a Flask endpoint to collect agent data
+enable_agent_mode = False   # When True the app periodically POSTs its connections to a server
+agent_server_address = ""   # Server URL used in agent mode (e.g. "http://192.168.1.10:5000")
+FLASK_LISTEN_PORT = 5000    # Port the Flask server listens on in server mode
+LOCAL_HOSTNAME = platform.node() or socket.gethostname()  # This machine's hostname
+
+# Parse --enable_server_mode and --enable_agent_mode from command line
+if "--enable_server_mode" in sys.argv:
+    enable_server_mode = True
+_agent_idx = None
+for _i, _a in enumerate(sys.argv):
+    if _a == "--enable_agent_mode" and _i + 1 < len(sys.argv):
+        _agent_idx = _i
+        break
+if _agent_idx is not None:
+    enable_agent_mode = True
+    agent_server_address = sys.argv[_agent_idx + 1]
+# Mutual exclusion: agent takes precedence if both are set
+if enable_server_mode and enable_agent_mode:
+    enable_server_mode = False
 
  
 
@@ -541,6 +566,18 @@ class TCPConnectionViewer(QMainWindow):
         # HTTP session for public IP checks (connection pooling)
         self._http_session = requests.Session()
 
+        # --- Server / Agent mode runtime state ---
+        # Server mode: cache of latest submissions from each agent
+        # Key = hostname (str), Value = dict with keys:
+        #   hostname, ip_addresses, lat, lng, connections (list of connection dicts)
+        self._agent_cache = {}          # protected by _agent_cache_lock
+        self._agent_cache_lock = threading.Lock()
+        self._last_agent_count = 0      # number of agents collected in last cycle
+        self._flask_thread = None       # daemon thread running Flask
+        # Agent mode: HTTP session with short timeout for POSTing to server
+        self._agent_http_session = requests.Session()
+        self._agent_http_session.headers.update({'Content-Type': 'application/json'})
+
         # Debounced map update
         self._map_update_timer = QTimer()
         self._map_update_timer.setSingleShot(True)
@@ -607,6 +644,10 @@ class TCPConnectionViewer(QMainWindow):
 
         # Apply UI-dependent settings after UI is created
         self._apply_settings_to_ui()
+
+        # Start Flask server if server mode was enabled (via CLI or settings)
+        if enable_server_mode:
+            self._start_flask_server()
 
         # Set up timer to refresh connections periodically
 
@@ -1012,6 +1053,9 @@ class TCPConnectionViewer(QMainWindow):
             'table_column_sort_reverse' : table_column_sort_reverse,
             'summary_table_column_sort_index': summary_table_column_sort_index,
             'summary_table_column_sort_reverse': summary_table_column_sort_reverse,
+            'enable_server_mode': enable_server_mode,
+            'enable_agent_mode': enable_agent_mode,
+            'agent_server_address': agent_server_address,
         }
 
         # Save current map position and zoom
@@ -1101,6 +1145,22 @@ class TCPConnectionViewer(QMainWindow):
                 table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
                 summary_table_column_sort_index = settings.get('summary_table_column_sort_index', summary_table_column_sort_index)
                 summary_table_column_sort_reverse = settings.get('summary_table_column_sort_reverse', summary_table_column_sort_reverse)
+
+                # Restore server/agent mode settings (CLI args take precedence)
+                global enable_server_mode, enable_agent_mode, agent_server_address
+                if not enable_server_mode and not enable_agent_mode:
+                    # Only apply persisted settings when CLI didn't override
+                    saved_server = settings.get('enable_server_mode', False)
+                    saved_agent = settings.get('enable_agent_mode', False)
+                    saved_addr = settings.get('agent_server_address', '')
+                    if saved_server and not saved_agent:
+                        enable_server_mode = True
+                    elif saved_agent and not saved_server:
+                        enable_agent_mode = True
+                        agent_server_address = saved_addr
+                    # If both were somehow True in settings, ignore (mutual exclusion)
+                    if not enable_agent_mode:
+                        agent_server_address = saved_addr
 
                 # Restore map position and zoom (CRITICAL: do this BEFORE init_ui/update_map)
                 try:
@@ -1224,6 +1284,14 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception:
                     pass
 
+                # Restore server/agent mode UI state
+                if hasattr(self, 'server_mode_check'):
+                    self.server_mode_check.setChecked(enable_server_mode)
+                if hasattr(self, 'agent_mode_check'):
+                    self.agent_mode_check.setChecked(enable_agent_mode)
+                if hasattr(self, 'agent_server_input'):
+                    self.agent_server_input.setText(agent_server_address)
+
         except Exception as e:
             logging.error(f"Error applying settings to UI: {e}")
 
@@ -1233,6 +1301,171 @@ class TCPConnectionViewer(QMainWindow):
         # _load_settings_early() - before UI creation
         # _apply_settings_to_ui() - after UI creation
         pass
+
+    # ── Server / Agent mode helpers ──────────────────────────────────────
+
+    def _on_server_mode_changed(self, state):
+        global enable_server_mode, enable_agent_mode
+        enabled = bool(state)
+        if enabled:
+            enable_server_mode = True
+            enable_agent_mode = False
+            if hasattr(self, 'agent_mode_check'):
+                self.agent_mode_check.blockSignals(True)
+                self.agent_mode_check.setChecked(False)
+                self.agent_mode_check.blockSignals(False)
+            self._start_flask_server()
+        else:
+            enable_server_mode = False
+            # Flask cannot be gracefully stopped mid-process; it will die with the app.
+        logging.info(f"Server mode {'enabled' if enable_server_mode else 'disabled'}")
+
+    def _on_agent_mode_changed(self, state):
+        global enable_agent_mode, enable_server_mode, agent_server_address
+        enabled = bool(state)
+        if enabled:
+            enable_agent_mode = True
+            enable_server_mode = False
+            agent_server_address = self.agent_server_input.text().strip()
+            if hasattr(self, 'server_mode_check'):
+                self.server_mode_check.blockSignals(True)
+                self.server_mode_check.setChecked(False)
+                self.server_mode_check.blockSignals(False)
+        else:
+            enable_agent_mode = False
+        logging.info(f"Agent mode {'enabled' if enable_agent_mode else 'disabled'} -> {agent_server_address}")
+
+    def _on_agent_server_address_changed(self):
+        global agent_server_address
+        agent_server_address = self.agent_server_input.text().strip()
+
+    def _start_flask_server(self):
+        """Start the Flask HTTP server in a background daemon thread."""
+        if self._flask_thread is not None and self._flask_thread.is_alive():
+            logging.info("Flask server already running")
+            return
+        try:
+            from flask import Flask, request as flask_request, jsonify
+        except ImportError:
+            logging.error("Flask is not installed. Install it with: pip install flask")
+            try:
+                self.status_label.setText("Server mode requires Flask (pip install flask)")
+            except Exception:
+                pass
+            return
+
+        app = Flask(__name__)
+        viewer = self  # capture reference for the route closure
+
+        @app.route("/submit_connections", methods=["POST"])
+        def submit_connections():
+            try:
+                data = flask_request.get_json(force=True)
+                hostname = data.get("hostname", "unknown")
+                ip_addresses = data.get("ip_addresses", [])
+                loc_lat = data.get("lat")
+                loc_lng = data.get("lng")
+                conns = data.get("connections", [])
+                with viewer._agent_cache_lock:
+                    viewer._agent_cache[hostname] = {
+                        "hostname": hostname,
+                        "ip_addresses": ip_addresses,
+                        "lat": loc_lat,
+                        "lng": loc_lng,
+                        "connections": conns,
+                    }
+                return jsonify({"status": "ok", "accepted": len(conns)}), 200
+            except Exception as e:
+                logging.error(f"Error processing /submit_connections: {e}")
+                return jsonify({"status": "error", "message": str(e)}), 400
+
+        def _run():
+            # Suppress Flask/Werkzeug request logging to keep console clean
+            wlog = logging.getLogger('werkzeug')
+            wlog.setLevel(logging.ERROR)
+            app.run(host="0.0.0.0", port=FLASK_LISTEN_PORT, threaded=True, use_reloader=False)
+
+        self._flask_thread = threading.Thread(target=_run, daemon=True, name="FlaskServer")
+        self._flask_thread.start()
+        logging.info(f"Flask server started on port {FLASK_LISTEN_PORT}")
+
+    def _collect_and_reset_agent_cache(self):
+        """Drain the agent cache and return a dict {hostname: agent_data}.
+        Called once per get_active_tcp_connections cycle in server mode."""
+        with self._agent_cache_lock:
+            snapshot = dict(self._agent_cache)
+            self._agent_cache.clear()
+        self._last_agent_count = len(snapshot)
+        return snapshot
+
+    def _get_local_ip_addresses(self):
+        """Return a list of non-loopback IP addresses on this machine."""
+        addrs = []
+        try:
+            for iface, snics in psutil.net_if_addrs().items():
+                for snic in snics:
+                    if snic.family in (socket.AF_INET, socket.AF_INET6):
+                        addr = snic.address
+                        if addr and addr not in ('127.0.0.1', '::1', ''):
+                            addrs.append(addr)
+        except Exception:
+            pass
+        return addrs
+
+    def _get_local_geolocation(self):
+        """Return (lat, lng) for this machine's public IP, or (None, None)."""
+        try:
+            public_ip = self.get_public_ip()
+            if public_ip:
+                import ipaddress
+                try:
+                    ip_obj = ipaddress.ip_address(public_ip)
+                    ip_type = "IPv4" if ip_obj.version == 4 else "IPv6"
+                except Exception:
+                    ip_type = "IPv4"
+                reader = self.reader_ipv4 if ip_type == "IPv4" else self.reader_ipv6
+                if reader:
+                    res = reader.get(public_ip)
+                    if res:
+                        lat = res.get('latitude') or res.get('location', {}).get('latitude')
+                        lng = res.get('longitude') or res.get('location', {}).get('longitude')
+                        return lat, lng
+        except Exception:
+            pass
+        return None, None
+
+    def _agent_post_connections(self, connections):
+        """POST the local connection list to the configured server (agent mode).
+        Retries up to 2 times on transient failures with a short timeout."""
+        global agent_server_address
+        if not agent_server_address:
+            return
+        url = agent_server_address.rstrip('/') + '/submit_connections'
+        lat, lng = self._get_local_geolocation()
+        payload = {
+            "hostname": LOCAL_HOSTNAME,
+            "ip_addresses": self._get_local_ip_addresses(),
+            "lat": lat,
+            "lng": lng,
+            "connections": connections,
+        }
+        max_retries = 3  # 1 initial + 2 retries
+        for attempt in range(max_retries):
+            try:
+                resp = self._agent_http_session.post(url, json=payload, timeout=(3, 5))
+                if resp.status_code == 200:
+                    logging.debug(f"Agent POST successful ({len(connections)} conns)")
+                    return
+                else:
+                    logging.warning(f"Agent POST returned {resp.status_code}: {resp.text[:200]}")
+            except requests.exceptions.ConnectionError as e:
+                logging.error(f"Agent POST connection error (attempt {attempt+1}/{max_retries}): {e}")
+            except requests.exceptions.Timeout:
+                logging.error(f"Agent POST timeout (attempt {attempt+1}/{max_retries})")
+            except Exception as e:
+                logging.error(f"Agent POST error (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
 
     def closeEvent(self, event):
         """Save settings when closing the application"""
@@ -2277,6 +2510,7 @@ class TCPConnectionViewer(QMainWindow):
             # Fixed column order (datetime first)
             columns = [
                 "datetime",
+                "hostname",
                 "process",
                 "pid",
                 "suspect",
@@ -2434,7 +2668,7 @@ class TCPConnectionViewer(QMainWindow):
         # Connection table
         self.connection_table = QTableWidget(0, LOCATION_LON_ROW_INDEX+1)
         self.connection_table.setHorizontalHeaderLabels([
-            "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon"
         ])
 
         # Connect the header clicked signal to a custom sort function
@@ -2461,7 +2695,7 @@ class TCPConnectionViewer(QMainWindow):
 
         # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
         _filter_placeholders = [
-            "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port",
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port",
             "Remote Addr", "Remote Port", "Name", "IP Type", "Lat", "Lon"
         ]
         self._connection_filter_inner = QWidget()
@@ -2636,10 +2870,10 @@ class TCPConnectionViewer(QMainWindow):
         summary_title_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
         summary_tab_layout.addWidget(summary_title_label)
 
-        # Create summary table with 9 columns
-        self.summary_table = QTableWidget(0, 9)
+        # Create summary table with 10 columns
+        self.summary_table = QTableWidget(0, 10)
         self.summary_table.setHorizontalHeaderLabels([
-            "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count"
         ])
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -2722,6 +2956,30 @@ class TCPConnectionViewer(QMainWindow):
         self.pause_table_sorting_check.setChecked(False)
         self.pause_table_sorting_check.stateChanged.connect(self.update_pause_table_sorrting)
         settings_tab_layout.addWidget(self.pause_table_sorting_check)
+
+        # --- Server / Agent mode settings ---
+        server_agent_separator = QLabel("─── Server / Agent Mode ───")
+        server_agent_separator.setStyleSheet("font-weight: bold; color: #555; margin-top: 8px;")
+        settings_tab_layout.addWidget(server_agent_separator)
+
+        self.server_mode_check = QCheckBox("Enable server mode (listen for agent connections)")
+        self.server_mode_check.setChecked(enable_server_mode)
+        self.server_mode_check.stateChanged.connect(self._on_server_mode_changed)
+        settings_tab_layout.addWidget(self.server_mode_check)
+
+        agent_mode_layout = QHBoxLayout()
+        self.agent_mode_check = QCheckBox("Enable agent mode:")
+        self.agent_mode_check.setChecked(enable_agent_mode)
+        self.agent_mode_check.stateChanged.connect(self._on_agent_mode_changed)
+        agent_mode_layout.addWidget(self.agent_mode_check)
+        self.agent_server_input = QLineEdit()
+        self.agent_server_input.setPlaceholderText("Server address (e.g. http://192.168.1.10:5000)")
+        self.agent_server_input.setText(agent_server_address)
+        self.agent_server_input.setMinimumWidth(280)
+        self.agent_server_input.editingFinished.connect(self._on_agent_server_address_changed)
+        agent_mode_layout.addWidget(self.agent_server_input)
+        agent_mode_layout.addStretch()
+        settings_tab_layout.addLayout(agent_mode_layout)
 
         # Add stretch to push settings to the top
         settings_tab_layout.addStretch()
@@ -3584,7 +3842,8 @@ class TCPConnectionViewer(QMainWindow):
                                     'ip_type': ip_type,
                                     'lat': lat,
                                     'lng': lng,
-                                    'icon': 'redIcon'
+                                    'icon': 'redIcon',
+                                    'hostname': LOCAL_HOSTNAME,
                                 })
                         except Exception:
                             # ignore C2 lookup failures
@@ -3604,7 +3863,8 @@ class TCPConnectionViewer(QMainWindow):
                     'ip_type': ip_type,
                     'lat': lat,
                     'lng': lng,
-                    'icon': 'greenIcon'
+                    'icon': 'greenIcon',
+                    'hostname': LOCAL_HOSTNAME,
                 })
 
                 # if this is a new connection (timeline-based detection), mark it
@@ -3627,11 +3887,24 @@ class TCPConnectionViewer(QMainWindow):
             c2_connections.extend(connections)
             connections = c2_connections
 
+        # Server mode: drain agent cache and merge remote agent connections
+        agent_snapshot = {}
+        if enable_server_mode and position_timeline is None:
+            agent_snapshot = self._collect_and_reset_agent_cache()
+            for hostname, agent_data in agent_snapshot.items():
+                for agent_conn in agent_data.get('connections', []):
+                    agent_conn['hostname'] = hostname  # ensure hostname tag
+                    # Mark agent exit-point connections with orange icon
+                    if agent_conn.get('icon') not in ('redIcon',):
+                        agent_conn['icon'] = 'orangeIcon'
+                    connections.append(agent_conn)
+
         # record timeline snapshot only when requested (position_timeline is None)
         if position_timeline is None:
             another_connection = {
                 "datetime": datetime.datetime.now(),
-                "connection_list": connections
+                "connection_list": connections,
+                "agent_data": agent_snapshot if enable_server_mode and agent_snapshot else None,
             }
 
             # append while ensuring we maintain the list size cap
@@ -3684,6 +3957,13 @@ class TCPConnectionViewer(QMainWindow):
             elapsed = time_module.perf_counter() - start_time
             if elapsed > 1.0:  # Log if took more than 1 second
                 logging.warning(f"get_active_tcp_connections took {elapsed:.2f}s to process {len(connections)} connections")
+
+        # Agent mode: POST local connections to the server
+        if enable_agent_mode and position_timeline is None:
+            try:
+                self._agent_post_connections(connections)
+            except Exception as e:
+                logging.error(f"Agent POST failed: {e}")
 
         return connections
     
@@ -3918,8 +4198,16 @@ class TCPConnectionViewer(QMainWindow):
         # Live mode is when datetime_text starts with "Live:"
         is_recording = do_capture_screenshots and datetime_text.startswith("Live:")
 
-        # Send stats_text, datetime_text, and recording indicator status to JS
-        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)}); setDateTime({json.dumps(datetime_text)}); setRecordingIndicator({str(is_recording).lower()});"
+        # Build server/agent mode indicator text
+        mode_indicator_text = ''
+        if enable_server_mode:
+            agent_count = getattr(self, '_last_agent_count', 0)
+            mode_indicator_text = f'Server mode ({agent_count} agent{"s" if agent_count != 1 else ""})'
+        elif enable_agent_mode:
+            mode_indicator_text = f'Agent mode: {agent_server_address}'
+
+        # Send stats_text, datetime_text, recording indicator, and mode indicator to JS
+        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)}); setDateTime({json.dumps(datetime_text)}); setRecordingIndicator({str(is_recording).lower()}); setModeIndicator({json.dumps(mode_indicator_text)});"
 
         # Check reload attempt limit to prevent infinite loops
         if not getattr(self, "map_initialized", False):
@@ -3993,6 +4281,13 @@ class TCPConnectionViewer(QMainWindow):
                        .leaflet-control-fitall a { font-size:18px; font-weight:bold; line-height:26px; text-align:center;
                                                    text-decoration:none; color:#333; }
                        .leaflet-control-fitall a:hover { background-color:#f4f4f4; }
+                       /* Server/Agent mode indicator (bottom-left, next to fit-all) */
+                       .leaflet-control-modeinfo { pointer-events:none; }
+                       .leaflet-control-modeinfo .mode-label {
+                           display:none; background:rgba(255,255,255,0.9); padding:4px 8px; border-radius:4px;
+                           font-family:Arial, sans-serif; font-size:11px; color:#333; white-space:nowrap;
+                           border:1px solid #ccc; }
+                       .leaflet-control-modeinfo .mode-label.active { display:block; }
                 </style>
             </head>
             <body>
@@ -4171,6 +4466,10 @@ class TCPConnectionViewer(QMainWindow):
                             yellow: {
                                 remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-yellow.png',
                                 local: localBase + 'marker-icon-2x-yellow.png'
+                            },
+                            orange: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-orange.png',
+                                local: localBase + 'marker-icon-2x-orange.png'
                             }
                         };
 
@@ -4189,6 +4488,7 @@ class TCPConnectionViewer(QMainWindow):
                                         'greenIcon': new L.Icon({iconUrl: resolved.green, iconSize:[25,41], iconAnchor:[12,41]}),
                                         'blueIcon': new L.Icon({iconUrl: resolved.blue, iconSize:[25,41], iconAnchor:[12,41]}),
                                         'yellowIcon': new L.Icon({iconUrl: resolved.yellow, iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'orangeIcon': new L.Icon({iconUrl: resolved.orange, iconSize:[25,41], iconAnchor:[12,41]}),
                                     };
 
                                     // initialize map AFTER icons resolved
@@ -4250,6 +4550,18 @@ class TCPConnectionViewer(QMainWindow):
                                         }
                                     });
                                     map.addControl(new FitAllControl());
+
+                                    // Server/Agent mode indicator control (bottom-left, right of fit-all)
+                                    var ModeIndicatorControl = L.Control.extend({
+                                        options: { position: 'bottomleft' },
+                                        onAdd: function(map) {
+                                            var container = L.DomUtil.create('div', 'leaflet-control-modeinfo');
+                                            var label = L.DomUtil.create('span', 'mode-label', container);
+                                            label.id = 'mode-indicator-label';
+                                            return container;
+                                        }
+                                    });
+                                    map.addControl(new ModeIndicatorControl());
 
                                     // Global helper called by the fit-all button
                                     window._fitAllMarkers = function() {
@@ -4512,6 +4824,22 @@ class TCPConnectionViewer(QMainWindow):
                                     window.setStats = setStats;
                                     window.setDateTime = setDateTime;
                                     window.setRecordingIndicator = setRecordingIndicator;
+
+                                    function setModeIndicator(text) {
+                                        try {
+                                            var el = document.getElementById('mode-indicator-label');
+                                            if (el) {
+                                                if (text) {
+                                                    el.innerText = text;
+                                                    el.className = 'mode-label active';
+                                                } else {
+                                                    el.innerText = '';
+                                                    el.className = 'mode-label';
+                                                }
+                                            }
+                                        } catch(e) {}
+                                    }
+                                    window.setModeIndicator = setModeIndicator;
                                     window.triggerPulse = triggerPulse;
 
                                     // Notify Python that map is fully initialized
@@ -4858,6 +5186,7 @@ class TCPConnectionViewer(QMainWindow):
                     self.connection_table.setItem(row, REMOTE_PORT_ROW_INDEX, QTableWidgetItem(conn['remoteport']))
                     self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
                     self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
+                    self.connection_table.setItem(row, HOSTNAME_ROW_INDEX, QTableWidgetItem(conn.get('hostname', '')))
 
                 if ip in ('*', '0.0.0.0', '::', ''):
                     # UDP listener with no remote peer — not a real unresolved address
@@ -5549,8 +5878,10 @@ class TCPConnectionViewer(QMainWindow):
                         if remote_ip in ('127.0.0.1', '::1'):
                             continue
 
+                    hostname = conn.get('hostname', '')
+
                     # Use tuple as dictionary key for grouping
-                    key = (process, pid, suspect, protocol, local, remote, ip_type, name)
+                    key = (hostname, process, pid, suspect, protocol, local, remote, ip_type, name)
 
                     # Increment count for this unique connection
                     if key in connection_stats:
@@ -5562,19 +5893,20 @@ class TCPConnectionViewer(QMainWindow):
             sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1], reverse=True)
 
             # Populate table with sorted results
-            for (process, pid, suspect, protocol, local, remote, ip_type, name), count in sorted_stats:
+            for (hostname, process, pid, suspect, protocol, local, remote, ip_type, name), count in sorted_stats:
                 row = self.summary_table.rowCount()
                 self.summary_table.insertRow(row)
 
-                self.summary_table.setItem(row, 0, QTableWidgetItem(process))
-                self.summary_table.setItem(row, 1, QTableWidgetItem(pid))
-                self.summary_table.setItem(row, 2, QTableWidgetItem(suspect))
-                self.summary_table.setItem(row, 3, QTableWidgetItem(protocol))
-                self.summary_table.setItem(row, 4, QTableWidgetItem(local))
-                self.summary_table.setItem(row, 5, QTableWidgetItem(remote))
-                self.summary_table.setItem(row, 6, QTableWidgetItem(ip_type))
-                self.summary_table.setItem(row, 7, QTableWidgetItem(name))
-                self.summary_table.setItem(row, 8, QTableWidgetItem(str(count)))
+                self.summary_table.setItem(row, 0, QTableWidgetItem(hostname))
+                self.summary_table.setItem(row, 1, QTableWidgetItem(process))
+                self.summary_table.setItem(row, 2, QTableWidgetItem(pid))
+                self.summary_table.setItem(row, 3, QTableWidgetItem(suspect))
+                self.summary_table.setItem(row, 4, QTableWidgetItem(protocol))
+                self.summary_table.setItem(row, 5, QTableWidgetItem(local))
+                self.summary_table.setItem(row, 6, QTableWidgetItem(remote))
+                self.summary_table.setItem(row, 7, QTableWidgetItem(ip_type))
+                self.summary_table.setItem(row, 8, QTableWidgetItem(name))
+                self.summary_table.setItem(row, 9, QTableWidgetItem(str(count)))
 
                 # Highlight suspect connections in red
                 if suspect == "Yes":
