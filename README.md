@@ -66,6 +66,8 @@ When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI w
 
 Databases are considered as obsolete after a week, and you will be prompted to refresh it.
 
+This tool has been developped with the help of Claude Sonnet and Claude Opus AI.
+
 # Avoiding prompts
 You can start the script by passing --accept_eula (Accept End User License Agreement) this means you agree, approve to follow all the licensing terms of all contributors and attributions including GeoLite2/MaxMind, C2_TRACKER, PySide6, psutil, folium / OpenStreetMap / Leaflet. 
 When --accept_eula is passed the databases will be downloaded automatically when they expire (by default every 7 days) and the /resources/leaflet/ files cache will be populated automatically as well to speedup startup time and reduce telemetry footprint this means you agree as well with leaflet and https://github.com/pointhi/leaflet-color-markers licensing agreements.
@@ -74,7 +76,6 @@ When --accept_eula is passed the databases will be downloaded automatically when
 Access to tile.openstreetmap.org is required to render the map so internet access is required to that site.
 When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img as well as https://unpkg.com/leaflet and will prompt you to cache them locally into /resources/leaflet/ in order to speed up next startup time.  You can also use the script download_resources.ps1 powershell script located in resources\leaflet directory  to download the below files independently.
 If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the TILE_OPENSTREETMAP_SERVER constant variable defined in the tcp_geo_map.py script though I have not tested this setup myself. 
-
 
 # Persistent IP DNS reverse cache file
 PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False set to True to turn on and speedup the script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
@@ -85,6 +86,7 @@ IP_DNS_NAME_CACHE_FILE = "ip_cache.json" if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUT
 - Green icon - Connection that is available since the last refresh
 - Blue icon - A new connection was made
 - Red icon - A possible C2 / Suspect connection
+- Yellow icon - A selected item.
 
 Markers can be clicked for additional details, map can be zoomed...
 
