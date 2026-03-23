@@ -96,7 +96,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.2.0" # Current script version
+VERSION = "3.2.1" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -3563,6 +3563,7 @@ class TCPConnectionViewer(QMainWindow):
             result = subprocess.run(
                 ["netstat", "-ano"],
                 capture_output=True, text=True, timeout=10,
+                encoding='utf-8', errors='replace',
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
             for line in result.stdout.splitlines():
