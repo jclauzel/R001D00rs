@@ -90,13 +90,13 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayo
                              QWidget, QTableWidget, QTableWidgetItem, QLabel,
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit) 
 from PySide6.QtGui import QIcon, QAction
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint
 from PySide6.QtWidgets import QStyle
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.2.1" # Current script version
+VERSION = "3.2.2" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -1304,6 +1304,7 @@ class TCPConnectionViewer(QMainWindow):
 
     # ── Server / Agent mode helpers ──────────────────────────────────────
 
+    @Slot(int)
     def _on_server_mode_changed(self, state):
         global enable_server_mode, enable_agent_mode
         enabled = bool(state)
@@ -1320,6 +1321,7 @@ class TCPConnectionViewer(QMainWindow):
             # Flask cannot be gracefully stopped mid-process; it will die with the app.
         logging.info(f"Server mode {'enabled' if enable_server_mode else 'disabled'}")
 
+    @Slot(int)
     def _on_agent_mode_changed(self, state):
         global enable_agent_mode, enable_server_mode, agent_server_address
         enabled = bool(state)
@@ -1335,6 +1337,7 @@ class TCPConnectionViewer(QMainWindow):
             enable_agent_mode = False
         logging.info(f"Agent mode {'enabled' if enable_agent_mode else 'disabled'} -> {agent_server_address}")
 
+    @Slot()
     def _on_agent_server_address_changed(self):
         global agent_server_address
         agent_server_address = self.agent_server_input.text().strip()
@@ -1646,6 +1649,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+    @Slot()
     def _cleanup_public_ip_dns_cache(self):
         """
         Periodic cleanup callback for public IP DNS attempt cache.
@@ -1666,6 +1670,7 @@ class TCPConnectionViewer(QMainWindow):
 
 
 
+    @Slot(QPoint)
     def on_connection_table_context_menu(self, pos):
         """Show a right-click context menu for the connection table row under the cursor."""
         index = self.connection_table.indexAt(pos)
@@ -1815,6 +1820,7 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", str(e))
 
+    @Slot(QPoint)
     def on_summary_table_context_menu(self, pos):
         """Show the same right-click context menu for the summary table row under the cursor."""
         index = self.summary_table.indexAt(pos)
@@ -1960,6 +1966,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+    @Slot()
     def apply_connection_table_filter(self):
         """Show/hide connection table rows based on the active per-column filter inputs."""
         try:
@@ -1980,6 +1987,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+    @Slot(int)
     def on_header_clicked(self, index):
         """
         Handles sorting when a column header is clicked.
@@ -1995,7 +2003,7 @@ class TCPConnectionViewer(QMainWindow):
                 table_column_sort_reverse = False
             else:
                 table_column_sort_reverse = True
-            
+
         table_column_sort_index = index
 
         self.sort_table_by_column(index, table_column_sort_reverse)
@@ -2069,6 +2077,7 @@ class TCPConnectionViewer(QMainWindow):
             for c, text in enumerate(row_values):
                 self.connection_table.setItem(new_row, c, QTableWidgetItem(text))
 
+    @Slot(int)
     def on_summary_header_clicked(self, index):
         """
         Handles sorting when a summary table column header is clicked.
@@ -2154,6 +2163,7 @@ class TCPConnectionViewer(QMainWindow):
                 self.summary_table.setItem(new_row, c, item)
 
      # Update connection list when slider changes
+    @Slot(int)
     def update_slider_value(self, value):
 
         # Update your connection list 
@@ -2182,6 +2192,7 @@ class TCPConnectionViewer(QMainWindow):
         else: 
             self.slider.setToolTip("")
 
+    @Slot()
     def update_resolve_public_ip(self):
         global do_resolve_public_ip
 
@@ -2191,6 +2202,7 @@ class TCPConnectionViewer(QMainWindow):
         else:
             do_resolve_public_ip = False
 
+    @Slot()
     def update_capture_screenshots(self):
         global do_capture_screenshots
 
@@ -2207,6 +2219,7 @@ class TCPConnectionViewer(QMainWindow):
         else:
             do_capture_screenshots = False
 
+    @Slot()
     def update_buffer_size(self):
         """Validate and update the max_connection_list_filo_buffer_size setting"""
         global max_connection_list_filo_buffer_size
@@ -2327,6 +2340,7 @@ class TCPConnectionViewer(QMainWindow):
 
 
 
+    @Slot()
     def update_reverse_dns(self):
         global do_reverse_dns
 
@@ -2348,6 +2362,7 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
+    @Slot()
     def update_c2_check(self):
         global do_c2_check
 
@@ -2360,6 +2375,7 @@ class TCPConnectionViewer(QMainWindow):
 
         self.refresh_connections()
 
+    @Slot()
     def only_show_new_connections_changed(self):
         global show_only_new_active_connections
 
@@ -2372,6 +2388,7 @@ class TCPConnectionViewer(QMainWindow):
 
         self.refresh_connections()
 
+    @Slot()
     def only_show_remote_connections_changed(self):
         global show_only_remote_connections
 
@@ -2383,11 +2400,13 @@ class TCPConnectionViewer(QMainWindow):
             self.setStyleSheet("") # Reset any previous styles
 
         self.refresh_connections()
-    
+
+    @Slot()
     def update_pause_table_sorrting(self):
         global do_pause_table_sorting
         do_pause_table_sorting = self.pause_table_sorting_check.isChecked()
 
+    @Slot()
     def update_refresh_interval(self):
         global map_refresh_interval
 
@@ -2396,6 +2415,7 @@ class TCPConnectionViewer(QMainWindow):
         self.timer.stop()
         self.timer.start(map_refresh_interval)
 
+    @Slot()
     def reset_connections(self):
 
         response = QMessageBox.question(
@@ -2425,6 +2445,7 @@ class TCPConnectionViewer(QMainWindow):
             # Start flashing to indicate ready to start
             self._start_capture_button_flash()
 
+    @Slot()
     def save_connection_list_to_csv(self):
         """
         Saves the connection list for a specific timeline index into a CSV file.
@@ -2572,6 +2593,7 @@ class TCPConnectionViewer(QMainWindow):
             QMessageBox.critical(self, "Save Error", f"An error occurred while saving the file: {e}")
 
 
+    @Slot(bool)
     def toggle_auto_refresh_replay_connections(self, enabled):
         if enabled:
             if self.timer_replay_connections.isActive():
@@ -3150,6 +3172,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error refreshing database {db_path}: {e}")
 
+    @Slot()
     def _refresh_all_databases(self):
         """Download all databases in sequence, reload them, then update the status table."""
         db_entries = [
@@ -3178,6 +3201,7 @@ class TCPConnectionViewer(QMainWindow):
                 return True
         return False
 
+    @Slot()
     def _on_database_refresh_timer(self):
         """Periodic callback (every 10 minutes) that checks database expiration and refreshes expired databases."""
         try:
@@ -4012,6 +4036,7 @@ class TCPConnectionViewer(QMainWindow):
             # defensive: ignore if map not ready yet
             pass
 
+    @Slot()
     def _do_map_update(self):
         """Execute pending debounced map update (if any)"""
         try:
@@ -5066,6 +5091,7 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
+    @Slot()
     def replay_connections(self):
 
         slider_position = self.slider.value()
@@ -5083,9 +5109,9 @@ class TCPConnectionViewer(QMainWindow):
         else:
             self.refresh_connections(self, 0)
             self.timer_replay_connections.stop()
-        
+
         self.slider.setValue(slider_position)    
-            
+
     def stop_capture_connections(self):
         if self.timer.isActive():
             self.timer.stop()
@@ -5098,6 +5124,7 @@ class TCPConnectionViewer(QMainWindow):
             # Start flashing the start capture button to draw attention
             self._start_capture_button_flash()
 
+    @Slot()
     def refresh_connections(self, slider_position=None):
 
         force_tooltip = show_tooltip
@@ -5282,6 +5309,7 @@ class TCPConnectionViewer(QMainWindow):
                 logging.debug(f"Could not restore selection: {e}")
         self.apply_connection_table_filter()
 
+    @Slot(bool)
     def on_map_loaded(self, success):
         if not success:
             self.status_label.setText("Error loading map")
@@ -5415,6 +5443,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error finishing screenshot capture: {e}")
 
+    @Slot()
     def generate_video_from_screenshots(self):
         """Generate MP4 video from all screenshots in the screen_captures folder (async)"""
         try:
@@ -5517,6 +5546,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error stopping video button flash: {e}")
 
+    @Slot()
     def _toggle_video_button_flash(self):
         """Toggle button appearance for flashing effect"""
         try:
@@ -5586,6 +5616,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error stopping start capture button flash: {e}")
 
+    @Slot()
     def _auto_stop_capture_flash(self):
         """Automatically stop flashing after timeout (called by timer)"""
         try:
@@ -5594,6 +5625,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error in auto-stop capture flash: {e}")
 
+    @Slot()
     def _toggle_start_capture_flash(self):
         """Toggle start capture button appearance for flashing effect"""
         try:
@@ -5649,6 +5681,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error stopping stop button wave: {e}")
 
+    @Slot()
     def _update_stop_button_wave(self):
         """Update stop button text with next wave pattern"""
         try:
@@ -5664,6 +5697,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error updating stop button wave: {e}")
 
+    @Slot(bool, str, dict)
     def _on_video_generation_finished(self, success, message, stats):
         """Called when video generation completes successfully"""
         try:
@@ -5692,6 +5726,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error in video generation finished handler: {e}")
 
+    @Slot(str)
     def _on_video_generation_error(self, error_message):
         """Called when video generation fails"""
         try:
@@ -5719,6 +5754,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error in video generation error handler: {e}")
 
+    @Slot(int, int)
     def _on_video_generation_progress(self, current_frame, total_frames):
         """Called when video generation makes progress"""
         try:
@@ -5829,6 +5865,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.warning(f"Error updating video button visibility: {e}")
 
+    @Slot(int)
     def on_tab_changed(self, index):
         """Called when user switches tabs - update Summary tab if selected (lazy loading)"""
         try:
@@ -5997,11 +6034,13 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+    @Slot(int, int)
     def _on_table_cell_clicked_deferred(self, row, column):
         """Defer the single-click action briefly so a double-click can cancel it."""
         self._pending_click = (row, column)
         self._click_timer.start(300)  # ms — slightly above the OS double-click interval
 
+    @Slot()
     def _execute_deferred_click(self):
         """Run the single-click handler after the double-click window has elapsed."""
         if self._pending_click is not None:
@@ -6009,6 +6048,7 @@ class TCPConnectionViewer(QMainWindow):
             self._pending_click = None
             self.on_table_cell_clicked(row, column)
 
+    @Slot(int, int)
     def on_table_cell_double_clicked(self, row, column):
         """Pin a connection as yellow marker on double-click. Persists across refreshes."""
         # Cancel any pending single-click so the map isn't redrawn twice
