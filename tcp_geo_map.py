@@ -96,7 +96,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.2.2" # Current script version
+VERSION = "3.2.3" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -577,6 +577,14 @@ class TCPConnectionViewer(QMainWindow):
         # Agent mode: HTTP session with short timeout for POSTing to server
         self._agent_http_session = requests.Session()
         self._agent_http_session.headers.update({'Content-Type': 'application/json'})
+        # Background thread for non-blocking agent POSTs
+        self._agent_post_pending = None          # latest payload (protected by _agent_post_lock)
+        self._agent_post_lock = threading.Lock()
+        self._agent_post_event = threading.Event()
+        self._agent_post_stop = threading.Event()
+        self._agent_post_thread = threading.Thread(
+            target=self._agent_post_worker, daemon=True, name="AgentPostWorker")
+        self._agent_post_thread.start()
 
         # Debounced map update
         self._map_update_timer = QTimer()
@@ -1366,6 +1374,7 @@ class TCPConnectionViewer(QMainWindow):
                 data = flask_request.get_json(force=True)
                 hostname = data.get("hostname", "unknown")
                 ip_addresses = data.get("ip_addresses", [])
+                public_ip = data.get("public_ip", "")
                 loc_lat = data.get("lat")
                 loc_lng = data.get("lng")
                 conns = data.get("connections", [])
@@ -1373,6 +1382,7 @@ class TCPConnectionViewer(QMainWindow):
                     viewer._agent_cache[hostname] = {
                         "hostname": hostname,
                         "ip_addresses": ip_addresses,
+                        "public_ip": public_ip,
                         "lat": loc_lat,
                         "lng": loc_lng,
                         "connections": conns,
@@ -1420,6 +1430,15 @@ class TCPConnectionViewer(QMainWindow):
         try:
             public_ip = self.get_public_ip()
             if public_ip:
+                return self._get_local_geolocation_for_ip(public_ip)
+        except Exception:
+            pass
+        return None, None
+
+    def _get_local_geolocation_for_ip(self, public_ip):
+        """Return (lat, lng) for the given public IP, or (None, None)."""
+        try:
+            if public_ip:
                 import ipaddress
                 try:
                     ip_obj = ipaddress.ip_address(public_ip)
@@ -1438,37 +1457,76 @@ class TCPConnectionViewer(QMainWindow):
         return None, None
 
     def _agent_post_connections(self, connections):
-        """POST the local connection list to the configured server (agent mode).
-        Retries up to 2 times on transient failures with a short timeout."""
+        """Schedule a background POST of the local connection list to the server (agent mode).
+        The actual network I/O runs on a dedicated daemon thread to avoid blocking the UI.
+        Only the most recent payload is kept; if the worker is still busy with a previous
+        POST, the older payload is silently replaced."""
         global agent_server_address
         if not agent_server_address:
             return
-        url = agent_server_address.rstrip('/') + '/submit_connections'
-        lat, lng = self._get_local_geolocation()
+
+        import copy
         payload = {
             "hostname": LOCAL_HOSTNAME,
             "ip_addresses": self._get_local_ip_addresses(),
-            "lat": lat,
-            "lng": lng,
-            "connections": connections,
+            "connections": copy.deepcopy(connections),
         }
-        max_retries = 3  # 1 initial + 2 retries
-        for attempt in range(max_retries):
+        with self._agent_post_lock:
+            self._agent_post_pending = payload
+        # Wake the worker thread
+        self._agent_post_event.set()
+
+    def _agent_post_worker(self):
+        """Background daemon thread that sends the latest agent payload to the server.
+        Blocks on _agent_post_event until new data is available. Resolves the public IP
+        and geolocation here (off the UI thread) so those network calls never block Qt."""
+        while not self._agent_post_stop.is_set():
+            # Wait for new data or stop signal
+            self._agent_post_event.wait()
+            if self._agent_post_stop.is_set():
+                break
+            self._agent_post_event.clear()
+
+            # Grab the latest payload
+            with self._agent_post_lock:
+                payload = self._agent_post_pending
+                self._agent_post_pending = None
+            if payload is None:
+                continue
+
+            # Resolve public IP and geolocation on this background thread
             try:
-                resp = self._agent_http_session.post(url, json=payload, timeout=(3, 5))
-                if resp.status_code == 200:
-                    logging.debug(f"Agent POST successful ({len(connections)} conns)")
+                public_ip = self.get_public_ip() if do_resolve_public_ip else ""
+                lat, lng = self._get_local_geolocation_for_ip(public_ip) if public_ip else (None, None)
+                payload["public_ip"] = public_ip
+                payload["lat"] = lat
+                payload["lng"] = lng
+            except Exception:
+                payload.setdefault("public_ip", "")
+                payload.setdefault("lat", None)
+                payload.setdefault("lng", None)
+
+            url = agent_server_address.rstrip('/') + '/submit_connections'
+            max_retries = 3
+            for attempt in range(max_retries):
+                if self._agent_post_stop.is_set():
                     return
-                else:
-                    logging.warning(f"Agent POST returned {resp.status_code}: {resp.text[:200]}")
-            except requests.exceptions.ConnectionError as e:
-                logging.error(f"Agent POST connection error (attempt {attempt+1}/{max_retries}): {e}")
-            except requests.exceptions.Timeout:
-                logging.error(f"Agent POST timeout (attempt {attempt+1}/{max_retries})")
-            except Exception as e:
-                logging.error(f"Agent POST error (attempt {attempt+1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(0.5)
+                try:
+                    resp = self._agent_http_session.post(url, json=payload, timeout=(3, 5))
+                    if resp.status_code == 200:
+                        logging.debug(f"Agent POST successful ({len(payload.get('connections', []))} conns)")
+                        break
+                    else:
+                        logging.warning(f"Agent POST returned {resp.status_code}: {resp.text[:200]}")
+                except requests.exceptions.ConnectionError as e:
+                    logging.error(f"Agent POST connection error (attempt {attempt+1}/{max_retries}): {e}")
+                except requests.exceptions.Timeout:
+                    logging.error(f"Agent POST timeout (attempt {attempt+1}/{max_retries})")
+                except Exception as e:
+                    logging.error(f"Agent POST error (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    # Interruptible sleep so we can stop quickly
+                    self._agent_post_stop.wait(0.5)
 
     def closeEvent(self, event):
         """Save settings when closing the application"""
@@ -1476,6 +1534,13 @@ class TCPConnectionViewer(QMainWindow):
             if getattr(self, "dns_worker", None) is not None:
                 self.dns_worker.stop()
                 self.dns_worker.join(timeout=2.0)
+        except Exception:
+            pass
+
+        # Signal the agent POST background thread to stop
+        try:
+            self._agent_post_stop.set()
+            self._agent_post_event.set()  # wake it so it sees the stop flag
         except Exception:
             pass
 
@@ -3917,8 +3982,17 @@ class TCPConnectionViewer(QMainWindow):
         if enable_server_mode and position_timeline is None:
             agent_snapshot = self._collect_and_reset_agent_cache()
             for hostname, agent_data in agent_snapshot.items():
+                agent_origin_lat = agent_data.get('lat')
+                agent_origin_lng = agent_data.get('lng')
+                agent_public_ip = agent_data.get('public_ip', '')
                 for agent_conn in agent_data.get('connections', []):
                     agent_conn['hostname'] = hostname  # ensure hostname tag
+                    # Inject the agent's exit-point origin so the map can draw
+                    # per-agent circles and polylines from the correct origin.
+                    agent_conn['origin_lat'] = agent_origin_lat
+                    agent_conn['origin_lng'] = agent_origin_lng
+                    agent_conn['origin_hostname'] = hostname
+                    agent_conn['origin_public_ip'] = agent_public_ip
                     # Mark agent exit-point connections with orange icon
                     if agent_conn.get('icon') not in ('redIcon',):
                         agent_conn['icon'] = 'orangeIcon'
@@ -4209,6 +4283,39 @@ class TCPConnectionViewer(QMainWindow):
                         })
             except Exception:
                 pass
+
+        # Server mode: add orange circle entries for each connected agent's exit point
+        if enable_server_mode:
+            # Collect unique agent origins from the connection data
+            # Iterate over a snapshot to avoid modifying list during iteration
+            seen_agent_origins = set()
+            for conn in list(connection_data):
+                origin_hostname = conn.get('origin_hostname')
+                origin_lat = conn.get('origin_lat')
+                origin_lng = conn.get('origin_lng')
+                if origin_hostname and origin_lat is not None and origin_lng is not None:
+                    key = origin_hostname
+                    if key not in seen_agent_origins:
+                        seen_agent_origins.add(key)
+                        origin_ip = conn.get('origin_public_ip', '')
+                        agent_label = f"Agent: {origin_hostname}"
+                        if origin_ip:
+                            agent_label += f" ({origin_ip})"
+                        connection_data.append({
+                            'process': 'Agent Exit Point',
+                            'pid': '',
+                            'suspect': '',
+                            'local': '',
+                            'localport': '',
+                            'remote': agent_label,
+                            'remoteport': '',
+                            'name': origin_hostname,
+                            'ip_type': '',
+                            'lat': origin_lat,
+                            'lng': origin_lng,
+                            'icon': 'orangeCircle',
+                            'origin_hostname': origin_hostname,
+                        })
 
         data_json = json.dumps(connection_data)
         # Determine if we should draw lines from public IP to markers
@@ -4681,14 +4788,19 @@ class TCPConnectionViewer(QMainWindow):
                                         if (!conns || !Array.isArray(conns)) { return; }
 
                                         var publicIpCoords = null;
-                                        var otherMarkerCoords = [];
+                                        // Per-agent origin coordinates: { hostname: [lat, lng] }
+                                        var agentOriginCoords = {};
+                                        // Markers originating from server (no origin_hostname)
+                                        var serverMarkerCoords = [];
+                                        // Markers originating from agents: { hostname: [[lat,lng], ...] }
+                                        var agentMarkerCoords = {};
 
                                         conns.forEach(function(conn) {
                                             if (conn.lat && conn.lng) {
                                                 var iconName = conn.icon || 'greenIcon';
 
                                                 if (iconName === 'redCircle') {
-                                                    // Create a red circle for public IP - ON TOP OF ALL MARKERS
+                                                    // Create a red circle for server public IP - ON TOP OF ALL MARKERS
                                                     var circle = L.circle([conn.lat, conn.lng], {
                                                         color: 'red',
                                                         fillColor: '#f03',
@@ -4700,13 +4812,39 @@ class TCPConnectionViewer(QMainWindow):
                                                     var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
                                                     circle.bindTooltip(conn.remote || 'Public IP', tooltipOptions);
 
-                                                    var popupHtml = "<b>Public IP</b><br>" +
+                                                    var popupHtml = "<b>Server Public IP</b><br>" +
                                                                     "IP: " + (conn.remote || '') + "<br>";
                                                     circle.bindPopup(popupHtml);
                                                     liveMarkers.push(circle);
 
-                                                    // Save public IP coordinates for line drawing
+                                                    // Save server public IP coordinates for line drawing
                                                     publicIpCoords = [conn.lat, conn.lng];
+
+                                                } else if (iconName === 'orangeCircle') {
+                                                    // Create an orange circle for agent exit point
+                                                    var agentCircle = L.circle([conn.lat, conn.lng], {
+                                                        color: 'orange',
+                                                        fillColor: '#ff8c00',
+                                                        fillOpacity: 0.5,
+                                                        radius: 80000,
+                                                        pane: 'publicIpPane'
+                                                    }).addTo(map);
+
+                                                    var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
+                                                    agentCircle.bindTooltip(conn.remote || 'Agent', tooltipOptions);
+
+                                                    var popupHtml = "<b>Agent Exit Point</b><br>" +
+                                                                    (conn.remote || '') + "<br>" +
+                                                                    "Hostname: " + (conn.name || '') + "<br>";
+                                                    agentCircle.bindPopup(popupHtml);
+                                                    liveMarkers.push(agentCircle);
+
+                                                    // Track agent origin coordinates for line drawing
+                                                    var agentHostname = conn.origin_hostname || conn.name || '';
+                                                    if (agentHostname) {
+                                                        agentOriginCoords[agentHostname] = [conn.lat, conn.lng];
+                                                    }
+
                                                 } else {
                                                     // Regular marker
                                                     var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
@@ -4718,8 +4856,11 @@ class TCPConnectionViewer(QMainWindow):
                                                     var marker = L.marker([conn.lat, conn.lng], markerOptions).addTo(map);
                                                     var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
 
-                                                    // Include protocol in tooltip
+                                                    // Include protocol and hostname in tooltip for agent connections
                                                     var tooltipText = (conn.process || '') + ' [' + (conn.protocol || 'TCP') + ']';
+                                                    if (conn.origin_hostname) {
+                                                        tooltipText += ' @' + conn.origin_hostname;
+                                                    }
                                                     marker.bindTooltip(tooltipText, tooltipOptions);
 
                                                     var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
@@ -4727,7 +4868,8 @@ class TCPConnectionViewer(QMainWindow):
                                                                     "PID: " + (conn.pid || '') + "<br>" +
                                                                     "Remote: " + (conn.remote || '') + "<br>" +
                                                                     "Local: " + (conn.local || '') + "<br>" +
-                                                                    (conn.name ? "Name: " + conn.name + "<br>" : "");
+                                                                    (conn.name ? "Name: " + conn.name + "<br>" : "") +
+                                                                    (conn.origin_hostname ? "Source: " + conn.origin_hostname + "<br>" : "");
                                                     marker.bindPopup(popupHtml, {autoClose: false, closeOnClick: false});
 
                                                     // Add click handler to select corresponding table row in Python.
@@ -4782,23 +4924,69 @@ class TCPConnectionViewer(QMainWindow):
 
                                                     liveMarkers.push(marker);
 
-                                                    // Save marker coordinates for line drawing
-                                                    otherMarkerCoords.push([conn.lat, conn.lng]);
+                                                    // Classify marker for line drawing based on origin
+                                                    var connOrigin = conn.origin_hostname || '';
+                                                    if (connOrigin) {
+                                                        // Agent connection — group under its agent origin
+                                                        if (!agentMarkerCoords[connOrigin]) {
+                                                            agentMarkerCoords[connOrigin] = [];
+                                                        }
+                                                        agentMarkerCoords[connOrigin].push([conn.lat, conn.lng]);
+                                                    } else {
+                                                        // Server (local) connection
+                                                        serverMarkerCoords.push([conn.lat, conn.lng]);
+                                                    }
                                                 }
                                             }
                                         });
 
-                                        // Draw blue lines from public IP to all other markers if enabled
-                                        if (drawLines && publicIpCoords && otherMarkerCoords.length > 0) {
-                                            otherMarkerCoords.forEach(function(markerCoords) {
-                                                var polyline = L.polyline([publicIpCoords, markerCoords], {
-                                                    color: 'blue',
-                                                    weight: 2,
-                                                    opacity: 0.6,
-                                                    dashArray: '5, 10'
-                                                }).addTo(map);
-                                                liveMarkers.push(polyline);
+                                        // Draw lines if enabled
+                                        if (drawLines) {
+                                            // Draw blue dashed lines from server public IP to server connections
+                                            if (publicIpCoords && serverMarkerCoords.length > 0) {
+                                                serverMarkerCoords.forEach(function(markerCoords) {
+                                                    var polyline = L.polyline([publicIpCoords, markerCoords], {
+                                                        color: 'blue',
+                                                        weight: 2,
+                                                        opacity: 0.6,
+                                                        dashArray: '5, 10'
+                                                    }).addTo(map);
+                                                    liveMarkers.push(polyline);
+                                                });
+                                            }
+
+                                            // Draw orange dashed lines from each agent's exit point to its connections
+                                            Object.keys(agentOriginCoords).forEach(function(hostname) {
+                                                var originCoords = agentOriginCoords[hostname];
+                                                var markers = agentMarkerCoords[hostname] || [];
+                                                markers.forEach(function(markerCoords) {
+                                                    var polyline = L.polyline([originCoords, markerCoords], {
+                                                        color: 'orange',
+                                                        weight: 2,
+                                                        opacity: 0.6,
+                                                        dashArray: '5, 10'
+                                                    }).addTo(map);
+                                                    liveMarkers.push(polyline);
+                                                });
                                             });
+
+                                            // For agent connections whose origin has no geolocation,
+                                            // fall back to drawing from server public IP if available
+                                            if (publicIpCoords) {
+                                                Object.keys(agentMarkerCoords).forEach(function(hostname) {
+                                                    if (!agentOriginCoords[hostname]) {
+                                                        agentMarkerCoords[hostname].forEach(function(markerCoords) {
+                                                            var polyline = L.polyline([publicIpCoords, markerCoords], {
+                                                                color: 'gray',
+                                                                weight: 1,
+                                                                opacity: 0.4,
+                                                                dashArray: '3, 8'
+                                                            }).addTo(map);
+                                                            liveMarkers.push(polyline);
+                                                        });
+                                                    }
+                                                });
+                                            }
                                         }
                                     }
 
