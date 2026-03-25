@@ -88,7 +88,7 @@ logging.basicConfig(
 )
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QTableWidget, QTableWidgetItem, QLabel,
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit) 
+                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox)
 from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint, QSize
 from PySide6.QtWidgets import QStyle
@@ -96,7 +96,9 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-VERSION = "3.2.3" # Current script version
+from connection_collector_plugin import ConnectionCollectorPlugin
+
+VERSION = "3.2.4" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -202,8 +204,10 @@ USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 # Server / Agent mode globals
 enable_server_mode = False  # When True the app runs a Flask endpoint to collect agent data
 enable_agent_mode = False   # When True the app periodically POSTs its connections to a server
-agent_server_address = ""   # Server URL used in agent mode (e.g. "http://192.168.1.10:5000")
-FLASK_LISTEN_PORT = 5000    # Port the Flask server listens on in server mode
+agent_server_host = ""      # Hostname/IP of the server in agent mode (no scheme, no port)
+agent_no_ui = False         # When True in agent mode the window is never shown (headless agent)
+FLASK_SERVER_PORT = 5000    # Port the Flask server listens on (server mode)
+FLASK_AGENT_PORT = 5000     # Port the agent POSTs to (agent mode)
 LOCAL_HOSTNAME = platform.node() or socket.gethostname()  # This machine's hostname
 
 # Parse --enable_server_mode and --enable_agent_mode from command line
@@ -216,7 +220,20 @@ for _i, _a in enumerate(sys.argv):
         break
 if _agent_idx is not None:
     enable_agent_mode = True
-    agent_server_address = sys.argv[_agent_idx + 1]
+    # Accept either a bare hostname ("myserver") or a legacy full URL
+    # ("http://myserver:5000") for backward-compatibility
+    _raw = sys.argv[_agent_idx + 1]
+    if _raw.startswith("http://") or _raw.startswith("https://"):
+        import urllib.parse as _urlparse
+        _parsed = _urlparse.urlparse(_raw)
+        agent_server_host = _parsed.hostname or ""
+        if _parsed.port:
+            FLASK_AGENT_PORT = _parsed.port
+    else:
+        agent_server_host = _raw
+# --no_ui: run as a headless background agent (no window shown, no taskbar button)
+if "--no_ui" in sys.argv:
+    agent_no_ui = True
 # Mutual exclusion: agent takes precedence if both are set
 if enable_server_mode and enable_agent_mode:
     enable_server_mode = False
@@ -538,6 +555,205 @@ class TileRequestInterceptor(QWebEngineUrlRequestInterceptor):
             info.setHttpHeader(b'Referer', b'https://www.openstreetmap.org/')
 
 
+# ---------------------------------------------------------------------------
+# Built-in connection collector plugin (psutil + netstat)
+# ---------------------------------------------------------------------------
+
+class PsutilCollector(ConnectionCollectorPlugin):
+    """Default collector — enumerates live TCP/UDP connections via psutil."""
+
+    @property
+    def name(self) -> str:
+        return "psutil (live connections)"
+
+    @property
+    def description(self) -> str:
+        return "Enumerate live TCP (ESTABLISHED) and UDP connections using psutil. On Windows, supplements UDP with netstat."
+
+    def collect_raw_connections(self) -> list:
+        """Return a list of raw connection dicts from psutil.
+
+        Each dict contains: process, pid, protocol, local, localport,
+        remote, remoteport, ip_type, hostname.
+        """
+        raw = []
+
+        # Get all connections once (both TCP and UDP)
+        all_connections = psutil.net_connections(kind='inet')
+
+        # On Windows, psutil's GetExtendedUdpTable does not report remote
+        # addresses for connected UDP sockets — supplement with netstat.
+        udp_remote_lookup = {}
+        if platform.system() == "Windows":
+            try:
+                udp_remote_lookup = PsutilCollector._parse_netstat_udp_static()
+            except Exception:
+                pass
+
+        for conn in all_connections:
+            is_tcp = (conn.type == socket.SOCK_STREAM)
+            is_udp = (conn.type == socket.SOCK_DGRAM)
+            protocol = "TCP" if is_tcp else ("UDP" if is_udp else "Unknown")
+
+            # For TCP, only ESTABLISHED; for UDP, all
+            if is_tcp and conn.status != psutil.CONN_ESTABLISHED:
+                continue
+
+            try:
+                pid = conn.pid
+
+                # Resolve process name (with cache)
+                if pid:
+                    with process_cache_lock:
+                        if pid in process_cache:
+                            process_name = process_cache[pid]
+                        else:
+                            try:
+                                p = psutil.Process(pid)
+                                process_name = p.name()
+                                process_cache[pid] = process_name
+                            except Exception:
+                                process_name = "Unknown"
+                else:
+                    process_name = "Unknown"
+
+                laddr = getattr(conn, "laddr", None)
+                raddr = getattr(conn, "raddr", None)
+
+                local_addr = f"{laddr.ip}" if laddr else ""
+                local_port = str(getattr(laddr, "port", "")) if laddr else ""
+
+                # Determine if we have a real remote address
+                has_real_raddr = False
+                if raddr:
+                    raddr_ip = getattr(raddr, "ip", None)
+                    raddr_port = getattr(raddr, "port", None)
+                    if raddr_ip and raddr_ip not in ("0.0.0.0", "::", "*", "") and raddr_port:
+                        has_real_raddr = True
+
+                if has_real_raddr:
+                    remote_addr = f"{raddr.ip}"
+                    remote_port = str(raddr.port)
+                else:
+                    if is_udp and udp_remote_lookup:
+                        pid_str = str(pid) if pid else ""
+                        ns_remote = udp_remote_lookup.get((local_addr, local_port, pid_str))
+                        if ns_remote:
+                            remote_addr, remote_port = ns_remote
+                        else:
+                            remote_addr = "*"
+                            remote_port = "*"
+                    elif is_udp:
+                        remote_addr = "*"
+                        remote_port = "*"
+                    else:
+                        remote_addr = ""
+                        remote_port = ""
+
+                # Determine IP type
+                family = getattr(conn, "family", None)
+                ip_type = "IPv4" if family == socket.AF_INET else ("IPv6" if family == socket.AF_INET6 else "")
+
+                raw.append({
+                    'process': process_name,
+                    'pid': str(pid) if pid else "",
+                    'protocol': protocol,
+                    'local': local_addr,
+                    'localport': local_port,
+                    'remote': remote_addr,
+                    'remoteport': remote_port,
+                    'ip_type': ip_type,
+                    'hostname': LOCAL_HOSTNAME,
+                })
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception:
+                continue
+
+        return raw
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_netstat_udp_static():
+        """Parse ``netstat -ano`` for UDP remote addresses (Windows only).
+
+        Returns dict: (local_ip, local_port, pid) -> (remote_ip, remote_port)
+        """
+        lookup = {}
+        try:
+            output = subprocess.check_output(
+                ['netstat', '-ano'], timeout=10,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            ).decode('utf-8', errors='replace')
+            for line in output.splitlines():
+                line = line.strip()
+                if not line.startswith('UDP'):
+                    continue
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                local_part = parts[1]
+                remote_part = parts[2]
+                pid_str = parts[3]
+                if remote_part in ('*:*', '0.0.0.0:0', '[::]:0'):
+                    continue
+                # Split local and remote into ip:port
+                if ']:' in local_part:
+                    l_ip = local_part.rsplit(':', 1)[0].strip('[]')
+                    l_port = local_part.rsplit(':', 1)[1]
+                else:
+                    l_ip, l_port = local_part.rsplit(':', 1)
+                if ']:' in remote_part:
+                    r_ip = remote_part.rsplit(':', 1)[0].strip('[]')
+                    r_port = remote_part.rsplit(':', 1)[1]
+                else:
+                    r_ip, r_port = remote_part.rsplit(':', 1)
+                lookup[(l_ip, l_port, pid_str)] = (r_ip, r_port)
+        except Exception:
+            pass
+        return lookup
+
+
+# ---------------------------------------------------------------------------
+# Plugin discovery
+# ---------------------------------------------------------------------------
+
+def _discover_collector_plugins():
+    """Scan the ``plugins/`` directory for ConnectionCollectorPlugin subclasses.
+
+    Returns a list of *instances* (built-in PsutilCollector is always first).
+    """
+    import importlib, importlib.util, inspect
+
+    collectors = [PsutilCollector()]
+
+    plugins_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plugins')
+    if not os.path.isdir(plugins_dir):
+        return collectors
+
+    for fname in sorted(os.listdir(plugins_dir)):
+        if not fname.endswith('.py') or fname.startswith('_'):
+            continue
+        filepath = os.path.join(plugins_dir, fname)
+        module_name = f"plugins.{fname[:-3]}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, filepath)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            for _attr_name in dir(mod):
+                obj = getattr(mod, _attr_name)
+                if (inspect.isclass(obj)
+                        and issubclass(obj, ConnectionCollectorPlugin)
+                        and obj is not ConnectionCollectorPlugin
+                        and obj is not PsutilCollector):
+                    collectors.append(obj())
+        except Exception as e:
+            logging.warning(f"Failed to load plugin {fname}: {e}")
+
+    return collectors
+
+
 class TCPConnectionViewer(QMainWindow):
     # Colors available for agent assignment (round-robin).
     # Excluded colors (reserved by the local-host UI):
@@ -590,6 +806,7 @@ class TCPConnectionViewer(QMainWindow):
         self._agent_cache_lock = threading.Lock()
         self._last_agent_count = 0      # number of agents collected in last cycle
         self._flask_thread = None       # daemon thread running Flask
+        self._werkzeug_server = None    # werkzeug BaseServer instance (stoppable)
         # Per-agent color assignment: hostname -> color name (e.g. 'violet')
         # Colors are drawn round-robin from the agent palette (excludes colors
         # reserved for the UI: green=local, red=suspect, blue=new, yellow=pinned).
@@ -643,6 +860,10 @@ class TCPConnectionViewer(QMainWindow):
         # Initialize thread pool for async operations (video generation, etc.)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(2)  # Limit concurrent background tasks
+
+        # --- Connection collector plugin system ---
+        self._collector_plugins = _discover_collector_plugins()
+        self._active_collector = self._collector_plugins[0]  # default: PsutilCollector
 
         # Set up QWebChannel for JavaScript-to-Python communication (map marker clicks)
         self.map_bridge = MapBridge(self)
@@ -955,8 +1176,12 @@ class TCPConnectionViewer(QMainWindow):
             pass
 
         try:
-            # Detect window state changes (fullscreen toggle, maximize, etc.)
             if event.type() == event.WindowStateChange:
+                # In no-UI agent mode keep the window permanently hidden —
+                # immediately re-hide it if anything tried to show it.
+                if agent_no_ui and enable_agent_mode:
+                    QTimer.singleShot(0, self.hide)
+                    return
                 # Schedule a delayed layout update to ensure proper rendering
                 # This fixes the map overlapping issue when entering fullscreen via double-click
                 QTimer.singleShot(100, self._update_layout_after_state_change)
@@ -1072,7 +1297,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1090,8 +1315,12 @@ class TCPConnectionViewer(QMainWindow):
             'summary_table_column_sort_reverse': summary_table_column_sort_reverse,
             'enable_server_mode': enable_server_mode,
             'enable_agent_mode': enable_agent_mode,
-            'agent_server_address': agent_server_address,
+            'agent_server_host': agent_server_host,
+            'flask_server_port': FLASK_SERVER_PORT,
+            'flask_agent_port': FLASK_AGENT_PORT,
+            'agent_no_ui': agent_no_ui,
             'agent_colors': dict(self._agent_colors),
+            'active_collector_plugin': self._active_collector.name,
         }
 
         # Save current map position and zoom
@@ -1183,20 +1412,48 @@ class TCPConnectionViewer(QMainWindow):
                 summary_table_column_sort_reverse = settings.get('summary_table_column_sort_reverse', summary_table_column_sort_reverse)
 
                 # Restore server/agent mode settings (CLI args take precedence)
-                global enable_server_mode, enable_agent_mode, agent_server_address
+                global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT
+                # Only restore no_ui from settings if --no_ui was not passed on CLI
+                if not agent_no_ui:
+                    agent_no_ui = bool(settings.get('agent_no_ui', False))
+
+                def _valid_port(val, default):
+                    try:
+                        p = int(val)
+                        return p if 1 <= p <= 65535 else default
+                    except (TypeError, ValueError):
+                        return default
+
+                # Restore server port (always, regardless of current mode)
+                FLASK_SERVER_PORT = _valid_port(
+                    settings.get('flask_server_port',
+                                 settings.get('flask_listen_port', FLASK_SERVER_PORT)),
+                    FLASK_SERVER_PORT)
+                # Restore agent port (always)
+                FLASK_AGENT_PORT = _valid_port(
+                    settings.get('flask_agent_port',
+                                 settings.get('flask_listen_port', FLASK_AGENT_PORT)),
+                    FLASK_AGENT_PORT)
+
                 if not enable_server_mode and not enable_agent_mode:
-                    # Only apply persisted settings when CLI didn't override
+                    # Only apply persisted mode settings when CLI didn't override
                     saved_server = settings.get('enable_server_mode', False)
                     saved_agent = settings.get('enable_agent_mode', False)
-                    saved_addr = settings.get('agent_server_address', '')
+                    # Support legacy key 'agent_server_address' for old settings files
+                    saved_host = settings.get('agent_server_host', '')
+                    if not saved_host:
+                        legacy = settings.get('agent_server_address', '')
+                        if legacy.startswith('http://') or legacy.startswith('https://'):
+                            import urllib.parse as _up
+                            _p = _up.urlparse(legacy)
+                            saved_host = _p.hostname or ''
+                        else:
+                            saved_host = legacy
                     if saved_server and not saved_agent:
                         enable_server_mode = True
                     elif saved_agent and not saved_server:
                         enable_agent_mode = True
-                        agent_server_address = saved_addr
-                         # If both were somehow True in settings, ignore (mutual exclusion)
-                        if not enable_agent_mode:
-                            agent_server_address = saved_addr
+                        agent_server_host = saved_host
 
                     # Restore per-agent color assignments
                     saved_colors = settings.get('agent_colors', {})
@@ -1210,6 +1467,14 @@ class TCPConnectionViewer(QMainWindow):
                         if _color not in used_colors:
                             break
                         self._agent_color_index += 1
+
+                    # Restore active connection collector plugin
+                    saved_collector = settings.get('active_collector_plugin', '')
+                    if saved_collector:
+                        for i, plugin in enumerate(self._collector_plugins):
+                            if plugin.name == saved_collector:
+                                self._active_collector = plugin
+                                break
 
                     # Restore map position and zoom (CRITICAL: do this BEFORE init_ui/update_map)
                 try:
@@ -1339,11 +1604,25 @@ class TCPConnectionViewer(QMainWindow):
                 if hasattr(self, 'agent_mode_check'):
                     self.agent_mode_check.setChecked(enable_agent_mode)
                 if hasattr(self, 'agent_server_input'):
-                    self.agent_server_input.setText(agent_server_address)
+                    self.agent_server_input.setText(agent_server_host)
+                if hasattr(self, 'flask_server_port_input'):
+                    self.flask_server_port_input.setText(str(FLASK_SERVER_PORT))
+                if hasattr(self, 'flask_agent_port_input'):
+                    self.flask_agent_port_input.setText(str(FLASK_AGENT_PORT))
+                if hasattr(self, 'no_ui_check'):
+                    self.no_ui_check.setChecked(agent_no_ui)
+                    self.no_ui_check.setEnabled(enable_agent_mode)
 
                 # Populate Agent Management table if server mode is active and agents were saved
                 if enable_server_mode and self._agent_colors:
                     self._refresh_agent_management_table()
+
+                # Restore active collector plugin in combo box
+                if hasattr(self, '_collector_combo'):
+                    for i in range(self._collector_combo.count()):
+                        if self._collector_combo.itemText(i) == self._active_collector.name:
+                            self._collector_combo.setCurrentIndex(i)
+                            break
 
         except Exception as e:
             logging.error(f"Error applying settings to UI: {e}")
@@ -1461,32 +1740,192 @@ class TCPConnectionViewer(QMainWindow):
 
     @Slot(int)
     def _on_agent_mode_changed(self, state):
-        global enable_agent_mode, enable_server_mode, agent_server_address
+        global enable_agent_mode, enable_server_mode, agent_server_host
         enabled = bool(state)
         if enabled:
             enable_agent_mode = True
             enable_server_mode = False
-            agent_server_address = self.agent_server_input.text().strip()
+            agent_server_host = self.agent_server_input.text().strip()
             if hasattr(self, 'server_mode_check'):
                 self.server_mode_check.blockSignals(True)
                 self.server_mode_check.setChecked(False)
                 self.server_mode_check.blockSignals(False)
         else:
             enable_agent_mode = False
-        logging.info(f"Agent mode {'enabled' if enable_agent_mode else 'disabled'} -> {agent_server_address}")
+        # no_ui only makes sense when agent mode is on
+        if hasattr(self, 'no_ui_check'):
+            self.no_ui_check.setEnabled(enable_agent_mode)
+        logging.info(f"Agent mode {'enabled' if enable_agent_mode else 'disabled'} -> {agent_server_host}:{FLASK_AGENT_PORT}")
+
+    @Slot(int)
+    @Slot(int)
+    def _on_collector_changed(self, index):
+        """Switch the active connection collector plugin."""
+        if 0 <= index < len(self._collector_plugins):
+            # Stop the previous collector if it has a stop() method (e.g. live sniffer)
+            prev = self._active_collector
+            if hasattr(prev, 'stop') and callable(prev.stop):
+                try:
+                    prev.stop()
+                except Exception:
+                    pass
+            self._active_collector = self._collector_plugins[index]
+            logging.info(f"Connection collector changed to: {self._active_collector.name}")
+            self.save_settings()
+
+    def _on_no_ui_changed(self, state):
+        global agent_no_ui
+        agent_no_ui = bool(state)
+        self.save_settings()
+        logging.info(f"No-UI mode {'enabled' if agent_no_ui else 'disabled'} (takes effect on next launch)")
 
     @Slot()
     def _on_agent_server_address_changed(self):
-        global agent_server_address
-        agent_server_address = self.agent_server_input.text().strip()
+        global agent_server_host
+        host = self.agent_server_input.text().strip()
+        agent_server_host = host
+        self.save_settings()
+        if host:
+            self._trigger_agent_connectivity_check()
+
+    @Slot()
+    def _on_flask_server_port_changed(self):
+        global FLASK_SERVER_PORT
+        previous_port = FLASK_SERVER_PORT
+        raw = self.flask_server_port_input.text().strip()
+        try:
+            port = int(raw)
+            if 1024 <= port <= 65535:
+                FLASK_SERVER_PORT = port
+                self.flask_server_port_input.setStyleSheet("")
+            else:
+                raise ValueError
+        except (ValueError, AttributeError):
+            FLASK_SERVER_PORT = previous_port
+            self.flask_server_port_input.setText(str(previous_port))
+            self.flask_server_port_input.setStyleSheet("border: 1px solid red;")
+            return
+
+        if not enable_server_mode:
+            # Server not running — just persist the new value
+            self.save_settings()
+            logging.info(f"Flask server port set to {FLASK_SERVER_PORT} (server not running)")
+            return
+
+        # Server is running — restart it on the new port
+        self._restart_flask_server(previous_port)
+
+    @Slot()
+    def _on_flask_agent_port_changed(self):
+        global FLASK_AGENT_PORT
+        raw = self.flask_agent_port_input.text().strip()
+        try:
+            port = int(raw)
+            if 1024 <= port <= 65535:
+                FLASK_AGENT_PORT = port
+                self.flask_agent_port_input.setStyleSheet("")
+            else:
+                raise ValueError
+        except (ValueError, AttributeError):
+            FLASK_AGENT_PORT = 5000
+            self.flask_agent_port_input.setText("5000")
+            self.flask_agent_port_input.setStyleSheet("border: 1px solid red;")
+        self.save_settings()
+        logging.info(f"Flask agent port set to {FLASK_AGENT_PORT}")
+        if agent_server_host:
+            self._trigger_agent_connectivity_check()
+
+    # ── Agent connectivity check ─────────────────────────────────────────────
+
+    def _trigger_agent_connectivity_check(self):
+        """Fire an async HTTP reachability check against the configured server.
+        Updates self.agent_conn_status_label with the result on the main thread."""
+        if not hasattr(self, 'agent_conn_status_label'):
+            return
+        host = agent_server_host.strip()
+        port = FLASK_AGENT_PORT
+        if not host:
+            self.agent_conn_status_label.setText("")
+            return
+        self.agent_conn_status_label.setText("⏳ Checking…")
+        self.agent_conn_status_label.setStyleSheet("color: grey;")
+
+        viewer = self
+
+        class _ConnCheckWorker(QRunnable):
+            def run(self):
+                url = f"http://{host}:{port}/submit_connections"
+                try:
+                    resp = requests.get(
+                        f"http://{host}:{port}/",
+                        timeout=4,
+                        allow_redirects=False
+                    )
+                    # Any HTTP response means the server is reachable
+                    QTimer.singleShot(0, lambda: viewer._on_conn_check_success())
+                except requests.exceptions.ConnectionError:
+                    msg = f"Connection refused — is the server running on {host}:{port}?"
+                    QTimer.singleShot(0, lambda m=msg: viewer._on_conn_check_failure(m))
+                except requests.exceptions.Timeout:
+                    msg = f"Connection timed out reaching {host}:{port}."
+                    QTimer.singleShot(0, lambda m=msg: viewer._on_conn_check_failure(m))
+                except Exception as exc:
+                    msg = str(exc)
+                    QTimer.singleShot(0, lambda m=msg: viewer._on_conn_check_failure(m))
+
+        self.thread_pool.start(_ConnCheckWorker())
+
+    @Slot()
+    def _on_conn_check_success(self):
+        if not hasattr(self, 'agent_conn_status_label'):
+            return
+        self.agent_conn_status_label.setText("✔ Reachable")
+        self.agent_conn_status_label.setStyleSheet("color: green; font-weight: bold;")
+
+    @Slot(str)
+    def _on_conn_check_failure(self, error_msg: str):
+        if not hasattr(self, 'agent_conn_status_label'):
+            return
+        self.agent_conn_status_label.setText("✖ Unreachable")
+        self.agent_conn_status_label.setStyleSheet("color: red; font-weight: bold;")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Connection check failed")
+        dlg.setMinimumWidth(400)
+        layout = QVBoxLayout(dlg)
+
+        icon_row = QHBoxLayout()
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(
+            self.style().standardPixmap(QStyle.SP_MessageBoxWarning).scaled(32, 32)
+        )
+        icon_row.addWidget(icon_lbl)
+        msg_lbl = QLabel(f"<b>Could not reach the server.</b><br><br>{error_msg}")
+        msg_lbl.setWordWrap(True)
+        icon_row.addWidget(msg_lbl, 1)
+        layout.addLayout(icon_row)
+
+        btns = QDialogButtonBox()
+        retry_btn = btns.addButton("Retry", QDialogButtonBox.AcceptRole)
+        btns.addButton("Cancel", QDialogButtonBox.RejectRole)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() == QDialog.Accepted:
+            self._trigger_agent_connectivity_check()
 
     def _start_flask_server(self):
-        """Start the Flask HTTP server in a background daemon thread."""
-        if self._flask_thread is not None and self._flask_thread.is_alive():
-            logging.info("Flask server already running")
-            return
+        """Start the Flask HTTP server in a background daemon thread.
+
+        Uses werkzeug.serving.make_server() instead of app.run() so we hold a
+        reference to the WSGI server object and can call .shutdown() later.
+        A port-availability pre-check is done on the calling (UI) thread so
+        that binding errors are reported immediately with a friendly message.
+        """
         try:
             from flask import Flask, request as flask_request, jsonify
+            from werkzeug.serving import make_server as werkzeug_make_server
         except ImportError:
             logging.error("Flask is not installed. Install it with: pip install flask")
             try:
@@ -1494,6 +1933,13 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
             return
+
+        # --- Pre-check: is the port available? -----------------------------------
+        port_error = self._check_port_available(FLASK_SERVER_PORT)
+        if port_error:
+            self._show_flask_port_error(port_error, FLASK_SERVER_PORT)
+            return
+        # -------------------------------------------------------------------------
 
         app = Flask(__name__)
         viewer = self  # capture reference for the route closure
@@ -1522,15 +1968,110 @@ class TCPConnectionViewer(QMainWindow):
                 logging.error(f"Error processing /submit_connections: {e}")
                 return jsonify({"status": "error", "message": str(e)}), 400
 
+        try:
+            srv = werkzeug_make_server("0.0.0.0", FLASK_SERVER_PORT, app)
+        except OSError as e:
+            self._show_flask_port_error(str(e), FLASK_SERVER_PORT)
+            return
+
+        self._werkzeug_server = srv
+
         def _run():
-            # Suppress Flask/Werkzeug request logging to keep console clean
             wlog = logging.getLogger('werkzeug')
             wlog.setLevel(logging.ERROR)
-            app.run(host="0.0.0.0", port=FLASK_LISTEN_PORT, threaded=True, use_reloader=False)
+            srv.serve_forever()
 
         self._flask_thread = threading.Thread(target=_run, daemon=True, name="FlaskServer")
         self._flask_thread.start()
-        logging.info(f"Flask server started on port {FLASK_LISTEN_PORT}")
+        logging.info(f"Flask server started on port {FLASK_SERVER_PORT}")
+
+    @staticmethod
+    def _check_port_available(port: int) -> str:
+        """Return an empty string if *port* is free on 0.0.0.0, else a human-readable error."""
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.bind(("0.0.0.0", port))
+            probe.close()
+            return ""
+        except OSError as e:
+            # errno 98  = EADDRINUSE  (Linux)
+            # errno 10048 = WSAEADDRINUSE (Windows)
+            if e.errno in (98, 10048):
+                return f"Port {port} is already in use by another process."
+            return f"Cannot bind to port {port}: {e.strerror} (error {e.errno})."
+
+    def _show_flask_port_error(self, error_msg: str, failed_port: int):
+        """Show a friendly error dialog and revert flask_server_port_input to the previous value."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Server port error")
+        dlg.setMinimumWidth(420)
+        layout = QVBoxLayout(dlg)
+
+        icon_row = QHBoxLayout()
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(
+            self.style().standardPixmap(QStyle.SP_MessageBoxCritical).scaled(32, 32)
+        )
+        icon_row.addWidget(icon_lbl)
+        detail = (
+            f"<b>Could not start the server on port {failed_port}.</b><br><br>"
+            f"{error_msg}<br><br>"
+            f"The port has been reverted to the previous value."
+        )
+        msg_lbl = QLabel(detail)
+        msg_lbl.setWordWrap(True)
+        icon_row.addWidget(msg_lbl, 1)
+        layout.addLayout(icon_row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok)
+        btns.accepted.connect(dlg.accept)
+        layout.addWidget(btns)
+        dlg.exec()
+
+    def _restart_flask_server(self, previous_port: int):
+        """Stop the running Werkzeug server and restart on FLASK_SERVER_PORT.
+
+        Shuts down the current server first, then probes the new port to catch
+        conflicts with *other* processes before attempting to bind.
+        If the new port is unavailable FLASK_SERVER_PORT is reverted to
+        *previous_port* and the server is restarted on that port instead.
+        """
+        global FLASK_SERVER_PORT
+
+        # --- Stop the current server first ---------------------------------------
+        srv = getattr(self, '_werkzeug_server', None)
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception as e:
+                logging.warning(f"Error shutting down Flask server: {e}")
+            self._werkzeug_server = None
+
+        if self._flask_thread is not None:
+            self._flask_thread.join(timeout=3)
+            self._flask_thread = None
+        # -------------------------------------------------------------------------
+
+        # Now that our port is released, probe for external conflicts
+        port_error = self._check_port_available(FLASK_SERVER_PORT)
+        if port_error:
+            # Revert to previous port
+            FLASK_SERVER_PORT = previous_port
+            if hasattr(self, 'flask_server_port_input'):
+                self.flask_server_port_input.setText(str(previous_port))
+                self.flask_server_port_input.setStyleSheet("border: 1px solid orange;")
+            self._show_flask_port_error(port_error, FLASK_SERVER_PORT)
+            if hasattr(self, 'flask_server_port_input'):
+                self.flask_server_port_input.setStyleSheet("")
+            # Restart on the reverted (previous) port
+            self._start_flask_server()
+            self.save_settings()
+            return
+
+        # Start on new port
+        self._start_flask_server()
+        self.save_settings()
+        logging.info(f"Flask server restarted on port {FLASK_SERVER_PORT}")
 
     def _collect_and_reset_agent_cache(self):
         """Return a snapshot of the agent cache without clearing it.
@@ -1603,8 +2144,8 @@ class TCPConnectionViewer(QMainWindow):
         The actual network I/O runs on a dedicated daemon thread to avoid blocking the UI.
         Only the most recent payload is kept; if the worker is still busy with a previous
         POST, the older payload is silently replaced."""
-        global agent_server_address
-        if not agent_server_address:
+        global agent_server_host
+        if not agent_server_host:
             return
 
         import copy
@@ -1648,7 +2189,7 @@ class TCPConnectionViewer(QMainWindow):
                 payload.setdefault("lat", None)
                 payload.setdefault("lng", None)
 
-            url = agent_server_address.rstrip('/') + '/submit_connections'
+            url = f"http://{agent_server_host}:{FLASK_AGENT_PORT}/submit_connections"
             max_retries = 3
             for attempt in range(max_retries):
                 if self._agent_post_stop.is_set():
@@ -1683,6 +2224,13 @@ class TCPConnectionViewer(QMainWindow):
         try:
             self._agent_post_stop.set()
             self._agent_post_event.set()  # wake it so it sees the stop flag
+        except Exception:
+            pass
+
+        # Stop the active collector plugin if it has a running background task
+        try:
+            if hasattr(self._active_collector, 'stop') and callable(self._active_collector.stop):
+                self._active_collector.stop()
         except Exception:
             pass
 
@@ -2249,6 +2797,41 @@ class TCPConnectionViewer(QMainWindow):
         try:
             if hasattr(self, 'connections') and self.connections is not None:
                 self._update_map_with_filter()
+        except Exception:
+            pass
+
+    def _sync_summary_filter_widths(self):
+        """Resize summary filter bar inputs to match the current summary table column widths."""
+        try:
+            vh_width = self.summary_table.verticalHeader().width()
+            self._summary_filter_vheader_spacer.setFixedWidth(vh_width)
+            total_width = vh_width
+            for i, le in enumerate(self._summary_filter_inputs):
+                col_width = self.summary_table.columnWidth(i)
+                le.setFixedWidth(col_width)
+                total_width += col_width
+            self._summary_filter_inner.setFixedWidth(total_width)
+        except Exception:
+            pass
+
+    @Slot()
+    def apply_summary_table_filter(self):
+        """Show/hide summary table rows based on the active per-column filter inputs."""
+        try:
+            filters = [le.text().strip().lower() for le in self._summary_filter_inputs]
+            has_filter = any(filters)
+            for row in range(self.summary_table.rowCount()):
+                if not has_filter:
+                    self.summary_table.setRowHidden(row, False)
+                    continue
+                visible = True
+                for col, f in enumerate(filters):
+                    if f:
+                        item = self.summary_table.item(row, col)
+                        if f not in (item.text().lower() if item else ""):
+                            visible = False
+                            break
+                self.summary_table.setRowHidden(row, not visible)
         except Exception:
             pass
 
@@ -3247,7 +3830,45 @@ class TCPConnectionViewer(QMainWindow):
         self.summary_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.summary_table.customContextMenuRequested.connect(self.on_summary_table_context_menu)
 
-        summary_tab_layout.addWidget(self.summary_table)
+        # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
+        _summary_filter_placeholders = [
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count"
+        ]
+        self._summary_filter_inner = QWidget()
+        _summary_filter_inner_layout = QHBoxLayout(self._summary_filter_inner)
+        _summary_filter_inner_layout.setContentsMargins(0, 0, 0, 0)
+        _summary_filter_inner_layout.setSpacing(0)
+        self._summary_filter_vheader_spacer = QWidget()
+        _summary_filter_inner_layout.addWidget(self._summary_filter_vheader_spacer)
+        self._summary_filter_inputs = []
+        for placeholder in _summary_filter_placeholders:
+            le = QLineEdit()
+            le.setPlaceholderText(placeholder)
+            le.setClearButtonEnabled(True)
+            le.setFixedHeight(24)
+            le.textChanged.connect(self.apply_summary_table_filter)
+            self._summary_filter_inputs.append(le)
+            _summary_filter_inner_layout.addWidget(le)
+        self._summary_filter_scroll = QScrollArea()
+        self._summary_filter_scroll.setWidget(self._summary_filter_inner)
+        self._summary_filter_scroll.setWidgetResizable(False)
+        self._summary_filter_scroll.setFixedHeight(28)
+        self._summary_filter_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._summary_filter_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._summary_filter_scroll.setFrameShape(QFrame.NoFrame)
+        self.summary_table.horizontalScrollBar().valueChanged.connect(
+            self._summary_filter_scroll.horizontalScrollBar().setValue)
+        self.summary_table.horizontalHeader().sectionResized.connect(
+            lambda *_: self._sync_summary_filter_widths())
+
+        # Wrap filter bar + table in a zero-spacing container so inputs sit flush against the header
+        _summary_table_container = QWidget()
+        _summary_table_container_layout = QVBoxLayout(_summary_table_container)
+        _summary_table_container_layout.setContentsMargins(0, 0, 0, 0)
+        _summary_table_container_layout.setSpacing(0)
+        _summary_table_container_layout.addWidget(self._summary_filter_scroll)
+        _summary_table_container_layout.addWidget(self.summary_table)
+        summary_tab_layout.addWidget(_summary_table_container)
 
         # Create Settings tab with all checkboxes
         settings_tab_widget = QWidget()
@@ -3319,29 +3940,99 @@ class TCPConnectionViewer(QMainWindow):
         self.pause_table_sorting_check.stateChanged.connect(self.update_pause_table_sorrting)
         settings_tab_layout.addWidget(self.pause_table_sorting_check)
 
+        # --- Connection Collector plugin selector ---
+        collector_separator = QLabel("─── Connection Collector Plugin ───")
+        collector_separator.setStyleSheet("font-weight: bold; color: #555; margin-top: 8px;")
+        settings_tab_layout.addWidget(collector_separator)
+
+        collector_row = QHBoxLayout()
+        collector_label = QLabel("Active collector:")
+        collector_row.addWidget(collector_label)
+        self._collector_combo = QComboBox()
+        for plugin in self._collector_plugins:
+            self._collector_combo.addItem(plugin.name)
+            idx = self._collector_combo.count() - 1
+            if plugin.description:
+                self._collector_combo.setItemData(idx, plugin.description, Qt.ToolTipRole)
+        self._collector_combo.currentIndexChanged.connect(self._on_collector_changed)
+        collector_row.addWidget(self._collector_combo, 1)
+        settings_tab_layout.addLayout(collector_row)
+
         # --- Server / Agent mode settings ---
         server_agent_separator = QLabel("─── Server / Agent Mode ───")
         server_agent_separator.setStyleSheet("font-weight: bold; color: #555; margin-top: 8px;")
         settings_tab_layout.addWidget(server_agent_separator)
 
+        server_mode_layout = QHBoxLayout()
         self.server_mode_check = QCheckBox("Enable server mode (listen for agent connections)")
         self.server_mode_check.setChecked(enable_server_mode)
         self.server_mode_check.stateChanged.connect(self._on_server_mode_changed)
-        settings_tab_layout.addWidget(self.server_mode_check)
+        server_mode_layout.addWidget(self.server_mode_check)
+        server_mode_layout.addWidget(QLabel("Port:"))
+        self.flask_server_port_input = QLineEdit()
+        self.flask_server_port_input.setPlaceholderText("5000")
+        self.flask_server_port_input.setText(str(FLASK_SERVER_PORT))
+        self.flask_server_port_input.setFixedWidth(60)
+        self.flask_server_port_input.setToolTip("High port (1024–65535)")
+        self.flask_server_port_input.textChanged.connect(
+            lambda t: self.flask_server_port_input.setStyleSheet(
+                "" if (t.isdigit() and 1024 <= int(t) <= 65535) else "border: 1px solid red;"
+            )
+        )
+        self.flask_server_port_input.editingFinished.connect(self._on_flask_server_port_changed)
+        server_mode_layout.addWidget(self.flask_server_port_input)
+        server_mode_layout.addStretch()
+        settings_tab_layout.addLayout(server_mode_layout)
 
         agent_mode_layout = QHBoxLayout()
         self.agent_mode_check = QCheckBox("Enable agent mode:")
         self.agent_mode_check.setChecked(enable_agent_mode)
         self.agent_mode_check.stateChanged.connect(self._on_agent_mode_changed)
         agent_mode_layout.addWidget(self.agent_mode_check)
+
+        # Hostname / IP of the server (no scheme, no port)
         self.agent_server_input = QLineEdit()
-        self.agent_server_input.setPlaceholderText("Server address (e.g. http://192.168.1.10:5000)")
-        self.agent_server_input.setText(agent_server_address)
-        self.agent_server_input.setMinimumWidth(280)
+        self.agent_server_input.setPlaceholderText("Server hostname or IP (e.g. 192.168.1.10)")
+        self.agent_server_input.setText(agent_server_host)
+        self.agent_server_input.setMinimumWidth(220)
         self.agent_server_input.editingFinished.connect(self._on_agent_server_address_changed)
         agent_mode_layout.addWidget(self.agent_server_input)
+
+        # Port the agent POSTs to on the remote server
+        agent_mode_layout.addWidget(QLabel("Port:"))
+        self.flask_agent_port_input = QLineEdit()
+        self.flask_agent_port_input.setPlaceholderText("5000")
+        self.flask_agent_port_input.setText(str(FLASK_AGENT_PORT))
+        self.flask_agent_port_input.setFixedWidth(60)
+        self.flask_agent_port_input.setToolTip("High port (1024–65535)")
+        self.flask_agent_port_input.textChanged.connect(
+            lambda t: self.flask_agent_port_input.setStyleSheet(
+                "" if (t.isdigit() and 1024 <= int(t) <= 65535) else "border: 1px solid red;"
+            )
+        )
+        self.flask_agent_port_input.editingFinished.connect(self._on_flask_agent_port_changed)
+        agent_mode_layout.addWidget(self.flask_agent_port_input)
+
+        # Connectivity status indicator — updated live by _trigger_agent_connectivity_check
+        self.agent_conn_status_label = QLabel("")
+        self.agent_conn_status_label.setMinimumWidth(120)
+        agent_mode_layout.addWidget(self.agent_conn_status_label)
+
         agent_mode_layout.addStretch()
         settings_tab_layout.addLayout(agent_mode_layout)
+
+        self.no_ui_check = QCheckBox(
+            "No UI mode — run as a hidden background agent (takes effect on next launch)"
+        )
+        self.no_ui_check.setChecked(agent_no_ui)
+        self.no_ui_check.setEnabled(enable_agent_mode)
+        self.no_ui_check.setToolTip(
+            "When checked and agent mode is active the application window is completely\n"
+            "hidden on the next launch (no taskbar button, not restorable by the user).\n"
+            "Equivalent to passing --no_ui on the command line."
+        )
+        self.no_ui_check.stateChanged.connect(self._on_no_ui_changed)
+        settings_tab_layout.addWidget(self.no_ui_check)
 
         # Add stretch to push settings to the top
         settings_tab_layout.addStretch()
@@ -3459,6 +4150,7 @@ class TCPConnectionViewer(QMainWindow):
         self.map_view.loadFinished.connect(self.on_map_loaded)
         # Defer initial filter bar width sync until the layout is finalized
         QTimer.singleShot(0, self._sync_filter_widths)
+        QTimer.singleShot(0, self._sync_summary_filter_widths)
 
     def _populate_db_status_table(self):
         """Fill (or refresh) the database status table in the Actions tab."""
@@ -4015,15 +4707,10 @@ class TCPConnectionViewer(QMainWindow):
         """
         Enumerate TCP and UDP connections and build the connection snapshot.
 
-        Performance and reliability improvements:
-        - Use local variable references to reduce attribute lookups.
-        - Avoid multiple calls to psutil.net_connections().
-        - Build ip collection and perform reverse DNS in batches only when enabled.
-        - Write to `self.connection_list` with minimum temporary allocations.
-        - Captures both TCP (ESTABLISHED) and UDP (all) connections.
-        - Caches geolocation and process names for performance.
-        - On Windows, supplements psutil UDP data with netstat output to obtain
-          real remote addresses for connected UDP sockets.
+        Raw connection enumeration is delegated to the active collector plugin
+        (default: PsutilCollector).  This method then enriches each raw dict
+        with geolocation, reverse DNS, C2 checks, icon assignment, agent merge,
+        and timeline management.
         """
 
         connections = []
@@ -4034,57 +4721,40 @@ class TCPConnectionViewer(QMainWindow):
         import time as time_module
         start_time = time_module.perf_counter()
 
-        # Get all connections once (both TCP and UDP)
-        all_connections = psutil.net_connections(kind='inet')
+        # Timeline replay short-circuit
+        if position_timeline is not None:
+            idx = min(position_timeline, len(self.connection_list) - 1)
+            if idx >= 0:
+                return self.connection_list[idx]['connection_list']
+            else:
+                return []
 
-        # On Windows, psutil's GetExtendedUdpTable does not report remote addresses
-        # for connected UDP sockets (the MIB_UDPROW_OWNER_PID struct lacks remote
-        # fields — a documented Win32 API limitation).  No Python library can work
-        # around this; netstat.exe uses undocumented NSI calls to obtain the data.
-        # A single 'netstat -ano' captures both UDP (IPv4) and UDPv6 lines.
-        udp_remote_lookup = {}  # (local_ip, local_port, pid) -> (remote_ip, remote_port)
-        if platform.system() == "Windows":
-            try:
-                udp_remote_lookup = self._parse_netstat_udp()
-            except Exception:
-                pass
+        # --- Phase 1: Collect raw connections via the active plugin -----------
+        try:
+            raw_connections = self._active_collector.collect_raw_connections()
+        except Exception as e:
+            logging.error(f"Collector plugin '{self._active_collector.name}' failed: {e}")
+            raw_connections = []
 
-        # Collect remote IPs for DNS resolution (only those we care about)
+        # --- Phase 2: Batch DNS warm-up for all remote IPs -------------------
         ips_to_resolve = set()
-        for c in all_connections:
-            # For TCP, only process ESTABLISHED connections
-            # For UDP, process all connections (UDP is connectionless)
-            is_tcp = (c.type == socket.SOCK_STREAM)
-            is_udp = (c.type == socket.SOCK_DGRAM)
-
-            if is_tcp and c.status != psutil.CONN_ESTABLISHED:
-                continue
-
-            if getattr(c, "raddr", None):
-                raddr_ip = getattr(c.raddr, "ip", None)
-                if raddr_ip and raddr_ip not in ('127.0.0.1', '::1'):
-                    ips_to_resolve.add(raddr_ip)
-
-        # Also collect remote IPs discovered via netstat for UDP
-        for (l_ip, l_port, pid_str), (r_ip, r_port) in udp_remote_lookup.items():
-            if r_ip and r_ip not in ('127.0.0.1', '::1', '*', '0.0.0.0', '::'):
-                ips_to_resolve.add(r_ip)
+        for rc in raw_connections:
+            remote = rc.get('remote', '')
+            ip = remote.split(' ')[0].split(':')[0]
+            if ip and ip not in ('127.0.0.1', '::1', 'N/A', '*', '0.0.0.0', '::'):
+                ips_to_resolve.add(ip)
 
         ip_hostnames = {}
         if do_reverse_dns and ips_to_resolve:
-            # Filter IPs to only those not already attempted for DNS resolution
             ips_to_enqueue = set()
             global public_ip_dns_attempts, public_ip_dns_attempts_lock
 
             with public_ip_dns_attempts_lock:
                 for ip in ips_to_resolve:
-                    # Only enqueue if not previously attempted (regardless of success/failure)
                     if ip not in public_ip_dns_attempts:
-                        # Mark as attempted with current timestamp
                         public_ip_dns_attempts[ip] = datetime.datetime.now()
                         ips_to_enqueue.add(ip)
 
-            # enqueue for background warming (non-blocking) - only new IPs
             if ips_to_enqueue:
                 try:
                     if getattr(self, "dns_worker", None) is not None:
@@ -4092,114 +4762,41 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception:
                     pass
 
-            # read any already-cached names immediately (non-blocking)
             with cache_lock:
                 for ip in ips_to_resolve:
                     host = ip_cache.get(ip)
                     if host:
                         ip_hostnames[ip] = host
-        else:
-            ip_hostnames = {}
 
-        # Use local references for speed
+        # Local references for speed
         reader_ipv4 = self.reader_ipv4
         reader_ipv6 = self.reader_ipv6
-        reader_c2 = self.reader_c2_tracker
         do_c2 = do_c2_check
 
-        # Choose the source of connections (live or timeline)
-        if position_timeline is None:
-            current_connections = all_connections
-        else:
-            idx = min(position_timeline, len(self.connection_list) - 1)
-            if idx >= 0:
-                return self.connection_list[idx]['connection_list']
-            else:
-                return []
-
-        for conn in current_connections:
-            # Determine protocol type
-            is_tcp = (conn.type == socket.SOCK_STREAM)
-            is_udp = (conn.type == socket.SOCK_DGRAM)
-
-            protocol = "TCP" if is_tcp else ("UDP" if is_udp else "Unknown")
-
-            # For TCP, only process ESTABLISHED connections
-            # For UDP, process all connections (connectionless protocol)
-            if is_tcp and conn.status != psutil.CONN_ESTABLISHED:
-                continue
-
+        # --- Phase 3: Enrich each raw connection with geo/DNS/C2/icons -------
+        for rc in raw_connections:
             try:
-                pid = conn.pid
-
-                # Use cached process name if available
-                if pid:
-                    with process_cache_lock:
-                        if pid in process_cache:
-                            process_name = process_cache[pid]
-                        else:
-                            try:
-                                process = psutil.Process(pid)
-                                process_name = process.name()
-                                process_cache[pid] = process_name
-                            except Exception:
-                                process_name = "Unknown"
-                else:
-                    process_name = "Unknown"
-
-                laddr = getattr(conn, "laddr", None)
-                raddr = getattr(conn, "raddr", None)
-
-                local_addr = f"{laddr.ip}" if laddr else ""
-                local_port = str(getattr(laddr, "port", "")) if laddr else ""
-
-                # UDP connections may not have a remote address (connectionless protocol)
-                # psutil may return raddr=() (falsy), or raddr with ip='0.0.0.0'/'::'  port=0
-                has_real_raddr = False
-                if raddr:
-                    raddr_ip = getattr(raddr, "ip", None)
-                    raddr_port = getattr(raddr, "port", None)
-                    if raddr_ip and raddr_ip not in ("0.0.0.0", "::", "*", "") and raddr_port:
-                        has_real_raddr = True
-
-                if has_real_raddr:
-                    remote_addr = f"{raddr.ip}"
-                    remote_port = str(raddr.port)
-                else:
-                    # psutil reported no useful remote peer; try the netstat lookup for UDP
-                    if is_udp and udp_remote_lookup:
-                        pid_str = str(pid) if pid else ""
-                        ns_remote = udp_remote_lookup.get((local_addr, local_port, pid_str))
-                        if ns_remote:
-                            remote_addr, remote_port = ns_remote
-                        else:
-                            remote_addr = "*"
-                            remote_port = "*"
-                    elif is_udp:
-                        remote_addr = "*"
-                        remote_port = "*"
-                    else:
-                        remote_addr = ""
-                        remote_port = ""
-
-                # Determine IP type
-                family = getattr(conn, "family", None)
-                ip_type = "IPv4" if family == socket.AF_INET else ("IPv6" if family == socket.AF_INET6 else "")
+                process_name = rc.get('process', 'Unknown')
+                pid = rc.get('pid', '')
+                protocol = rc.get('protocol', 'TCP')
+                local_addr = rc.get('local', '')
+                local_port = rc.get('localport', '')
+                remote_addr = rc.get('remote', '')
+                remote_port = rc.get('remoteport', '')
+                ip_type = rc.get('ip_type', '')
+                hostname = rc.get('hostname', LOCAL_HOSTNAME)
 
                 lat = lng = None
                 name = ""
 
-                # obtain IP string for lookup (strip any appended hostname)
                 ip_lookup = remote_addr.split(' ')[0].split(':')[0]
 
-                # Skip geolocation/DNS for UDP connections without remote peer
                 if ip_lookup and ip_lookup not in ('127.0.0.1', '::1', 'N/A', '*', '0.0.0.0', '::'):
-                    # Check geolocation cache first
+                    # Geolocation
                     with geo_cache_lock:
                         if ip_lookup in geo_cache:
                             lat, lng = geo_cache[ip_lookup]
                         else:
-                            # geolocation lookup from database
                             try:
                                 if ip_type == "IPv4" and reader_ipv4:
                                     res = reader_ipv4.get(ip_lookup)
@@ -4211,27 +4808,26 @@ class TCPConnectionViewer(QMainWindow):
                                     if res is not None:
                                         lat = res.get('latitude') or res.get('location', {}).get('latitude')
                                         lng = res.get('longitude') or res.get('location', {}).get('longitude')
-                                # Cache the result (even if None)
                                 geo_cache[ip_lookup] = (lat, lng)
                             except Exception:
                                 lat = lng = None
                                 geo_cache[ip_lookup] = (None, None)
 
-                    # reverse DNS result from batched lookup
+                    # Reverse DNS
                     if do_reverse_dns:
-                        hostname = ip_hostnames.get(ip_lookup)
-                        if hostname:
-                            remote_addr = f"{remote_addr} ({hostname})"
-                            name = hostname
+                        resolved = ip_hostnames.get(ip_lookup)
+                        if resolved:
+                            remote_addr = f"{remote_addr} ({resolved})"
+                            name = resolved
 
-                    # c2 check (optimized with set lookup)
+                    # C2 check
                     if do_c2 and self.reader_c2_tracker_set is not None:
                         try:
                             is_c2, c2_type, c2_info = self.check_ip_is_present_in_c2_tracker(ip_lookup)
                             if is_c2:
                                 c2_connections.append({
                                     'process': process_name,
-                                    'pid': str(pid) if pid else "",
+                                    'pid': pid,
                                     'suspect': 'Yes',
                                     'protocol': protocol,
                                     'local': local_addr,
@@ -4243,16 +4839,15 @@ class TCPConnectionViewer(QMainWindow):
                                     'lat': lat,
                                     'lng': lng,
                                     'icon': 'redIcon',
-                                    'hostname': LOCAL_HOSTNAME,
+                                    'hostname': hostname,
                                 })
                         except Exception:
-                            # ignore C2 lookup failures
                             pass
 
-                # append standard connection entry (without heavy psutil object)
+                # Standard connection entry
                 connections.append({
                     'process': process_name,
-                    'pid': str(pid) if pid else "",
+                    'pid': pid,
                     'suspect': '',
                     'protocol': protocol,
                     'local': local_addr,
@@ -4264,22 +4859,18 @@ class TCPConnectionViewer(QMainWindow):
                     'lat': lat,
                     'lng': lng,
                     'icon': 'greenIcon',
-                    'hostname': LOCAL_HOSTNAME,
+                    'hostname': hostname,
                 })
 
-                # if this is a new connection (timeline-based detection), mark it
+                # New connection detection (timeline-based)
                 if self.connection_list:
                     try:
                         if not self.is_connection_in_list(connections[-1], self.connection_list[-1]['connection_list']):
                             connections[-1]['icon'] = 'blueIcon'
                     except Exception:
-                        # defensive: ignore comparison errors
                         pass
 
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
             except Exception:
-                # defensive catch-all to avoid breaking the main loop for unexpected errors
                 continue
 
         # Merge C2 entries at front if present
@@ -4685,7 +5276,7 @@ class TCPConnectionViewer(QMainWindow):
                 f'| Top layer: {foreground}'
             )
         elif enable_agent_mode:
-            mode_indicator_text = f'Agent mode: {agent_server_address}'
+            mode_indicator_text = f'Agent mode: {agent_server_host}:{FLASK_AGENT_PORT}'
 
         # Send stats_text, datetime_text, recording indicator, and mode indicator to JS
         js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)}); setDateTime({json.dumps(datetime_text)}); setRecordingIndicator({str(is_recording).lower()}); setModeIndicator({json.dumps(mode_indicator_text)});"
@@ -6533,6 +7124,8 @@ class TCPConnectionViewer(QMainWindow):
                 if self._summary_needs_update:
                     self.update_summary_table()
                     self._summary_needs_update = False
+                # Always re-sync filter widths — columns may have been resized while the tab was hidden
+                QTimer.singleShot(0, self._sync_summary_filter_widths)
             # Refresh Agent Management table whenever it is activated
             if hasattr(self, '_agent_mgmt_tab_index') and index == self._agent_mgmt_tab_index:
                 self._refresh_agent_management_table()
@@ -6629,6 +7222,9 @@ class TCPConnectionViewer(QMainWindow):
             global summary_table_column_sort_index, summary_table_column_sort_reverse
             if summary_table_column_sort_index >= 0:
                 self.sort_summary_table_by_column(summary_table_column_sort_index, summary_table_column_sort_reverse)
+
+            # Re-apply any active per-column filters
+            self.apply_summary_table_filter()
 
         except Exception as e:
             logging.error(f"Error populating summary table: {e}")
@@ -6831,7 +7427,18 @@ class TCPConnectionViewer(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     viewer = TCPConnectionViewer()
-    viewer.show()
+
+    if agent_no_ui and enable_agent_mode:
+        # Headless agent mode: keep the window completely off-screen and off the taskbar.
+        # Qt.Tool removes the taskbar button; combining with FramelessWindowHint + hiding
+        # ensures the window cannot be restored by the user via the taskbar or other means.
+        viewer.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnBottomHint
+        )
+        # Never call show() — the window stays hidden for the entire lifetime.
+    else:
+        viewer.show()
+
     sys.exit(app.exec())
 
 if __name__ == "__main__":
