@@ -280,6 +280,15 @@ class MapBridge(QObject):
         except Exception as e:
             logging.error(f"Error handling popup close notification: {e}")
 
+    @Slot(str)
+    def setForegroundHost(self, hostname):
+        """Called from JavaScript when the user clicks an agent circle or marker.
+        Promotes *hostname* to the foreground layer and triggers a map re-render."""
+        try:
+            self.viewer.bring_to_top_layer(hostname)
+        except Exception as e:
+            logging.error(f"Error in setForegroundHost: {e}")
+
 class VideoGeneratorSignals(QObject):
     """Signals for video generation worker"""
     finished = Signal(bool, str, dict)  # success, message, stats
@@ -530,6 +539,13 @@ class TileRequestInterceptor(QWebEngineUrlRequestInterceptor):
 
 
 class TCPConnectionViewer(QMainWindow):
+    # Colors available for agent assignment (round-robin).
+    # Excluded colors (reserved by the local-host UI):
+    #   green  = local connections, blue = new connections,
+    #   red    = suspect/C2,        yellow = pinned marker,
+    #   gold   = too similar to yellow (both ~#FFD326 / #CAC428).
+    _AGENT_COLOR_PALETTE = ['orange', 'violet', 'black']
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"TCP/UDP Geo Map - R001D00rs - v {VERSION}")
@@ -574,6 +590,11 @@ class TCPConnectionViewer(QMainWindow):
         self._agent_cache_lock = threading.Lock()
         self._last_agent_count = 0      # number of agents collected in last cycle
         self._flask_thread = None       # daemon thread running Flask
+        # Per-agent color assignment: hostname -> color name (e.g. 'violet')
+        # Colors are drawn round-robin from the agent palette (excludes colors
+        # reserved for the UI: green=local, red=suspect, blue=new, yellow=pinned).
+        self._agent_colors = {}         # hostname -> color name
+        self._agent_color_index = 0     # next index into _AGENT_COLOR_PALETTE
         # Agent mode: HTTP session with short timeout for POSTing to server
         self._agent_http_session = requests.Session()
         self._agent_http_session.headers.update({'Content-Type': 'application/json'})
@@ -585,6 +606,12 @@ class TCPConnectionViewer(QMainWindow):
         self._agent_post_thread = threading.Thread(
             target=self._agent_post_worker, daemon=True, name="AgentPostWorker")
         self._agent_post_thread.start()
+
+        # Foreground agent: the hostname whose connections are rendered with the
+        # standard localhost colour scheme (green/blue/yellow/red).  All other
+        # agents (including localhost when demoted) render in their assigned
+        # palette colour (grey for localhost when demoted).
+        self._foreground_hostname = LOCAL_HOSTNAME
 
         # Debounced map update
         self._map_update_timer = QTimer()
@@ -1403,11 +1430,16 @@ class TCPConnectionViewer(QMainWindow):
         logging.info(f"Flask server started on port {FLASK_LISTEN_PORT}")
 
     def _collect_and_reset_agent_cache(self):
-        """Drain the agent cache and return a dict {hostname: agent_data}.
-        Called once per get_active_tcp_connections cycle in server mode."""
+        """Return a snapshot of the agent cache without clearing it.
+
+        The cache is intentionally *not* cleared here.  Each agent's entry is
+        only replaced when the agent sends a new POST (in the Flask route).
+        This means a single missed POST cycle no longer causes the agent to
+        vanish from the map — the last-known data is kept until fresh data
+        arrives or the server is restarted.
+        """
         with self._agent_cache_lock:
             snapshot = dict(self._agent_cache)
-            self._agent_cache.clear()
         self._last_agent_count = len(snapshot)
         return snapshot
 
@@ -1747,6 +1779,8 @@ class TCPConnectionViewer(QMainWindow):
         pid = pid_item.text().strip() if pid_item else ""
         process_item = self.connection_table.item(row, PROCESS_ROW_INDEX)
         process_name = process_item.text().strip() if process_item else ""
+        hostname_item = self.connection_table.item(row, HOSTNAME_ROW_INDEX)
+        row_hostname = hostname_item.text().strip() if hostname_item else ""
 
         menu = QMenu(self)
 
@@ -1754,6 +1788,12 @@ class TCPConnectionViewer(QMainWindow):
         cell_item = self.connection_table.item(row, index.column())
         cell_text = cell_item.text() if cell_item else ""
         action_copy = menu.addAction("Copy")
+        menu.addSeparator()
+
+        # Bring to top layer — visible when multiple agents are present
+        action_bring_to_top = menu.addAction("Bring to top layer")
+        foreground_host = getattr(self, '_foreground_hostname', LOCAL_HOSTNAME)
+        action_bring_to_top.setEnabled(bool(row_hostname) and row_hostname != foreground_host)
         menu.addSeparator()
 
         if platform.system() == "Windows":
@@ -1770,6 +1810,11 @@ class TCPConnectionViewer(QMainWindow):
 
         if chosen == action_copy:
             QApplication.clipboard().setText(cell_text)
+            return
+
+        if chosen == action_bring_to_top:
+            if row_hostname:
+                self.bring_to_top_layer(row_hostname)
             return
 
         if not pid:
@@ -2031,9 +2076,47 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+    def _get_active_filters(self):
+        """Return a list of (col_index, filter_text) pairs for every non-empty filter input."""
+        result = []
+        for col, le in enumerate(self._connection_filter_inputs):
+            f = le.text().strip().lower()
+            if f:
+                result.append((col, f))
+        return result
+
+    def _conn_matches_filters(self, conn, filters):
+        """Return True when *conn* (a connection dict) satisfies all active filters.
+
+        The filter columns map to connection dict keys via the same indices used
+        by the table so the map and the table always agree on what is visible."""
+        if not filters:
+            return True
+        # Map column index -> connection dict key (mirrors the table setItem calls)
+        col_to_key = {
+            HOSTNAME_ROW_INDEX:        lambda c: c.get('hostname', ''),
+            PROCESS_ROW_INDEX:         lambda c: c.get('process', ''),
+            PID_ROW_INDEX:             lambda c: c.get('pid', ''),
+            SUSPECT_ROW_INDEX:         lambda c: c.get('suspect', ''),
+            PROTOCOL_ROW_INDEX:        lambda c: c.get('protocol', 'TCP'),
+            LOCAL_ADDRESS_ROW_INDEX:   lambda c: c.get('local', ''),
+            LOCAL_PORT_ROW_INDEX:      lambda c: c.get('localport', ''),
+            REMOTE_ADDRESS_ROW_INDEX:  lambda c: c.get('remote', ''),
+            REMOTE_PORT_ROW_INDEX:     lambda c: c.get('remoteport', ''),
+            NAME_ROW_INDEX:            lambda c: c.get('name', ''),
+            IP_TYPE_ROW_INDEX:         lambda c: c.get('ip_type', ''),
+        }
+        for col, f in filters:
+            getter = col_to_key.get(col)
+            value = getter(conn).lower() if getter else ''
+            if f not in value:
+                return False
+        return True
+
     @Slot()
     def apply_connection_table_filter(self):
-        """Show/hide connection table rows based on the active per-column filter inputs."""
+        """Show/hide connection table rows based on the active per-column filter inputs,
+        then re-render the map so it reflects the same filtered view."""
         try:
             filters = [le.text().strip().lower() for le in self._connection_filter_inputs]
             has_filter = any(filters)
@@ -2049,6 +2132,13 @@ class TCPConnectionViewer(QMainWindow):
                             visible = False
                             break
                 self.connection_table.setRowHidden(row, not visible)
+        except Exception:
+            pass
+
+        # Re-render the map to match the filtered table view
+        try:
+            if hasattr(self, 'connections') and self.connections is not None:
+                self._update_map_with_filter()
         except Exception:
             pass
 
@@ -2075,10 +2165,85 @@ class TCPConnectionViewer(QMainWindow):
         self.apply_connection_table_filter()
 
 
+    def bring_to_top_layer(self, hostname):
+        """Promote *hostname* to the foreground rendering layer.
+
+        The foreground agent gets the standard localhost colour scheme
+        (green / blue / yellow / red).  Localhost, when demoted, renders grey.
+        Calling this with LOCAL_HOSTNAME restores the default state.
+        """
+        try:
+            if not hostname:
+                return
+            self._foreground_hostname = hostname
+            logging.debug("Foreground host set to: %s", hostname)
+            # Re-render the map immediately to reflect the new layer order.
+            self._update_map_with_filter()
+        except Exception as e:
+            logging.error(f"bring_to_top_layer error: {e}")
+
+    def _update_map_with_filter(self):
+        """Re-render the map using the current connections list filtered by the active
+        column filters.  Agent exit-point circles are always rendered for every known
+        agent regardless of whether any of their connections survive the filter."""
+        try:
+            if not hasattr(self, 'connections') or self.connections is None:
+                return
+
+            active_filters = self._get_active_filters()
+
+            if not active_filters:
+                # No filter — the last full render (from refresh_connections) is already correct
+                return
+
+            filtered = []
+            # Collect the set of agent origin-hostnames that appear in the *full* connection
+            # list so we can inject stub entries for any agent that has no matched connections
+            # (their exit-point circle must still appear on the map).
+            all_agent_origins = {}   # hostname -> first conn that carries origin info
+            for conn in self.connections:
+                oh = conn.get('origin_hostname')
+                if oh and oh not in all_agent_origins:
+                    all_agent_origins[oh] = conn
+
+            matched_agent_origins = set()
+            for conn in self.connections:
+                if self._conn_matches_filters(conn, active_filters):
+                    filtered.append(conn)
+                    oh = conn.get('origin_hostname')
+                    if oh:
+                        matched_agent_origins.add(oh)
+
+            # For agents whose connections were all filtered out, inject a minimal stub
+            # that carries only the origin metadata (no lat/lng for a marker) so that
+            # update_map still synthesises the agentCircle for that agent.
+            for hostname, ref_conn in all_agent_origins.items():
+                if hostname not in matched_agent_origins:
+                    filtered.append({
+                        'process': '', 'pid': '', 'suspect': '', 'local': '', 'localport': '',
+                        'remote': '', 'remoteport': '', 'name': '', 'ip_type': '',
+                        'lat': None, 'lng': None, 'icon': '',
+                        'origin_hostname': hostname,
+                        'origin_lat':      ref_conn.get('origin_lat'),
+                        'origin_lng':      ref_conn.get('origin_lng'),
+                        'origin_public_ip': ref_conn.get('origin_public_ip', ''),
+                        'agent_color':     ref_conn.get('agent_color', 'orange'),
+                        'hostname':        hostname,
+                    })
+
+            # Re-use the last stats / datetime text from the most recent full render
+            stats_line = getattr(self, '_last_stats_line', '')
+            datetime_text = getattr(self, '_last_datetime_text', '')
+            force_tooltip = show_tooltip
+            self.update_map(filtered, force_tooltip,
+                            stats_text=stats_line, datetime_text=datetime_text)
+        except Exception as e:
+            logging.error(f"_update_map_with_filter error: {e}")
+
     def column_resort(self, index):
         """
         Handles sorting when a column header is clicked.
-        
+
         Args:
             index (int): The column index that was clicked.
         """
@@ -3985,17 +4150,24 @@ class TCPConnectionViewer(QMainWindow):
                 agent_origin_lat = agent_data.get('lat')
                 agent_origin_lng = agent_data.get('lng')
                 agent_public_ip = agent_data.get('public_ip', '')
+                # Assign a persistent color to this agent on first encounter
+                if hostname not in self._agent_colors:
+                    palette = self._AGENT_COLOR_PALETTE
+                    self._agent_colors[hostname] = palette[self._agent_color_index % len(palette)]
+                    self._agent_color_index += 1
+                agent_color = self._agent_colors[hostname]
                 for agent_conn in agent_data.get('connections', []):
-                    agent_conn['hostname'] = hostname  # ensure hostname tag
+                    agent_conn['hostname'] = hostname
                     # Inject the agent's exit-point origin so the map can draw
                     # per-agent circles and polylines from the correct origin.
                     agent_conn['origin_lat'] = agent_origin_lat
                     agent_conn['origin_lng'] = agent_origin_lng
                     agent_conn['origin_hostname'] = hostname
                     agent_conn['origin_public_ip'] = agent_public_ip
-                    # Mark agent exit-point connections with orange icon
+                    agent_conn['agent_color'] = agent_color
+                    # Use the agent's assigned color icon (fall back if not suspect)
                     if agent_conn.get('icon') not in ('redIcon',):
-                        agent_conn['icon'] = 'orangeIcon'
+                        agent_conn['icon'] = agent_color + 'Icon'
                     connections.append(agent_conn)
 
         # record timeline snapshot only when requested (position_timeline is None)
@@ -4284,8 +4456,23 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
-        # Server mode: add orange circle entries for each connected agent's exit point
+        # Server mode: add circle entries for each connected agent's exit point.
+        # Build the ordered z-layer stack: foreground agent on top, then others
+        # in reverse-registration order, localhost always last (lowest z).
         if enable_server_mode:
+            foreground_host = getattr(self, '_foreground_hostname', LOCAL_HOSTNAME)
+            # Collect all known agent hostnames in registration order
+            all_known_agents = list(getattr(self, '_agent_colors', {}).keys())
+            # Build z-layer order: foreground first, then others, localhost last
+            layer_order = [foreground_host]
+            for h in all_known_agents:
+                if h != foreground_host and h != LOCAL_HOSTNAME:
+                    layer_order.append(h)
+            if LOCAL_HOSTNAME not in layer_order:
+                layer_order.append(LOCAL_HOSTNAME)
+            # Base z-index for the top agent pane (below publicIpPane=650, above pinnedPane=640)
+            _AGENT_PANE_Z_TOP = 635
+
             # Collect unique agent origins from the connection data
             # Iterate over a snapshot to avoid modifying list during iteration
             seen_agent_origins = set()
@@ -4298,9 +4485,19 @@ class TCPConnectionViewer(QMainWindow):
                     if key not in seen_agent_origins:
                         seen_agent_origins.add(key)
                         origin_ip = conn.get('origin_public_ip', '')
+                        agent_color = conn.get('agent_color', 'orange')
+                        # Demote localhost circle colour when not foreground
+                        if origin_hostname == LOCAL_HOSTNAME and foreground_host != LOCAL_HOSTNAME:
+                            agent_color = 'grey'
                         agent_label = f"Agent: {origin_hostname}"
                         if origin_ip:
                             agent_label += f" ({origin_ip})"
+                        # Assign z-index based on layer order
+                        try:
+                            rank = layer_order.index(origin_hostname)
+                        except ValueError:
+                            rank = len(layer_order)
+                        pane_z = max(600, _AGENT_PANE_Z_TOP - rank)
                         connection_data.append({
                             'process': 'Agent Exit Point',
                             'pid': '',
@@ -4313,8 +4510,10 @@ class TCPConnectionViewer(QMainWindow):
                             'ip_type': '',
                             'lat': origin_lat,
                             'lng': origin_lng,
-                            'icon': 'orangeCircle',
+                            'icon': 'agentCircle',
+                            'agent_color': agent_color,
                             'origin_hostname': origin_hostname,
+                            'pane_z': pane_z,
                         })
 
         data_json = json.dumps(connection_data)
@@ -4335,7 +4534,11 @@ class TCPConnectionViewer(QMainWindow):
         mode_indicator_text = ''
         if enable_server_mode:
             agent_count = getattr(self, '_last_agent_count', 0)
-            mode_indicator_text = f'Server mode ({agent_count} agent{"s" if agent_count != 1 else ""})'
+            foreground = getattr(self, '_foreground_hostname', LOCAL_HOSTNAME)
+            mode_indicator_text = (
+                f'Server mode ({agent_count} agent{"s" if agent_count != 1 else ""}) '
+                f'| Top layer: {foreground}'
+            )
         elif enable_agent_mode:
             mode_indicator_text = f'Agent mode: {agent_server_address}'
 
@@ -4603,6 +4806,22 @@ class TCPConnectionViewer(QMainWindow):
                             orange: {
                                 remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-orange.png',
                                 local: localBase + 'marker-icon-2x-orange.png'
+                            },
+                            violet: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-violet.png',
+                                local: localBase + 'marker-icon-2x-violet.png'
+                            },
+                            grey: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-grey.png',
+                                local: localBase + 'marker-icon-2x-grey.png'
+                            },
+                            black: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-black.png',
+                                local: localBase + 'marker-icon-2x-black.png'
+                            },
+                            gold: {
+                                remote: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-gold.png',
+                                local: localBase + 'marker-icon-2x-gold.png'
                             }
                         };
 
@@ -4617,11 +4836,15 @@ class TCPConnectionViewer(QMainWindow):
                                 if (remaining === 0) {
                                     // create icon definitions using resolved URLs
                                     const iconDefinitions = {
-                                        'redIcon': new L.Icon({iconUrl: resolved.red, iconSize:[25,41], iconAnchor:[12,41]}),
-                                        'greenIcon': new L.Icon({iconUrl: resolved.green, iconSize:[25,41], iconAnchor:[12,41]}),
-                                        'blueIcon': new L.Icon({iconUrl: resolved.blue, iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'redIcon':    new L.Icon({iconUrl: resolved.red,    iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'greenIcon':  new L.Icon({iconUrl: resolved.green,  iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'blueIcon':   new L.Icon({iconUrl: resolved.blue,   iconSize:[25,41], iconAnchor:[12,41]}),
                                         'yellowIcon': new L.Icon({iconUrl: resolved.yellow, iconSize:[25,41], iconAnchor:[12,41]}),
                                         'orangeIcon': new L.Icon({iconUrl: resolved.orange, iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'violetIcon': new L.Icon({iconUrl: resolved.violet, iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'greyIcon':   new L.Icon({iconUrl: resolved.grey,   iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'blackIcon':  new L.Icon({iconUrl: resolved.black,  iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'goldIcon':   new L.Icon({iconUrl: resolved.gold,   iconSize:[25,41], iconAnchor:[12,41]}),
                                     };
 
                                     // initialize map AFTER icons resolved
@@ -4790,6 +5013,8 @@ class TCPConnectionViewer(QMainWindow):
                                         var publicIpCoords = null;
                                         // Per-agent origin coordinates: { hostname: [lat, lng] }
                                         var agentOriginCoords = {};
+                                        // Per-agent color: { hostname: colorName }
+                                        var agentOriginColors = {};
                                         // Markers originating from server (no origin_hostname)
                                         var serverMarkerCoords = [];
                                         // Markers originating from agents: { hostname: [[lat,lng], ...] }
@@ -4820,30 +5045,67 @@ class TCPConnectionViewer(QMainWindow):
                                                     // Save server public IP coordinates for line drawing
                                                     publicIpCoords = [conn.lat, conn.lng];
 
-                                                } else if (iconName === 'orangeCircle') {
-                                                    // Create an orange circle for agent exit point
-                                                    var agentCircle = L.circle([conn.lat, conn.lng], {
-                                                        color: 'orange',
-                                                        fillColor: '#ff8c00',
-                                                        fillOpacity: 0.5,
-                                                        radius: 80000,
-                                                        pane: 'publicIpPane'
-                                                    }).addTo(map);
+                                                } else if (iconName === 'agentCircle') {
+                                                                     // Create a colored circle for agent exit point using the agent's assigned color
+                                                                     var agentColor = conn.agent_color || 'orange';
+                                                                     // Map palette names to CSS fill colors
+                                                                     var agentFillColors = {
+                                                                         orange: '#ff8c00', violet: '#9c2bcb',
+                                                                         grey:   '#7b7b7b', black:  '#3d3d3d',
+                                                                         gold:   '#ffd326'
+                                                                     };
+                                                                     var fillColor = agentFillColors[agentColor] || agentColor;
 
-                                                    var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
-                                                    agentCircle.bindTooltip(conn.remote || 'Agent', tooltipOptions);
+                                                                     // Create a dedicated pane for this agent if it doesn't exist yet,
+                                                                     // using the z-index provided by Python for z-layer ordering.
+                                                                     var agentHostname = conn.origin_hostname || conn.name || '';
+                                                                     var agentPaneName = agentHostname
+                                                                         ? 'agentPane_' + agentHostname.replace(/[^a-zA-Z0-9]/g, '_')
+                                                                         : 'publicIpPane';
+                                                                     var agentPaneZ = (typeof conn.pane_z === 'number') ? conn.pane_z : 620;
+                                                                     if (agentHostname && !map.getPane(agentPaneName)) {
+                                                                         map.createPane(agentPaneName);
+                                                                         map.getPane(agentPaneName).style.zIndex = agentPaneZ;
+                                                                     }
 
-                                                    var popupHtml = "<b>Agent Exit Point</b><br>" +
-                                                                    (conn.remote || '') + "<br>" +
-                                                                    "Hostname: " + (conn.name || '') + "<br>";
-                                                    agentCircle.bindPopup(popupHtml);
-                                                    liveMarkers.push(agentCircle);
+                                                                     var agentCircle = L.circle([conn.lat, conn.lng], {
+                                                                         color: agentColor,
+                                                                         fillColor: fillColor,
+                                                                         fillOpacity: 0.5,
+                                                                         radius: 80000,
+                                                                         pane: agentHostname ? agentPaneName : 'publicIpPane'
+                                                                     }).addTo(map);
 
-                                                    // Track agent origin coordinates for line drawing
-                                                    var agentHostname = conn.origin_hostname || conn.name || '';
-                                                    if (agentHostname) {
-                                                        agentOriginCoords[agentHostname] = [conn.lat, conn.lng];
-                                                    }
+                                                                     var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
+                                                                     agentCircle.bindTooltip(conn.remote || 'Agent', tooltipOptions);
+
+                                                                     var popupHtml = "<b>Agent Exit Point</b><br>" +
+                                                                                     (conn.remote || '') + "<br>" +
+                                                                                     "Hostname: " + (conn.name || '') + "<br>" +
+                                                                                     "<i style='font-size:11px;color:#555'>Click to bring to foreground</i>";
+                                                                     agentCircle.bindPopup(popupHtml);
+
+                                                                     // Click on agent circle → promote that agent to foreground
+                                                                     (function(hostName) {
+                                                                         agentCircle.on('click', function(e) {
+                                                                             try {
+                                                                                 if (mapBridge && typeof mapBridge.setForegroundHost === 'function') {
+                                                                                     console.log('[AgentCircle Click] Bringing to foreground:', hostName);
+                                                                                     mapBridge.setForegroundHost(hostName);
+                                                                                 }
+                                                                             } catch(ex) {
+                                                                                 console.error('[AgentCircle Click] Error:', ex);
+                                                                             }
+                                                                         });
+                                                                     })(agentHostname);
+
+                                                                     liveMarkers.push(agentCircle);
+
+                                                                     // Track agent origin coordinates and color for line drawing
+                                                                     if (agentHostname) {
+                                                                         agentOriginCoords[agentHostname] = [conn.lat, conn.lng];
+                                                                         agentOriginColors[agentHostname] = agentColor;
+                                                                     }
 
                                                 } else {
                                                     // Regular marker
@@ -4873,36 +5135,41 @@ class TCPConnectionViewer(QMainWindow):
                                                     marker.bindPopup(popupHtml, {autoClose: false, closeOnClick: false});
 
                                                     // Add click handler to select corresponding table row in Python.
-                                                    // We unbind the popup before calling pinConnection so that
-                                                    // Leaflet's internal click-to-open-popup path doesn't fire
-                                                    // a popup that will immediately be destroyed by the refresh.
-                                                    (function(connection, m) {
-                                                        m.on('click', function(e) {
-                                                            try {
-                                                                // Prevent Leaflet from opening / re-opening the popup
-                                                                // on this click — the refresh will handle it.
-                                                                m.closePopup();
-                                                                m.off('popupclose');
-                                                                if (mapBridge && typeof mapBridge.pinConnection === 'function') {
-                                                                    console.log('[Marker Click] Calling Python pinConnection:', connection.process, connection.pid, connection.remote, connection.local);
-                                                                    mapBridge.pinConnection(
-                                                                        connection.process || '',
-                                                                        connection.pid || '',
-                                                                        connection.protocol || 'TCP',
-                                                                        connection.local || '',
-                                                                        connection.localport || '',
-                                                                        connection.remote || '',
-                                                                        connection.remoteport || '',
-                                                                        connection.ip_type || ''
-                                                                    );
-                                                                } else {
-                                                                    console.warn('[Marker Click] mapBridge not ready yet');
-                                                                }
-                                                            } catch(e) {
-                                                                console.error('[Marker Click] Error calling pinConnection:', e);
-                                                            }
-                                                        });
-                                                    })(conn, marker);
+                                                     // We unbind the popup before calling pinConnection so that
+                                                     // Leaflet's internal click-to-open-popup path doesn't fire
+                                                     // a popup that will immediately be destroyed by the refresh.
+                                                     (function(connection, m) {
+                                                         m.on('click', function(e) {
+                                                             try {
+                                                                 // Prevent Leaflet from opening / re-opening the popup
+                                                                 // on this click — the refresh will handle it.
+                                                                 m.closePopup();
+                                                                 m.off('popupclose');
+                                                                 if (mapBridge && typeof mapBridge.pinConnection === 'function') {
+                                                                     console.log('[Marker Click] Calling Python pinConnection:', connection.process, connection.pid, connection.remote, connection.local);
+                                                                     mapBridge.pinConnection(
+                                                                         connection.process || '',
+                                                                         connection.pid || '',
+                                                                         connection.protocol || 'TCP',
+                                                                         connection.local || '',
+                                                                         connection.localport || '',
+                                                                         connection.remote || '',
+                                                                         connection.remoteport || '',
+                                                                         connection.ip_type || ''
+                                                                     );
+                                                                 } else {
+                                                                     console.warn('[Marker Click] mapBridge not ready yet');
+                                                                 }
+                                                                 // Bring the marker's agent to the foreground layer
+                                                                 var markerHost = connection.origin_hostname || connection.hostname || '';
+                                                                 if (markerHost && mapBridge && typeof mapBridge.setForegroundHost === 'function') {
+                                                                     mapBridge.setForegroundHost(markerHost);
+                                                                 }
+                                                             } catch(e) {
+                                                                 console.error('[Marker Click] Error calling pinConnection:', e);
+                                                             }
+                                                         });
+                                                     })(conn, marker);
 
                                                     // Auto-open popup when triggered by pinned connection
                                                     if (conn.autoPopup) {
@@ -4955,13 +5222,14 @@ class TCPConnectionViewer(QMainWindow):
                                                 });
                                             }
 
-                                            // Draw orange dashed lines from each agent's exit point to its connections
+                                            // Draw colored dashed lines from each agent's exit point to its connections
                                             Object.keys(agentOriginCoords).forEach(function(hostname) {
                                                 var originCoords = agentOriginCoords[hostname];
+                                                var lineColor = agentOriginColors[hostname] || 'orange';
                                                 var markers = agentMarkerCoords[hostname] || [];
                                                 markers.forEach(function(markerCoords) {
                                                     var polyline = L.polyline([originCoords, markerCoords], {
-                                                        color: 'orange',
+                                                        color: lineColor,
                                                         weight: 2,
                                                         opacity: 0.6,
                                                         dashArray: '5, 10'
@@ -5447,6 +5715,30 @@ class TCPConnectionViewer(QMainWindow):
                         conn['popupGeneration'] = self._pinned_popup_generation
                     break
 
+        # Apply foreground / z-layer icon remapping.
+        # The foreground agent uses the standard localhost colour scheme
+        # (green=normal / blue=new / red=C2 / yellow=pinned).
+        # Localhost, when demoted, uses grey.  Other agents keep their palette
+        # colour regardless of layer position.
+        foreground = getattr(self, '_foreground_hostname', LOCAL_HOSTNAME)
+        if foreground != LOCAL_HOSTNAME:
+            for conn in connections_to_show_on_map:
+                hostname = conn.get('hostname', '')
+                icon = conn.get('icon', '')
+                if icon in ('redIcon', 'yellowIcon', 'agentCircle', 'redCircle', ''):
+                    continue  # never remap suspect/pinned/circle markers
+                if hostname == LOCAL_HOSTNAME:
+                    # Demote localhost to grey
+                    conn['icon'] = 'greyIcon'
+                elif hostname == foreground:
+                    # Promote foreground agent to standard colour scheme
+                    agent_color = conn.get('agent_color', '')
+                    if icon == agent_color + 'Icon':
+                        # Was agent-coloured; switch to green (normal) or blue (new)
+                        conn['icon'] = 'greenIcon'
+                elif hostname:
+                    pass  # other agents keep their assigned palette colour
+
         # Get datetime for the current view (live or timeline)
         datetime_text = ""
         if slider_position is None or slider_position is False:
@@ -5468,7 +5760,40 @@ class TCPConnectionViewer(QMainWindow):
 
         # Build single-line stats string and update map with it
         stats_line = f"Geo resolved locations: {resolved_addresses} - Unresolved locations: {unresolved_addresses} - Local connections: {local_addresses} - UDP *: {udp_no_remote}"
-        self.update_map(connections_to_show_on_map, force_tooltip, stats_text=stats_line, datetime_text=datetime_text)
+        # Cache for reuse when the filter changes without a full refresh
+        self._last_stats_line = stats_line
+        self._last_datetime_text = datetime_text
+
+        # Apply active column filters to the map view as well
+        active_filters = self._get_active_filters()
+        if active_filters:
+            map_conns = [c for c in connections_to_show_on_map
+                         if self._conn_matches_filters(c, active_filters)]
+            # Collect all agent origins from the full list and inject stubs for any
+            # agent whose connections were entirely filtered out so their circle still shows
+            all_agent_origins = {}
+            for conn in connections_to_show_on_map:
+                oh = conn.get('origin_hostname')
+                if oh and oh not in all_agent_origins:
+                    all_agent_origins[oh] = conn
+            matched_origins = {c.get('origin_hostname') for c in map_conns if c.get('origin_hostname')}
+            for hostname, ref_conn in all_agent_origins.items():
+                if hostname not in matched_origins:
+                    map_conns.append({
+                        'process': '', 'pid': '', 'suspect': '', 'local': '', 'localport': '',
+                        'remote': '', 'remoteport': '', 'name': '', 'ip_type': '',
+                        'lat': None, 'lng': None, 'icon': '',
+                        'origin_hostname': hostname,
+                        'origin_lat':      ref_conn.get('origin_lat'),
+                        'origin_lng':      ref_conn.get('origin_lng'),
+                        'origin_public_ip': ref_conn.get('origin_public_ip', ''),
+                        'agent_color':     ref_conn.get('agent_color', 'orange'),
+                        'hostname':        hostname,
+                    })
+        else:
+            map_conns = connections_to_show_on_map
+
+        self.update_map(map_conns, force_tooltip, stats_text=stats_line, datetime_text=datetime_text)
 
         if table_column_sort_index > -1 and not do_pause_table_sorting:
             self.column_resort(table_column_sort_index)
