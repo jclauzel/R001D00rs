@@ -19,7 +19,7 @@ The built-in plugins are:
 
 •	The psutil interface that requires low privileges.
 
-•	A scapy live interface that requires administrative privileges or https://npcap.com/.
+•	A scapy live packet capture interface that requires administrative privileges or https://npcap.com/.
 
 •	A pcap file visualization for recorded packet captures (pcaps).
 
