@@ -15,8 +15,11 @@ The latest release introduces many enhancements from general performance to agen
 
 You can now start on one machine from the settings tab the server feature. Once done you can then deploy as many clients as you wish and point them to the server. From now on the server instance will now render remote machine connections allowing you to monitor your home machine network for example.
 The built-in plugins are:
+
 •	The psutil interface that requires low privileges.
+
 •	A scapy live interface that requires administrative privileges or https://npcap.com/.
+
 •	A pcap file visualization for recorded packet captures (pcaps).
 
 # Why use tcp_geo_map.py?
