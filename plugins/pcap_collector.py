@@ -1,22 +1,35 @@
 """
-Example connection collector plugin that reads connections from a pcap file.
+Connection collector plugin that reads connections from a pcap file.
 
-This is a *template* — it requires the ``scapy`` library to be installed
-(``pip install scapy``) and a pcap file path to be configured.
+Requires the ``scapy`` library (``pip install scapy``).
 
 To use it:
   1. ``pip install scapy``
   2. Place this file in the ``plugins/`` directory next to ``tcp_geo_map.py``.
   3. Launch the application → Settings tab → Connection Collector → select
      "PCAP File Collector".
-  4. Set ``PCAP_FILE_PATH`` below (or extend the plugin to accept a UI path).
+  4. Set the pcap file path in the Settings tab (saved to settings.json).
 """
+
+import json
+import os
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
-# --- Configuration -----------------------------------------------------------
-PCAP_FILE_PATH = ""  # Set to the full path of your .pcap / .pcapng file
-# -----------------------------------------------------------------------------
+# Path to the global settings file (one directory above this plugin)
+_SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'settings.json'
+)
+
+
+def _read_pcap_path() -> str:
+    """Return the pcap_file_path stored in settings.json, or '' if not set."""
+    try:
+        with open(_SETTINGS_FILE, 'r') as f:
+            return json.load(f).get('pcap_file_path', '')
+    except Exception:
+        return ''
 
 
 class PcapCollector(ConnectionCollectorPlugin):
@@ -37,7 +50,8 @@ class PcapCollector(ConnectionCollectorPlugin):
             process, pid, protocol, local, localport, remote, remoteport,
             ip_type, hostname
         """
-        if not PCAP_FILE_PATH:
+        pcap_file_path = _read_pcap_path()
+        if not pcap_file_path:
             return []
 
         try:
@@ -49,7 +63,7 @@ class PcapCollector(ConnectionCollectorPlugin):
         seen = set()
 
         try:
-            packets = rdpcap(PCAP_FILE_PATH)
+            packets = rdpcap(pcap_file_path)
         except Exception:
             return []
 

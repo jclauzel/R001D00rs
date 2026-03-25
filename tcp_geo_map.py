@@ -2,7 +2,7 @@
 
 # R001D00rs tcp_geo_map https://github.com/jclauzel/R001D00rs/
 
-# pip install psutil, maxminddb, PySide6, opencv-python, procmon-parser
+# pip install psutil, maxminddb PySide6 opencv-python procmon-parser flask scapy
 
 # using https://github.com/pointhi/leaflet-color-markers for colored map markers
 # using https://github.com/sapics/ip-location-db/tree/main/geolite2-city this script is using the MaxMind GeoLite2 database and is attributed accordingly for its usage.
@@ -66,11 +66,11 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
     git clone https://github.com/jclauzel/R001D00rs
     python3 -m venv ./venv
     source venv/bin/activate
-    pip3 install psutil pyside6 requests maxminddb opencv-python procmon-parser
+    pip3 install psutil pyside6 requests maxminddb opencv-python procmon-parser scapy
     python3 tcp_geo_map.py
 
     Windows:
-    pip3 install pyside6 requests maxminddb opencv-python procmon-parser
+    pip3 install pyside6 requests maxminddb opencv-python procmon-parser scapy
 """
 
 import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, logging, platform, subprocess, procmon_parser
@@ -88,7 +88,7 @@ logging.basicConfig(
 )
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QTableWidget, QTableWidgetItem, QLabel,
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox)
+                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog)
 from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint, QSize
 from PySide6.QtWidgets import QStyle
@@ -98,7 +98,7 @@ from PySide6.QtWebChannel import QWebChannel
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
-VERSION = "3.2.4" # Current script version
+VERSION = "3.3.1" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -1321,6 +1321,7 @@ class TCPConnectionViewer(QMainWindow):
             'agent_no_ui': agent_no_ui,
             'agent_colors': dict(self._agent_colors),
             'active_collector_plugin': self._active_collector.name,
+            'pcap_file_path': getattr(self, '_pcap_file_path', ''),
         }
 
         # Save current map position and zoom
@@ -1476,6 +1477,9 @@ class TCPConnectionViewer(QMainWindow):
                                 self._active_collector = plugin
                                 break
 
+                    # Restore pcap file path
+                    self._pcap_file_path = settings.get('pcap_file_path', '')
+
                     # Restore map position and zoom (CRITICAL: do this BEFORE init_ui/update_map)
                 try:
                     lat = settings.get('map_center_lat')
@@ -1624,6 +1628,12 @@ class TCPConnectionViewer(QMainWindow):
                             self._collector_combo.setCurrentIndex(i)
                             break
 
+                # Restore pcap file path input
+                if hasattr(self, '_pcap_path_input'):
+                    self._pcap_path_input.setText(getattr(self, '_pcap_file_path', ''))
+                if hasattr(self, '_pcap_path_row'):
+                    self._pcap_path_row.setVisible(self._active_collector.name == "PCAP File Collector")
+
         except Exception as e:
             logging.error(f"Error applying settings to UI: {e}")
 
@@ -1771,6 +1781,31 @@ class TCPConnectionViewer(QMainWindow):
                     pass
             self._active_collector = self._collector_plugins[index]
             logging.info(f"Connection collector changed to: {self._active_collector.name}")
+            # Show the PCAP path row only when the PCAP file collector is active
+            if hasattr(self, '_pcap_path_row'):
+                self._pcap_path_row.setVisible(self._active_collector.name == "PCAP File Collector")
+            self.save_settings()
+
+    @Slot()
+    def _on_pcap_path_changed(self):
+        """Save the pcap file path to settings when the user edits it."""
+        if hasattr(self, '_pcap_path_input'):
+            self._pcap_file_path = self._pcap_path_input.text().strip()
+            self.save_settings()
+
+    @Slot()
+    def _on_pcap_browse(self):
+        """Open a file dialog to choose a pcap file."""
+        start_dir = ''
+        if hasattr(self, '_pcap_path_input'):
+            start_dir = os.path.dirname(self._pcap_path_input.text().strip())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select PCAP file", start_dir,
+            "PCAP files (*.pcap *.pcapng);;All files (*)"
+        )
+        if path and hasattr(self, '_pcap_path_input'):
+            self._pcap_path_input.setText(path)
+            self._pcap_file_path = path
             self.save_settings()
 
     def _on_no_ui_changed(self, state):
@@ -2454,13 +2489,17 @@ class TCPConnectionViewer(QMainWindow):
         action_bring_to_top.setEnabled(bool(row_hostname) and row_hostname != foreground_host)
         menu.addSeparator()
 
-        if platform.system() == "Windows":
-            action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
-            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
-            action_procmon = menu.addAction(f"Open {process_name} pid:{pid} in Process Monitor")
-        else:
-            action_open = menu.addAction(f"Open {process_name} pid:{pid} in htop")
-            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} memory")
+        # Only offer local-process tools when the row comes from this machine
+        _is_remote_agent = bool(row_hostname) and row_hostname != LOCAL_HOSTNAME
+        action_open = action_memory = action_procmon = None
+        if not _is_remote_agent:
+            if platform.system() == "Windows":
+                action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
+                action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
+                action_procmon = menu.addAction(f"Open {process_name} pid:{pid} in Process Monitor")
+            else:
+                action_open = menu.addAction(f"Open {process_name} pid:{pid} in htop")
+                action_memory = menu.addAction(f"Capture {process_name} pid:{pid} memory")
 
         chosen = menu.exec(self.connection_table.viewport().mapToGlobal(pos))
         if chosen is None:
@@ -2596,20 +2635,26 @@ class TCPConnectionViewer(QMainWindow):
             return
 
         row = index.row()
-        pid_item = self.summary_table.item(row, 1)   # PID column
-        pid = pid_item.text().strip() if pid_item else ""
-        process_item = self.summary_table.item(row, 0)  # Process column
+        hostname_item = self.summary_table.item(row, 0)  # Hostname column
+        row_hostname = hostname_item.text().strip() if hostname_item else ""
+        process_item = self.summary_table.item(row, 1)  # Process column
         process_name = process_item.text().strip() if process_item else ""
+        pid_item = self.summary_table.item(row, 2)      # PID column
+        pid = pid_item.text().strip() if pid_item else ""
 
         menu = QMenu(self)
 
-        if platform.system() == "Windows":
-            action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
-            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
-            action_procmon = menu.addAction(f"Open {process_name} pid:{pid} in Process Monitor")
-        else:
-            action_open = menu.addAction(f"Open {process_name} pid:{pid} in htop")
-            action_memory = menu.addAction(f"Capture {process_name} pid:{pid} memory")
+        # Only offer local-process tools when the row comes from this machine
+        _is_remote_agent = bool(row_hostname) and row_hostname != LOCAL_HOSTNAME
+        action_open = action_memory = action_procmon = None
+        if not _is_remote_agent:
+            if platform.system() == "Windows":
+                action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
+                action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
+                action_procmon = menu.addAction(f"Open {process_name} pid:{pid} in Process Monitor")
+            else:
+                action_open = menu.addAction(f"Open {process_name} pid:{pid} in htop")
+                action_memory = menu.addAction(f"Capture {process_name} pid:{pid} memory")
 
         chosen = menu.exec(self.summary_table.viewport().mapToGlobal(pos))
         if chosen is None:
@@ -3957,6 +4002,24 @@ class TCPConnectionViewer(QMainWindow):
         self._collector_combo.currentIndexChanged.connect(self._on_collector_changed)
         collector_row.addWidget(self._collector_combo, 1)
         settings_tab_layout.addLayout(collector_row)
+
+        # PCAP file path row — visible only when PcapCollector is active
+        self._pcap_path_row = QWidget()
+        pcap_path_layout = QHBoxLayout(self._pcap_path_row)
+        pcap_path_layout.setContentsMargins(0, 0, 0, 0)
+        pcap_path_layout.addWidget(QLabel("PCAP file:"))
+        self._pcap_path_input = QLineEdit()
+        self._pcap_path_input.setPlaceholderText("Path to .pcap / .pcapng file…")
+        self._pcap_path_input.setText(getattr(self, '_pcap_file_path', ''))
+        self._pcap_path_input.editingFinished.connect(self._on_pcap_path_changed)
+        pcap_path_layout.addWidget(self._pcap_path_input, 1)
+        pcap_browse_btn = QPushButton("Browse…")
+        pcap_browse_btn.setFixedWidth(80)
+        pcap_browse_btn.clicked.connect(self._on_pcap_browse)
+        pcap_path_layout.addWidget(pcap_browse_btn)
+        settings_tab_layout.addWidget(self._pcap_path_row)
+        # Show/hide based on current active collector
+        self._pcap_path_row.setVisible(self._active_collector.name == "PCAP File Collector")
 
         # --- Server / Agent mode settings ---
         server_agent_separator = QLabel("─── Server / Agent Mode ───")
