@@ -11,6 +11,14 @@ Maximum connection snapshots to keep in memory can be modified on the Settings t
 
 In the settings tab the "Capture screenshots of the map to disk" feature may be turned on to take screenshots of the map into the screen_captures folder. Everytime the map is lived refreshed an new .jpg file will be generated. When the feature is on a new button will apear on the main tab that will generate a new .mp4 video capture of all the present .jpg file in the same location. To prevent disk space from getting filled the older files are automaticaly deleted.
 
+The latest release introduces many enhancements from general performance to agent (client) / server architecture and its new plugin API (ConnectionCollectorPlugin interface) that makes it extensible.
+
+You can now start on one machine from the settings tab the server feature. Once done you can then deploy as many clients as you wish and point them to the server. From now on the server instance will now render remote machine connections allowing you to monitor your home machine network for example.
+The built-in plugins are:
+•	The psutil interface that requires low privileges.
+•	A scapy live interface that requires administrative privileges or https://npcap.com/.
+•	A pcap file visualization for recorded packet captures (pcaps).
+
 # Why use tcp_geo_map.py?
 Ever wondered, is this machine clean? To what endpoints and geographical destination is this host connecting to such as to sending telemetry or simply understand this machine "network" behavior based on what processes (running programs) on it? 
 This GeoInt OSINT script UI shows on the earth map live network connections made and will warn based on the C2-Tracker list maintained by montysecurity if the machine connects to a suspicious C2 endpoint.
