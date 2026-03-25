@@ -89,8 +89,8 @@ logging.basicConfig(
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QTableWidget, QTableWidgetItem, QLabel,
                              QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit) 
-from PySide6.QtGui import QIcon, QAction
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint
+from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint, QSize
 from PySide6.QtWidgets import QStyle
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
@@ -1091,6 +1091,7 @@ class TCPConnectionViewer(QMainWindow):
             'enable_server_mode': enable_server_mode,
             'enable_agent_mode': enable_agent_mode,
             'agent_server_address': agent_server_address,
+            'agent_colors': dict(self._agent_colors),
         }
 
         # Save current map position and zoom
@@ -1193,11 +1194,24 @@ class TCPConnectionViewer(QMainWindow):
                     elif saved_agent and not saved_server:
                         enable_agent_mode = True
                         agent_server_address = saved_addr
-                    # If both were somehow True in settings, ignore (mutual exclusion)
-                    if not enable_agent_mode:
-                        agent_server_address = saved_addr
+                         # If both were somehow True in settings, ignore (mutual exclusion)
+                        if not enable_agent_mode:
+                            agent_server_address = saved_addr
 
-                # Restore map position and zoom (CRITICAL: do this BEFORE init_ui/update_map)
+                    # Restore per-agent color assignments
+                    saved_colors = settings.get('agent_colors', {})
+                    for h, c in saved_colors.items():
+                        if isinstance(h, str) and isinstance(c, str) and c in self._AGENT_COLOR_PALETTE:
+                            self._agent_colors[h] = c
+                    # Advance color index past already-claimed colors so new agents
+                    # don't collide with persisted assignments.
+                    used_colors = list(self._agent_colors.values())
+                    for _color in self._AGENT_COLOR_PALETTE:
+                        if _color not in used_colors:
+                            break
+                        self._agent_color_index += 1
+
+                    # Restore map position and zoom (CRITICAL: do this BEFORE init_ui/update_map)
                 try:
                     lat = settings.get('map_center_lat')
                     lng = settings.get('map_center_lng')
@@ -1327,6 +1341,10 @@ class TCPConnectionViewer(QMainWindow):
                 if hasattr(self, 'agent_server_input'):
                     self.agent_server_input.setText(agent_server_address)
 
+                # Populate Agent Management table if server mode is active and agents were saved
+                if enable_server_mode and self._agent_colors:
+                    self._refresh_agent_management_table()
+
         except Exception as e:
             logging.error(f"Error applying settings to UI: {e}")
 
@@ -1354,7 +1372,92 @@ class TCPConnectionViewer(QMainWindow):
         else:
             enable_server_mode = False
             # Flask cannot be gracefully stopped mid-process; it will die with the app.
+        # Show or hide the Agent Management tab to match current mode
+        if hasattr(self, 'tab_widget') and hasattr(self, '_agent_mgmt_tab_index'):
+            self.tab_widget.setTabVisible(self._agent_mgmt_tab_index, enable_server_mode)
+            if enable_server_mode:
+                self._refresh_agent_management_table()
         logging.info(f"Server mode {'enabled' if enable_server_mode else 'disabled'}")
+
+    def _refresh_agent_management_table(self):
+        """Rebuild the Agent Management table from the current agent registry."""
+        if not hasattr(self, 'agent_mgmt_table'):
+            return
+        try:
+            # Collect all known hostnames: from color map and from live cache
+            known_hosts = set(self._agent_colors.keys())
+            with self._agent_cache_lock:
+                known_hosts.update(self._agent_cache.keys())
+            known_hosts = sorted(known_hosts)
+
+            self.agent_mgmt_table.setRowCount(0)
+
+            for hostname in known_hosts:
+                row = self.agent_mgmt_table.rowCount()
+                self.agent_mgmt_table.insertRow(row)
+
+                # Column 0 — hostname
+                host_item = QTableWidgetItem(hostname)
+                host_item.setFlags(Qt.ItemIsEnabled)
+                self.agent_mgmt_table.setItem(row, 0, host_item)
+
+                # Column 1 — color combo box with swatch + label per item
+                color_combo = QComboBox()
+                color_combo.setIconSize(QSize(16, 16))
+
+                for color in self._AGENT_COLOR_PALETTE:
+                    # Build a solid 16×16 swatch icon for each palette entry
+                    pix = QPixmap(16, 16)
+                    pix.fill(QColor(color))
+                    color_combo.addItem(QIcon(pix), color)
+
+                current_color = self._agent_colors.get(hostname)
+                if current_color and current_color in self._AGENT_COLOR_PALETTE:
+                    color_combo.setCurrentText(current_color)
+
+                # Style the combo's display button to reflect the chosen color
+                def _apply_combo_style(combo, chosen):
+                    fg = 'white' if chosen in ('black', 'violet') else 'black'
+                    combo.setStyleSheet(
+                        f"QComboBox {{ background-color: {chosen}; color: {fg}; }}"
+                        f"QComboBox QAbstractItemView {{ background-color: white; color: black; }}"
+                    )
+
+                if current_color and current_color in self._AGENT_COLOR_PALETTE:
+                    _apply_combo_style(color_combo, current_color)
+
+                # Capture hostname in closure
+                def make_color_changed(hn, combo):
+                    def _on_color_changed(_index):
+                        chosen = combo.currentText()
+                        self._agent_colors[hn] = chosen
+                        _apply_combo_style(combo, chosen)
+                        self.save_settings()
+                        self._update_map_with_filter()
+                    return _on_color_changed
+
+                color_combo.currentIndexChanged.connect(make_color_changed(hostname, color_combo))
+                self.agent_mgmt_table.setCellWidget(row, 1, color_combo)
+
+                # Column 2 — Clear button
+                clear_btn = QPushButton("Clear")
+                clear_btn.setToolTip(f"Remove all saved settings for {hostname}")
+
+                def make_clear_handler(hn):
+                    def _on_clear():
+                        self._agent_colors.pop(hn, None)
+                        with self._agent_cache_lock:
+                            self._agent_cache.pop(hn, None)
+                        self.save_settings()
+                        self._refresh_agent_management_table()
+                        self._update_map_with_filter()
+                    return _on_clear
+
+                clear_btn.clicked.connect(make_clear_handler(hostname))
+                self.agent_mgmt_table.setCellWidget(row, 2, clear_btn)
+
+        except Exception as e:
+            logging.error(f"Error refreshing agent management table: {e}")
 
     @Slot(int)
     def _on_agent_mode_changed(self, state):
@@ -1441,6 +1544,13 @@ class TCPConnectionViewer(QMainWindow):
         with self._agent_cache_lock:
             snapshot = dict(self._agent_cache)
         self._last_agent_count = len(snapshot)
+
+        # If any hostname in the snapshot is new (not yet in the table),
+        # schedule a table refresh on the main thread.
+        new_hosts = set(snapshot.keys()) - set(self._agent_colors.keys())
+        if new_hosts and hasattr(self, 'agent_mgmt_table'):
+            QTimer.singleShot(0, self._refresh_agent_management_table)
+
         return snapshot
 
     def _get_local_ip_addresses(self):
@@ -3285,6 +3395,41 @@ class TCPConnectionViewer(QMainWindow):
         self.tab_widget.addTab(summary_tab_widget, "Summary")
         self.tab_widget.addTab(actions_tab_widget, "Actions")
         self.tab_widget.addTab(settings_tab_widget, "Settings")
+
+        # --- Agent Management tab (only shown when server mode is active) ---
+        agent_mgmt_tab_widget = QWidget()
+        agent_mgmt_tab_layout = QVBoxLayout(agent_mgmt_tab_widget)
+        agent_mgmt_tab_layout.setContentsMargins(10, 10, 10, 10)
+        agent_mgmt_tab_layout.setSpacing(10)
+
+        agent_mgmt_title = QLabel("Agent Management")
+        agent_mgmt_title.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        agent_mgmt_tab_layout.addWidget(agent_mgmt_title)
+
+        agent_mgmt_desc = QLabel(
+            "All known agents seen by this server. "
+            "Assign a display color from the palette or clear an agent's settings."
+        )
+        agent_mgmt_desc.setWordWrap(True)
+        agent_mgmt_tab_layout.addWidget(agent_mgmt_desc)
+
+        self.agent_mgmt_table = QTableWidget(0, 3)
+        self.agent_mgmt_table.setHorizontalHeaderLabels(["Hostname", "Color", "Action"])
+        self.agent_mgmt_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.agent_mgmt_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.agent_mgmt_table.verticalHeader().setVisible(False)
+        self.agent_mgmt_table.setSelectionMode(QTableWidget.NoSelection)
+        agent_mgmt_tab_layout.addWidget(self.agent_mgmt_table)
+        agent_mgmt_tab_layout.addStretch()
+
+        self.tab_widget.addTab(agent_mgmt_tab_widget, "Agent Management")
+        # Keep track of the agent management tab index
+        self._agent_mgmt_tab_index = self.tab_widget.count() - 1
+        # Only show it when server mode is active
+        self.tab_widget.setTabVisible(self._agent_mgmt_tab_index, enable_server_mode)
 
         # Connect tab change event to update summary when Summary tab is selected
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
@@ -6388,8 +6533,11 @@ class TCPConnectionViewer(QMainWindow):
                 if self._summary_needs_update:
                     self.update_summary_table()
                     self._summary_needs_update = False
+            # Refresh Agent Management table whenever it is activated
+            if hasattr(self, '_agent_mgmt_tab_index') and index == self._agent_mgmt_tab_index:
+                self._refresh_agent_management_table()
         except Exception as e:
-            logging.error(f"Error updating summary tab: {e}")
+            logging.error(f"Error updating tab: {e}")
 
     def update_summary_table(self):
         """Populate the summary table with aggregated connection statistics"""
