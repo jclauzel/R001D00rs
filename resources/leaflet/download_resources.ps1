@@ -4,15 +4,14 @@
 Write-Host "Downloading Leaflet marker icons..." -ForegroundColor Green
 
 try {
-    # Download marker icons
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png" -OutFile "marker-icon-2x-red.png"
-    Write-Host "  ✓ Downloaded marker-icon-2x-red.png" -ForegroundColor Green
-    
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png" -OutFile "marker-icon-2x-green.png"
-    Write-Host "  ✓ Downloaded marker-icon-2x-green.png" -ForegroundColor Green
-    
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png" -OutFile "marker-icon-2x-blue.png"
-    Write-Host "  ✓ Downloaded marker-icon-2x-blue.png" -ForegroundColor Green
+    # Download marker icons (all available colors from pointhi/leaflet-color-markers)
+    $colors = @('red','green','blue','yellow','orange','violet','grey','black','gold')
+    foreach ($color in $colors) {
+        $url = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-$color.png"
+        $out = "marker-icon-2x-$color.png"
+        Invoke-WebRequest -Uri $url -OutFile $out
+        Write-Host "  ✓ Downloaded $out" -ForegroundColor Green
+    }
 
     Write-Host ""
     Write-Host "Downloading Leaflet library (optional, for full offline mode)..." -ForegroundColor Yellow
