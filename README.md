@@ -52,6 +52,12 @@ When prompted for download and agreed the script will fetch the following file c
 * procmon-parser
 When right clicking on a table item sysinternals procmon can be started to automaticaly start capturing process activity. To generate the procmon capture profile it uses https://github.com/eronnen/procmon-parser .
 
+* flask
+When using server and agent mode, the server will start by default a flask web server on port 5000 (port can be configured in the settings tab). You may need to create a firewall rule allow python to listen and allow remote agents (clients) to connect to it
+
+* scapy
+You may replace psutil collection by scapy live packet capture. To do so navigate to the settings tab and select the scapy collector. This requires to run the script (python) as an administrator. By default the scapy plugin will try to capture layer 2 packets and then falls back to layer 3 if not found. For layer 2 capture you will need to install https://npcap.com/ but this is not mandatory as if not present the default plugin will fallback to layer 3 (requiring administrative privileges though).
+
 tcp_geo_map uses:
 
 * maxminddb
@@ -61,6 +67,7 @@ tcp_geo_map uses:
 * opencv-python
 * procmon-parser
 * flask
+* scapy
 * https://github.com/pointhi/leaflet-color-markers
 
 When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process performing such a call will be tagged in red and "C2" column will mark "Yes".
@@ -100,7 +107,7 @@ python3 -m venv ./R001D00rs
 
 source R001D00rs/bin/activate
 
-pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser flask
+pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser flask scapy
 
 or
 
@@ -121,7 +128,7 @@ Download source from latest "release" located on the right side of https://githu
 
 Install required packages:
 
-pip3 install pyside6 requests maxminddb opencv-python procmon-parser flask
+pip3 install pyside6 requests maxminddb opencv-python procmon-parser flask scapy
 
 or
 
