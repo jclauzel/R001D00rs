@@ -73,8 +73,9 @@ IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR F
     pip3 install pyside6 requests maxminddb opencv-python procmon-parser scapy
 """
 
-import requests, datetime, sys, os, concurrent, threading, time, socket, csv, psutil, maxminddb, json, queue, logging, platform, subprocess, procmon_parser
-from concurrent.futures import ThreadPoolExecutor
+import requests, datetime, sys, os, threading, time, socket, csv, psutil, maxminddb, json, queue, logging, platform, subprocess, signal, ipaddress
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Suppress Qt WebEngine Chromium warnings (must be set before QApplication)
 os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.webenginecontext.debug=false'
@@ -88,9 +89,9 @@ logging.basicConfig(
 )
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QTableWidget, QTableWidgetItem, QLabel,
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QGraphicsOpacityEffect, QGridLayout, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog)
+                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog)
 from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint, QSize
+from PySide6.QtCore import Qt, QTimer, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint, QSize
 from PySide6.QtWidgets import QStyle
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
@@ -98,7 +99,7 @@ from PySide6.QtWebChannel import QWebChannel
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
-VERSION = "3.3.1" # Current script version
+VERSION = "3.3.2" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -116,6 +117,46 @@ SETTINGS_FILE_NAME = "settings.json"
     You can pass --accept_eula as a startup parametter to the script to automate download and refresh 
     the Geolite and c2 tracker databases howver this means you fully agree to their licensing terms
 """
+# ---------------------------------------------------------------------------
+# Help / usage — must be checked before any other sys.argv processing so that
+# the app exits immediately without requiring a display or any other deps.
+# ---------------------------------------------------------------------------
+_HELP_FLAGS = {"-h", "-?", "/?", "--h", "--help"}
+if _HELP_FLAGS.intersection(sys.argv):
+    print("""
+Usage: python tcp_geo_map.py [OPTIONS]
+
+Options:
+  --accept_eula
+      Automatically accept the EULA for the GeoLite2 and C2-Tracker databases
+      and allow them to be downloaded/refreshed on startup. By passing this
+      flag you confirm that you have read and agree to their respective
+      licensing terms.
+
+  --enable_server_mode
+      Start the application in server mode. A Flask endpoint is started to
+      collect connection data submitted by one or more remote agents.
+
+  --enable_agent_mode <host>
+      Start the application in agent mode. The app periodically POSTs its
+      live connection data to the server at <host>. <host> may be a bare
+      hostname/IP (e.g. "myserver") or a legacy full URL
+      (e.g. "http://myserver:5000").
+
+  --no_ui
+      Run as a headless background agent — no window is shown and no taskbar
+      button is created. Only meaningful when combined with --enable_agent_mode.
+
+  --no_ui_off
+      Explicitly disable agent headless mode and persist that choice to settings.json
+      so future launches without any flag also show the UI. Takes precedence
+      over any saved "agent_no_ui" value in settings.json.
+
+  -h, -?, /?, --h, --help
+      Show this help message and exit.
+""")
+    sys.exit(0)
+
 ACCEPT_EULA = "--accept_eula" in sys.argv
 
 
@@ -234,6 +275,21 @@ if _agent_idx is not None:
 # --no_ui: run as a headless background agent (no window shown, no taskbar button)
 if "--no_ui" in sys.argv:
     agent_no_ui = True
+# --no_ui_off: explicitly disable headless mode and persist that to settings.json
+_no_ui_off_requested = "--no_ui_off" in sys.argv
+if _no_ui_off_requested:
+    agent_no_ui = False
+    _settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
+    try:
+        _s = {}
+        if os.path.exists(_settings_path):
+            with open(_settings_path, 'r') as _f:
+                _s = json.load(_f)
+        _s['agent_no_ui'] = False
+        with open(_settings_path, 'w') as _f:
+            json.dump(_s, _f, indent=4)
+    except Exception as _e:
+        logging.warning(f"--no_ui_off: could not update settings.json: {_e}")
 # Mutual exclusion: agent takes precedence if both are set
 if enable_server_mode and enable_agent_mode:
     enable_server_mode = False
@@ -781,9 +837,6 @@ class TCPConnectionViewer(QMainWindow):
         self.reader_c2_tracker_set = None  # Fast O(1) lookup set
         self.connections = []
 
-        # Track previous connections for incremental updates
-        self.previous_connections = set()
-
         # Pinned (double-clicked) connection — persists across refreshes, shown as yellow marker
         self._pinned_connection = None
         self._pinned_popup_open = False  # True while the pinned popup should stay open
@@ -797,6 +850,8 @@ class TCPConnectionViewer(QMainWindow):
 
         # HTTP session for public IP checks (connection pooling)
         self._http_session = requests.Session()
+        self._public_ip_cache = ""
+        self._public_ip_cache_time = 0.0
 
         # --- Server / Agent mode runtime state ---
         # Server mode: cache of latest submissions from each agent
@@ -830,15 +885,9 @@ class TCPConnectionViewer(QMainWindow):
         # palette colour (grey for localhost when demoted).
         self._foreground_hostname = LOCAL_HOSTNAME
 
-        # Debounced map update
-        self._map_update_timer = QTimer()
-        self._map_update_timer.setSingleShot(True)
-        self._map_update_timer.timeout.connect(self._do_map_update)
-        self._pending_map_data = None
-
         # Summary table needs update flag
         self._summary_needs_update = True
-        
+
         self.load_ip_cache()
  
         # Start persistent DNS worker that warms the ip_cache in background.
@@ -1414,8 +1463,8 @@ class TCPConnectionViewer(QMainWindow):
 
                 # Restore server/agent mode settings (CLI args take precedence)
                 global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT
-                # Only restore no_ui from settings if --no_ui was not passed on CLI
-                if not agent_no_ui:
+                # Only restore no_ui from settings if neither --no_ui nor --no_ui_off was passed on CLI
+                if not agent_no_ui and not _no_ui_off_requested:
                     agent_no_ui = bool(settings.get('agent_no_ui', False))
 
                 def _valid_port(val, default):
@@ -1636,13 +1685,6 @@ class TCPConnectionViewer(QMainWindow):
 
         except Exception as e:
             logging.error(f"Error applying settings to UI: {e}")
-
-    def load_settings(self):
-        """Load settings from a JSON file (legacy method - now split into early/late phases)"""
-        # This method is kept for backward compatibility but actual loading happens in:
-        # _load_settings_early() - before UI creation
-        # _apply_settings_to_ui() - after UI creation
-        pass
 
     # ── Server / Agent mode helpers ──────────────────────────────────────
 
@@ -2157,7 +2199,6 @@ class TCPConnectionViewer(QMainWindow):
         """Return (lat, lng) for the given public IP, or (None, None)."""
         try:
             if public_ip:
-                import ipaddress
                 try:
                     ip_obj = ipaddress.ip_address(public_ip)
                     ip_type = "IPv4" if ip_obj.version == 4 else "IPv6"
@@ -2401,7 +2442,7 @@ class TCPConnectionViewer(QMainWindow):
         # Submit lookups and collect resolved hostnames
         with ThreadPoolExecutor(max_workers=max_workers) as exe:
             futures = {exe.submit(_lookup_and_cache, ip): ip for ip in to_resolve}
-            for fut in concurrent.futures.as_completed(futures):
+            for fut in as_completed(futures):
                 try:
                     ip_addr, hostname = fut.result()
                 except Exception:
@@ -3038,12 +3079,14 @@ class TCPConnectionViewer(QMainWindow):
             rows = non_empties + empties
 
         # repopulate table from sorted snapshot
+        self.connection_table.setUpdatesEnabled(False)
         self.connection_table.setRowCount(0)
         for _, row_values in rows:
             new_row = self.connection_table.rowCount()
             self.connection_table.insertRow(new_row)
             for c, text in enumerate(row_values):
                 self.connection_table.setItem(new_row, c, QTableWidgetItem(text))
+        self.connection_table.setUpdatesEnabled(True)
 
     @Slot(int)
     def on_summary_header_clicked(self, index):
@@ -3119,6 +3162,7 @@ class TCPConnectionViewer(QMainWindow):
             rows = non_empties + empties
 
         # repopulate table from sorted snapshot
+        self.summary_table.setUpdatesEnabled(False)
         self.summary_table.setRowCount(0)
         for _, row_values, row_colors in rows:
             new_row = self.summary_table.rowCount()
@@ -3129,6 +3173,7 @@ class TCPConnectionViewer(QMainWindow):
                 if c < len(row_colors) and row_colors[c] is not None:
                     item.setForeground(row_colors[c])
                 self.summary_table.setItem(new_row, c, item)
+        self.summary_table.setUpdatesEnabled(True)
 
      # Update connection list when slider changes
     @Slot(int)
@@ -3169,6 +3214,7 @@ class TCPConnectionViewer(QMainWindow):
             do_resolve_public_ip = True
         else:
             do_resolve_public_ip = False
+        self.save_settings()
 
     @Slot()
     def update_capture_screenshots(self):
@@ -3186,6 +3232,7 @@ class TCPConnectionViewer(QMainWindow):
                 QMessageBox.warning(self, "Screenshot Error", f"Failed to create screenshot directory: {e}")
         else:
             do_capture_screenshots = False
+        self.save_settings()
 
     @Slot()
     def update_buffer_size(self):
@@ -3225,9 +3272,9 @@ class TCPConnectionViewer(QMainWindow):
             # Always reset connections when buffer size changes
             logging.info("Resetting connections due to buffer size change")
 
-            # Clear connection data
+            # Clear connection data — recreate deque with updated maxlen
             if hasattr(self, 'connection_list'):
-                self.connection_list.clear()
+                self.connection_list = deque(maxlen=max_connection_list_filo_buffer_size)
             if hasattr(self, 'connections'):
                 self.connections = []
 
@@ -3276,6 +3323,8 @@ class TCPConnectionViewer(QMainWindow):
                         self._start_stop_button_wave()
                     if hasattr(self, 'status_label'):
                         self.status_label.setText("Auto-refreshing connections.")
+
+            self.save_settings()
 
         except ValueError as e:
             # Invalid input - show error and revert
@@ -3329,6 +3378,7 @@ class TCPConnectionViewer(QMainWindow):
                     self.public_ip_dns_cache_cleanup_timer.stop()
             except Exception:
                 pass
+        self.save_settings()
 
     @Slot()
     def update_c2_check(self):
@@ -3342,6 +3392,7 @@ class TCPConnectionViewer(QMainWindow):
             self.setStyleSheet("") # Reset any previous styles
 
         self.refresh_connections()
+        self.save_settings()
 
     @Slot()
     def only_show_new_connections_changed(self):
@@ -3355,6 +3406,7 @@ class TCPConnectionViewer(QMainWindow):
             self.setStyleSheet("") # Reset any previous styles
 
         self.refresh_connections()
+        self.save_settings()
 
     @Slot()
     def only_show_remote_connections_changed(self):
@@ -3368,11 +3420,13 @@ class TCPConnectionViewer(QMainWindow):
             self.setStyleSheet("") # Reset any previous styles
 
         self.refresh_connections()
+        self.save_settings()
 
     @Slot()
     def update_pause_table_sorrting(self):
         global do_pause_table_sorting
         do_pause_table_sorting = self.pause_table_sorting_check.isChecked()
+        self.save_settings()
 
     @Slot()
     def update_refresh_interval(self):
@@ -3382,6 +3436,7 @@ class TCPConnectionViewer(QMainWindow):
         map_refresh_interval = selected_interval
         self.timer.stop()
         self.timer.start(map_refresh_interval)
+        self.save_settings()
 
     @Slot()
     def reset_connections(self):
@@ -3602,7 +3657,7 @@ class TCPConnectionViewer(QMainWindow):
             self._start_capture_button_flash()
 
     def init_ui(self):
-        self.connection_list = []
+        self.connection_list = deque(maxlen=max_connection_list_filo_buffer_size)
         self.connection_list_counter = 0
 
         # Use a horizontal splitter so the user can resize left/right panels with the mouse
@@ -3760,7 +3815,6 @@ class TCPConnectionViewer(QMainWindow):
         # Set initial loading HTML after page is configured
         self.map_view.setHtml("<html><body><h2>Loading map...</h2></body></html>")
 
-        self.map_redraw = True
         self.map_objects = 0
         self.map_initialized = False
         self._map_reload_attempts = 0  # Track reload attempts to prevent infinite loops
@@ -4655,19 +4709,6 @@ class TCPConnectionViewer(QMainWindow):
                         
             return connections
         
-    def are_connections_identical(self, conn1, conn2):
-        # Check if all important fields are the same
-        return (
-            conn1['process'] == conn2['process'] and
-            conn1['pid'] == conn2['pid'] and
-            conn1['protocol'] == conn2['protocol'] and
-            conn1['local'] == conn2['local'] and
-            conn1['localport'] == conn2['localport'] and
-            conn1['remote'] == conn2['remote'] and
-            conn1['remoteport'] == conn2['remoteport'] and
-            conn1['ip_type'] == conn2['ip_type'] 
-        )
-
     def _is_pinned_connection(self, conn):
         """Check if *conn* matches the pinned (double-clicked) connection.
 
@@ -4691,81 +4732,6 @@ class TCPConnectionViewer(QMainWindow):
             conn.get('ip_type') == pin.get('ip_type')
         )
 
-    def is_connection_in_list(self, connection, connection_list):
-        for conn in connection_list:
-            if self.are_connections_identical(conn, connection):
-                return True
-        return False
-
-    def _parse_netstat_udp(self):
-        """Run a single 'netstat -ano' on Windows and extract connected UDP/UDPv6 remote addresses.
-
-        psutil's GetExtendedUdpTable (and the per-process variant) only reports
-        local bindings – the MIB_UDPROW_OWNER_PID struct has no remote-address
-        fields.  This is a documented limitation of the Win32 IP Helper API.
-        netstat.exe obtains connected-UDP remote addresses via undocumented
-        Network Store Interface (NSI) calls that are not exposed to user code.
-
-        A single 'netstat -ano' invocation returns both UDP (IPv4) and UDPv6
-        lines, so one subprocess call covers everything.
-
-        Returns a dict: (local_ip, local_port, pid) -> (remote_ip, remote_port)
-        Only entries with a meaningful remote address (not *:*  or 0.0.0.0:0) are included.
-        """
-        lookup = {}
-        try:
-            result = subprocess.run(
-                ["netstat", "-ano"],
-                capture_output=True, text=True, timeout=10,
-                encoding='utf-8', errors='replace',
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                # Only process UDP lines (covers both "UDP" and "UDPv6" protocol labels)
-                if not line.startswith("UDP"):
-                    continue
-                parts = line.split()
-                # Expected format: UDP  local_addr:port  remote_addr:port  PID
-                if len(parts) < 4:
-                    continue
-                local_raw = parts[1]
-                remote_raw = parts[2]
-                pid_str = parts[3]
-
-                # Skip entries where remote is *:* or 0.0.0.0:0 or [::]:0
-                if remote_raw in ("*:*", "0.0.0.0:0", "[::]:0"):
-                    continue
-
-                # Parse local address
-                l_ip, l_port = self._split_netstat_addr(local_raw)
-                # Parse remote address
-                r_ip, r_port = self._split_netstat_addr(remote_raw)
-
-                if r_ip and r_ip not in ("*", "0.0.0.0", "::", ""):
-                    lookup[(l_ip, l_port, pid_str)] = (r_ip, r_port)
-        except Exception:
-            pass
-        return lookup
-
-    @staticmethod
-    def _split_netstat_addr(addr_str):
-        """Split a netstat address string like '192.168.1.1:443' or '[::1]:443' into (ip, port)."""
-        try:
-            if addr_str.startswith("["):
-                # IPv6: [::1]:port
-                bracket_end = addr_str.index("]")
-                ip = addr_str[1:bracket_end]
-                port = addr_str[bracket_end + 2:]  # skip ]:
-            else:
-                # IPv4: 1.2.3.4:port  — split on the last colon
-                last_colon = addr_str.rfind(":")
-                ip = addr_str[:last_colon]
-                port = addr_str[last_colon + 1:]
-            return ip, port
-        except Exception:
-            return addr_str, ""
-
     def get_active_tcp_connections(self, position_timeline=None):
         """
         Enumerate TCP and UDP connections and build the connection snapshot.
@@ -4781,8 +4747,7 @@ class TCPConnectionViewer(QMainWindow):
         global do_capture_screenshots, geo_cache, geo_cache_lock, process_cache, process_cache_lock
 
         # Performance timing
-        import time as time_module
-        start_time = time_module.perf_counter()
+        start_time = time.perf_counter()
 
         # Timeline replay short-circuit
         if position_timeline is not None:
@@ -4835,6 +4800,21 @@ class TCPConnectionViewer(QMainWindow):
         reader_ipv4 = self.reader_ipv4
         reader_ipv6 = self.reader_ipv6
         do_c2 = do_c2_check
+
+        # Build a set of connection keys from the previous snapshot for O(1)
+        # new-connection detection (replaces the old O(n²) is_connection_in_list).
+        _prev_conn_keys = set()
+        if self.connection_list:
+            try:
+                for _pc in self.connection_list[-1]['connection_list']:
+                    _prev_conn_keys.add((
+                        _pc.get('process', ''), _pc.get('pid', ''),
+                        _pc.get('protocol', ''), _pc.get('local', ''),
+                        _pc.get('localport', ''), _pc.get('remote', ''),
+                        _pc.get('remoteport', ''), _pc.get('ip_type', ''),
+                    ))
+            except Exception:
+                pass
 
         # --- Phase 3: Enrich each raw connection with geo/DNS/C2/icons -------
         for rc in raw_connections:
@@ -4925,13 +4905,12 @@ class TCPConnectionViewer(QMainWindow):
                     'hostname': hostname,
                 })
 
-                # New connection detection (timeline-based)
-                if self.connection_list:
-                    try:
-                        if not self.is_connection_in_list(connections[-1], self.connection_list[-1]['connection_list']):
-                            connections[-1]['icon'] = 'blueIcon'
-                    except Exception:
-                        pass
+                # New connection detection — O(1) set lookup
+                if _prev_conn_keys:
+                    _key = (process_name, pid, protocol, local_addr, local_port,
+                            remote_addr, remote_port, ip_type)
+                    if _key not in _prev_conn_keys:
+                        connections[-1]['icon'] = 'blueIcon'
 
             except Exception:
                 continue
@@ -4977,16 +4956,9 @@ class TCPConnectionViewer(QMainWindow):
                 "agent_data": agent_snapshot if enable_server_mode and agent_snapshot else None,
             }
 
-            # append while ensuring we maintain the list size cap
+            # append — deque with maxlen auto-evicts the oldest entry
             self.connection_list.append(another_connection)
             self.connection_list_counter = len(self.connection_list)
-
-            if self.connection_list_counter >= max_connection_list_filo_buffer_size:
-                # pop oldest until within limit
-                excess = self.connection_list_counter - max_connection_list_filo_buffer_size
-                for _ in range(excess):
-                    self.connection_list.pop(0)
-                self.connection_list_counter = len(self.connection_list)
 
             # keep slider in sync
             self.slider.setMaximum(self.connection_list_counter)
@@ -5024,7 +4996,7 @@ class TCPConnectionViewer(QMainWindow):
             self._summary_needs_update = True
 
             # Performance logging
-            elapsed = time_module.perf_counter() - start_time
+            elapsed = time.perf_counter() - start_time
             if elapsed > 1.0:  # Log if took more than 1 second
                 logging.warning(f"get_active_tcp_connections took {elapsed:.2f}s to process {len(connections)} connections")
 
@@ -5080,25 +5052,6 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             # defensive: ignore if map not ready yet
             pass
-
-    @Slot()
-    def _do_map_update(self):
-        """Execute pending debounced map update (if any)"""
-        try:
-            if self._pending_map_data is not None:
-                # Extract the pending data
-                data = self._pending_map_data
-                self._pending_map_data = None
-
-                # Call update_map with the pending data
-                # The data is expected to be a tuple: (connection_data, force_show_tooltip, stats_text, datetime_text)
-                if isinstance(data, tuple) and len(data) == 4:
-                    self.update_map(data[0], data[1], data[2], data[3])
-                elif isinstance(data, dict):
-                    # Fallback: if it's just connection data
-                    self.update_map(data)
-        except Exception as e:
-            logging.error(f"Error in _do_map_update: {e}")
 
     def _call_update_js(self, js, connection_data=None, force_show_tooltip=False, retries=10, delay_ms=200):
         """
@@ -5156,16 +5109,29 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
+    _PUBLIC_IP_TTL = 60  # seconds between external IP lookups
+
     def get_public_ip(self):
-        """Get public IP address using ipify API with connection pooling. Returns empty string on error."""
+        """Get public IP address using ipify API with connection pooling and TTL cache.
+
+        The result is cached for ``_PUBLIC_IP_TTL`` seconds so that the
+        blocking HTTP call is not repeated on every 2-second refresh cycle.
+        Returns empty string on error.
+        """
+        now = time.time()
+        if self._public_ip_cache and (now - self._public_ip_cache_time) < self._PUBLIC_IP_TTL:
+            return self._public_ip_cache
         try:
             response = self._http_session.get('https://api.ipify.org', timeout=5)
             if response.status_code == 200:
-                return response.text.strip()
+                result = response.text.strip()
+                self._public_ip_cache = result
+                self._public_ip_cache_time = now
+                return result
             else:
-                return ""
+                return self._public_ip_cache or ""
         except Exception:
-            return ""
+            return self._public_ip_cache or ""
 
     def update_map(self, connection_data, force_show_tooltip=False, stats_text="", datetime_text=""):
         """
@@ -5179,7 +5145,6 @@ class TCPConnectionViewer(QMainWindow):
                 public_ip = self.get_public_ip()
                 if public_ip:
                     # Determine IP type
-                    import ipaddress
                     try:
                         ip_obj = ipaddress.ip_address(public_ip)
                         ip_type = "IPv4" if ip_obj.version == 4 else "IPv6"
@@ -6406,7 +6371,6 @@ class TCPConnectionViewer(QMainWindow):
 
 
         if len(self.connections) != number_of_previous_objects:
-            self.map_redraw = True
             self.map_objects = len(self.connections)
 
             self.left_panel.setTitle(f"Active TCP/UDP Connections - {self.map_objects} connections")
@@ -6429,6 +6393,7 @@ class TCPConnectionViewer(QMainWindow):
             selected_connection = None
 
         # Update table
+        self.connection_table.setUpdatesEnabled(False)
         self.connection_table.setRowCount(0)
 
         connections_to_show_on_map = []
@@ -6500,6 +6465,8 @@ class TCPConnectionViewer(QMainWindow):
                     self.status_label.setText("Warning: Suspect C2 connections detected!")
                 
                 connections_to_show_on_map.append(conn)
+
+        self.connection_table.setUpdatesEnabled(True)
 
         # Apply yellow icon override for the pinned (double-clicked) connection
         if self._pinned_connection is not None:
@@ -7199,9 +7166,11 @@ class TCPConnectionViewer(QMainWindow):
         """Populate the summary table with aggregated connection statistics"""
         try:
             # Clear existing rows
+            self.summary_table.setUpdatesEnabled(False)
             self.summary_table.setRowCount(0)
 
             if not self.connection_list:
+                self.summary_table.setUpdatesEnabled(True)
                 return
 
             # Dictionary to track unique connections: (process, pid, suspect, remote, name) -> count
@@ -7267,6 +7236,8 @@ class TCPConnectionViewer(QMainWindow):
                 if suspect == "Yes":
                     for col in range(self.summary_table.columnCount()):
                         self.summary_table.item(row, col).setForeground(Qt.red)
+
+            self.summary_table.setUpdatesEnabled(True)
 
             # Update title with total count
             total_unique = len(sorted_stats)
@@ -7490,6 +7461,19 @@ class TCPConnectionViewer(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     viewer = TCPConnectionViewer()
+
+    # Allow Ctrl-C in the console to close the application.
+    # Qt's event loop holds the GIL and never returns control to Python's
+    # signal machinery unless we periodically interrupt it with a no-op timer.
+    def _handle_sigint(*_):
+        logging.info("Received SIGINT — shutting down.")
+        app.quit()
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    _sigint_timer = QTimer()
+    _sigint_timer.setInterval(200)   # ms — yields the GIL so Python can check signals
+    _sigint_timer.timeout.connect(lambda: None)
+    _sigint_timer.start()
 
     if agent_no_ui and enable_agent_mode:
         # Headless agent mode: keep the window completely off-screen and off the taskbar.
