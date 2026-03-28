@@ -95,12 +95,7 @@ When --accept_eula is passed the databases will be downloaded automatically when
 # Offline / Telemetry reduction
 Access to tile.openstreetmap.org is required to render the map so internet access is required to that site.
 When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img as well as https://unpkg.com/leaflet and will prompt you to cache them locally into /resources/leaflet/ in order to speed up next startup time.  You can also use the script download_resources.ps1 powershell script located in resources\leaflet directory  to download the below files independently.
-If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the TILE_OPENSTREETMAP_SERVER constant variable defined in the tcp_geo_map.py script though I have not tested this setup myself. 
-
-# Persistent IP DNS reverse cache file
-PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False set to True to turn on and speedup the script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
-
-IP_DNS_NAME_CACHE_FILE = "ip_cache.json" if PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the application will save and load from the disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application starts it will reload this cache to speed up startup time of the script.
+If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the `TILE_OPENSTREETMAP_SERVER` constant in `tcp_geo_map.py` (see the Settings section below for details).
 
 # Map marker colors
 - Green icon - Connection that is available since the last refresh
@@ -189,49 +184,101 @@ deactivate
 
 # Settings
 
-Settings are persisted in a local file called settings.json and are saved when closing the script.
-To reset them either change the various options in the UI or simply delete the settings.json file that will be recreated at the next execution.
+All settings are persisted in `settings.json` (located in the same directory as the script) and are saved automatically whenever a setting is changed in the UI, as well as when the application closes. To reset all settings to their defaults, delete `settings.json` — it will be recreated with defaults on the next launch.
 
-Sample settings.json with explanations:
+The table below documents every key stored in `settings.json`.
 
-"max_connection_list_filo_buffer_size": 1000, // At each refresh intervals the connection list is maintained in memory and added to a First In First Out item type buffer. When the buffer is full, it will evict one at the time older connection list. The purpose of this is to allow you to go back in time using the time slider or to replay connections.
+---
 
-"do_c2_check": true, // Perfom C2 checks
+### Connection capture
 
-"show_only_new_active_connections": false, // Only show new active connections (at the next refresh interval) on the map.
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_connection_list_filo_buffer_size` | integer | `1000` | Maximum number of connection snapshots kept in memory. The capture buffer is a First-In-First-Out (FIFO) queue: once full, the oldest snapshot is evicted to make room for the newest. Larger values let you look further back in time using the time slider or replay feature but consume more memory. Configurable on the Settings tab. |
+| `map_refresh_interval` | integer (ms) | `2000` | How often (in milliseconds) the connection table and map are refreshed. Lowering this value reduces the chance of missing short-lived connections. Selectable from the refresh-interval drop-down on the main tab. |
+| `show_only_new_active_connections` | boolean | `false` | When `true`, only connections that are **new** since the previous refresh are shown in the table and on the map. Useful for spotting sudden new activity without noise from persistent connections. |
+| `show_only_remote_connections` | boolean | `false` | When `true`, loopback addresses (`127.0.0.1`, `::1`) and other purely local connections are hidden from the connection table. Local connections are never plotted on the map regardless of this setting. |
+| `do_pause_table_sorting` | boolean | `false` | When `true`, the connection table stops re-sorting on each refresh cycle. Existing sort order is preserved so you can read the table without it jumping. New connections are still collected and appended; sorting resumes when unchecked. |
 
-"show_only_remote_connections": true, // Only show remote connections made (at the next refresh interval) on the table, when selecting these remote IP addresses of 127.0.0.1 or ::1 will not be shown in the table. Local connections are not shown on the map anyway.
+---
 
-"do_reverse_dns": true, // Perform reverse DNS (Domain Name Service) lookups on remote IP addresses. Since this task is time consuming, this action is performed by a background worker thread when the script starts. Therefore, it may take a little while for the "Name" column to be populated. When the DNS name resolution is successful and remote location can be resolved, the DNS name will be shown as well when clicking on the marker on the map.
+### Name resolution & enrichment
 
-"map_refresh_interval": 2000, // "netstat" connection refresh interval in milliseconds
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `do_reverse_dns` | boolean | `true` | Perform reverse DNS lookups on remote IP addresses. Lookups are executed by a background thread to avoid blocking the UI, so the **Name** column may take a moment to populate after startup. Resolved hostnames also appear in map marker pop-ups. |
+| `do_resolve_public_ip` | boolean | `false` | When `true`, the application periodically queries [ipify.org](https://api.ipify.org) to determine the machine's current public/exit IP address and plots it on the map as a red circle. The result is cached for 60 seconds to avoid excessive external requests. Only useful when behind NAT or a VPN where the local IP differs from the public one. |
+| `do_c2_check` | boolean | `false` | Enable C2-Tracker threat-intelligence checks. Each remote IP is compared against the [montysecurity/C2-Tracker](https://github.com/montysecurity/C2-Tracker) database. When a match is found the UI turns red, a warning is displayed, and the offending row is tagged **C2: Yes** in the table. Requires the C2-Tracker database to be downloaded first (prompted automatically or via `--accept_eula`). |
 
-"table_column_sort_index": -1, // Left table ordering column number (-1 means no ordering is made on any table column)
+---
 
-"table_column_sort_reverse": false, // Left table ordering (ascending / descending)
+### Display & table sorting
 
-"splitter_state": "AAAA/wAAAAEAAAACAAAAAAAABdwBAAAABgEAAAABAA==", // Horizontal splitter position
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `table_column_sort_index` | integer | `-1` | Column index used to sort the main connection table. `-1` means no explicit sort is applied (connections appear in capture order). |
+| `table_column_sort_reverse` | boolean | `false` | Sort direction for the main connection table. `false` = ascending, `true` = descending. |
+| `summary_table_column_sort_index` | integer | `-1` | Column index used to sort the Summary tab aggregated table. `-1` means no explicit sort. |
+| `summary_table_column_sort_reverse` | boolean | `false` | Sort direction for the Summary tab table. `false` = ascending, `true` = descending. |
 
-"right_splitter_state": "AAAA/wAAAAEAAAACAAADggAAAAABAAAABgEAAAACAA==" // Vertical splitter position
+---
 
-"is_fullscreen": false, // Allows restoring full-screen on startups - setting will be applied/reset after every closing of the script.
+### Screenshots & recording
 
-"is_maximized": true, // Allows restoring maximized screen on startups (it is either full-screen or maximized) - setting will be applied/reset after every closing of the script
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `do_capture_screenshots` | boolean | `false` | When `true`, a `.jpg` screenshot of the map is written to the `screen_captures/` folder every time the map refreshes. Once enabled, a **Generate Video** button appears on the main tab that compiles all current screenshots into an `.mp4` video using OpenCV. Older screenshots are automatically pruned to prevent unbounded disk growth. Requires `opencv-python`. |
 
-"fullscreen_screen_name": "MyScreenName" // Allows restoring the application UI back on to the right screen - setting will be applied/reset after every closing of the script.
+---
 
-"map_center_lat", "map_center_lng", "map_zoom": are the values of the map settings and position used to restore the exact map layout settings when the application starts again.
+### Window & map layout
 
-Other settings that you may tweak in the script itself:
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `is_fullscreen` | boolean | `false` | Whether the application window was full-screen when last closed. Restored automatically on the next launch. |
+| `is_maximized` | boolean | `false` | Whether the application window was maximized when last closed. Restored automatically on the next launch. Mutually exclusive with `is_fullscreen`. |
+| `fullscreen_screen_name` | string | `null` | The OS display name (e.g. `"\\.\DISPLAY1"`) of the monitor the window was on. Used to restore the window to the correct screen on multi-monitor setups. |
+| `splitter_state` | string (Base64) | `null` | Serialized state of the horizontal splitter that divides the connection table (left) from the map (right). Restored automatically; do not edit by hand. |
+| `right_splitter_state` | string (Base64) | `null` | Serialized state of the vertical splitter that divides the map (top) from the controls/settings area (bottom). Restored automatically; do not edit by hand. |
+| `map_center_lat` | float | — | Latitude of the map viewport centre when the application was last closed. Restored on next launch so the map opens at the same position. |
+| `map_center_lng` | float | — | Longitude of the map viewport centre when the application was last closed. |
+| `map_zoom` | integer | — | Zoom level of the map when the application was last closed. |
 
-* PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK = False 
-Set to True to turn on and speedup script start time, False to disable. However this will keep track on the disk to what IP addresses machine was connected to.
+---
 
-* IP_DNS_NAME_CACHE_FILE = "ip_cache.json"
-If PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to true the script will save and load from disk the IP DNS Name resolution made as name resolution is slow from the database subfolder. Next time the application start it will reload this cache to speed up startup time and name resolution of the tcp_geo_map.py script.
+### Server / Agent mode
 
-* DATABASE_EXPIRE_AFTER_DAYS = 7
-Databases expiration time in days from the last download date, default 7 days (1 week)
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable_server_mode` | boolean | `false` | When `true`, the application starts a Flask HTTP endpoint (default port 5000) that accepts connection data POSTed by remote agents. All agent connections are rendered on the map alongside local connections. |
+| `enable_agent_mode` | boolean | `false` | When `true`, the application periodically POSTs its live connection snapshot to the configured server. Can be combined with `--no_ui` / `--no_ui_off` for headless deployment. |
+| `agent_server_host` | string | `""` | Hostname or IP address of the server to POST to in agent mode. No scheme or port — e.g. `"192.168.1.10"` or `"myserver"`. Configured via the **Agent server address** field on the Settings tab. |
+| `flask_server_port` | integer | `5000` | TCP port the Flask server listens on in server mode. Must be reachable by all agents; a firewall rule may be required. |
+| `flask_agent_port` | integer | `5000` | TCP port the agent POSTs to on the server. Must match `flask_server_port` on the server side. |
+| `agent_no_ui` | boolean | `false` | When `true`, the application window is never shown — the process runs headless as a background agent. Equivalent to passing `--no_ui` on the command line. Set to `false` explicitly via `--no_ui_off`. Only meaningful when `enable_agent_mode` is also `true`. |
+| `agent_colors` | object | `{}` | Maps each remote agent hostname to a display colour used for its map markers and table rows, e.g. `{"laptop": "blue", "server": "green"}`. Managed automatically by the **Agent Management** tab; colours persist across restarts. |
+
+---
+
+### Connection collector plugin
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `active_collector_plugin` | string | `"Psutil Collector"` | Name of the active connection-collector plugin. Built-in options: `"Psutil Collector"` (default, low-privilege), `"Scapy Live Capture"` (requires admin/root or Npcap on Windows), `"PCAP File"` (offline replay of a saved `.pcap`). Selectable on the Settings tab. |
+| `pcap_file_path` | string | `""` | Absolute path to the `.pcap` file used when `active_collector_plugin` is `"PCAP File"`. Set via the **Browse** button on the Settings tab. Has no effect when any other collector is active. |
+
+---
+
+### Other settings configurable in the script itself
+
+The following constants are not exposed in the UI and must be changed directly in `tcp_geo_map.py`:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK` | `False` | Set to `True` to persist the reverse-DNS cache to `ip_cache.json` between runs. Speeds up startup but leaves a record on disk of every IP address the machine has connected to. |
+| `IP_DNS_NAME_CACHE_FILE` | `"ip_cache.json"` | File name used for the on-disk DNS cache when `PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK` is enabled. |
+| `DATABASE_EXPIRE_AFTER_DAYS` | `7` | Number of days after which the GeoLite2 and C2-Tracker databases are considered stale and a refresh is prompted. |
+| `TILE_OPENSTREETMAP_SERVER` | `"tile.openstreetmap.org"` | Tile server hostname used to render the map. Change this to point to a self-hosted tile server for fully offline / private operation. |
 
 # Troubleshooting
 The script can spew additional information by changing in the tcp_geo_map.py:

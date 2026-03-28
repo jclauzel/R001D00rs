@@ -25,8 +25,15 @@ To use:
 """
 
 import threading
+import time
+import socket as _socket
 import platform as _platform
 import logging
+
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
@@ -58,6 +65,14 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         self._stop_event = threading.Event()
         self._started = False
         self._hostname = _platform.node()
+        # PID lookup cache: (laddr, lport, proto) -> (pid, process_name)
+        # Refreshed at most once per _PID_CACHE_TTL seconds to avoid
+        # calling psutil on every packet.
+        self._pid_cache: dict = {}
+        self._pid_cache_time: float = 0.0
+        self._pid_cache_lock = threading.Lock()
+
+    _PID_CACHE_TTL = 2.0  # seconds between psutil connection-table refreshes
 
     # ---- public API ---------------------------------------------------------
 
@@ -74,6 +89,67 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             snapshot = list(self._connections.values())
             self._connections.clear()
         return snapshot
+
+    # ---- PID / process correlation ------------------------------------------
+
+    def _refresh_pid_cache(self):
+        """Rebuild the port-based PID lookup table from the live OS connection table.
+
+        Keyed on ``(lport_str, proto)`` rather than ``(laddr, lport, proto)``
+        because psutil may report wildcard bind addresses (``"0.0.0.0"``,
+        ``"::"``) which never match the real source/destination IP seen in a
+        captured packet.  Port numbers are unique enough in practice for
+        correlating a captured flow back to its owning process.
+
+        Guarded by ``_PID_CACHE_TTL`` so psutil is called at most once per
+        refresh cycle regardless of packet rate.
+        """
+        if _psutil is None:
+            return
+        new_cache: dict = {}
+        try:
+            for c in _psutil.net_connections(kind='inet'):
+                if not c.laddr or not c.pid:
+                    continue
+                if c.type == _socket.SOCK_STREAM:
+                    proto = 'TCP'
+                elif c.type == _socket.SOCK_DGRAM:
+                    proto = 'UDP'
+                else:
+                    continue
+                key = (str(c.laddr.port), proto)
+                # Don't overwrite an entry that already has a real process name
+                if key in new_cache:
+                    continue
+                try:
+                    proc_name = _psutil.Process(c.pid).name()
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                    proc_name = ''
+                new_cache[key] = (c.pid, proc_name)
+        except Exception as e:
+            logging.debug(f"ScapyLiveCollector: PID cache refresh error: {e}")
+        with self._pid_cache_lock:
+            self._pid_cache = new_cache
+            self._pid_cache_time = time.monotonic()
+
+    def _lookup_pid(self, port: str, proto: str):
+        """Return ``(pid_str, process_name)`` for *port*/*proto*, or ``('', '')``.
+
+        Refreshes the cache when stale before the lookup.
+        """
+        if _psutil is None:
+            return '', ''
+        now = time.monotonic()
+        with self._pid_cache_lock:
+            stale = (now - self._pid_cache_time) >= self._PID_CACHE_TTL
+        if stale:
+            self._refresh_pid_cache()
+        with self._pid_cache_lock:
+            entry = self._pid_cache.get((port, proto))
+        if entry is not None:
+            pid, name = entry
+            return str(pid), name or str(pid)
+        return '', ''
 
     # ---- background sniffer -------------------------------------------------
 
@@ -151,9 +227,20 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                 return
 
             key = (src, sport, dst, dport, protocol)
+
+            # Correlate with the OS connection table via psutil.
+            # Try the source port first (outbound: local=src), then the
+            # destination port (inbound: local=dst).  Port-only keying
+            # handles wildcard-bound sockets (0.0.0.0 / ::) correctly.
+            pid_str, proc_name = self._lookup_pid(sport, protocol)
+            if not pid_str:
+                pid_str, proc_name = self._lookup_pid(dport, protocol)
+            if not proc_name:
+                proc_name = 'capture'
+
             conn = {
-                'process': 'capture',
-                'pid': '',
+                'process': proc_name,
+                'pid': pid_str,
                 'protocol': protocol,
                 'local': src,
                 'localport': sport,
