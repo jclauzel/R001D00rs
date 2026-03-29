@@ -99,7 +99,7 @@ from PySide6.QtWebChannel import QWebChannel
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
-VERSION = "3.5.0" # Current script version
+VERSION = "3.5.1" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -4925,14 +4925,18 @@ class TCPConnectionViewer(QMainWindow):
 
         # Build a set of connection keys from the previous snapshot for O(1)
         # new-connection detection (replaces the old O(n²) is_connection_in_list).
+        # Use the raw remote IP (strip DNS-enriched hostname) so that a background
+        # DNS resolution does not cause existing connections to be detected as "new",
+        # which would trigger a global tooltip flash and visible map refresh.
         _prev_conn_keys = set()
         if self.connection_list:
             try:
                 for _pc in self.connection_list[-1]['connection_list']:
+                    _prev_remote_raw = _pc.get('remote', '').split(' (')[0]
                     _prev_conn_keys.add((
                         _pc.get('process', ''), _pc.get('pid', ''),
                         _pc.get('protocol', ''), _pc.get('local', ''),
-                        _pc.get('localport', ''), _pc.get('remote', ''),
+                        _pc.get('localport', ''), _prev_remote_raw,
                         _pc.get('remoteport', ''), _pc.get('ip_type', ''),
                     ))
             except Exception:
@@ -5033,10 +5037,13 @@ class TCPConnectionViewer(QMainWindow):
                     'bytes_recv': bytes_recv,
                 })
 
-                # New connection detection — O(1) set lookup
+                # New connection detection — O(1) set lookup.
+                # Use the raw remote IP (before DNS enrichment) so that
+                # background name resolution does not cause a false positive.
                 if _prev_conn_keys:
+                    _raw_remote_for_key = remote_addr.split(' (')[0]
                     _key = (process_name, pid, protocol, local_addr, local_port,
-                            remote_addr, remote_port, ip_type)
+                            _raw_remote_for_key, remote_port, ip_type)
                     if _key not in _prev_conn_keys:
                         connections[-1]['icon'] = 'blueIcon'
 
@@ -6084,7 +6091,9 @@ class TCPConnectionViewer(QMainWindow):
                                                         markerOptions.pane = 'pinnedPane';
                                                     }
                                                     var marker = L.marker([conn.lat, conn.lng], markerOptions).addTo(map);
-                                                    var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
+                                                    // Show permanent tooltip if global setting is on OR if this is a new connection (blue marker)
+                                                    var isNewConn = (iconName === 'blueIcon');
+                                                    var tooltipOptions = { permanent: (!!showTooltip || isNewConn), opacity: 0.9, direction: 'auto' };
 
                                                     // Include protocol and hostname in tooltip for agent connections
                                                     var tooltipText = (conn.process || '') + ' [' + (conn.protocol || 'TCP') + ']';
@@ -6672,8 +6681,6 @@ class TCPConnectionViewer(QMainWindow):
             # Add to table
 
             if not show_only_new_active_connections or (show_only_new_active_connections and conn['icon'] == 'blueIcon'):
-                if conn['icon'] == 'blueIcon':
-                    force_tooltip = True
 
                 lat, lng = None, None
 
