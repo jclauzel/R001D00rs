@@ -19,8 +19,15 @@ the following string keys (values are all strings):
     ip_type     — "IPv4" or "IPv6"
     hostname    — hostname of the machine that owns this connection
 
-The main application will enrich each dict with geolocation, reverse DNS,
-C2 checks, icon assignment, and agent-merge logic.
+Optional numeric keys (int, default 0 when absent):
+
+    bytes_sent  — total bytes sent on this connection (outbound)
+    bytes_recv  — total bytes received on this connection (inbound)
+
+When the collector can measure traffic volume (e.g. Scapy-based packet
+capture), it should populate ``bytes_sent`` and ``bytes_recv``.  The main
+application uses these values to render an optional traffic gauge on the
+map next to each marker.
 """
 
 from abc import ABC, abstractmethod

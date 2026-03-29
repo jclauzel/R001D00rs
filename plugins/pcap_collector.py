@@ -60,7 +60,7 @@ class PcapCollector(ConnectionCollectorPlugin):
             return []
 
         connections = []
-        seen = set()
+        conn_map = {}   # key -> index in connections list (for byte accumulation)
 
         try:
             packets = rdpcap(pcap_file_path)
@@ -99,22 +99,35 @@ class PcapCollector(ConnectionCollectorPlugin):
             src = ip_layer.src
             dst = ip_layer.dst
 
-            # De-duplicate
-            key = (src, sport, dst, dport, protocol)
-            if key in seen:
-                continue
-            seen.add(key)
+            # Packet byte size (IP total length or raw length)
+            try:
+                pkt_bytes = int(ip_layer.len)
+            except Exception:
+                pkt_bytes = len(pkt)
 
-            connections.append({
-                'process': 'pcap',
-                'pid': '',
-                'protocol': protocol,
-                'local': src,
-                'localport': sport,
-                'remote': dst,
-                'remoteport': dport,
-                'ip_type': ip_type,
-                'hostname': local_hostname,
-            })
+            key = (src, sport, dst, dport, protocol)
+            rev_key = (dst, dport, src, sport, protocol)
+
+            if key in conn_map:
+                # Same direction as the first packet — accumulate as sent
+                connections[conn_map[key]]['bytes_sent'] = connections[conn_map[key]].get('bytes_sent', 0) + pkt_bytes
+            elif rev_key in conn_map:
+                # Reverse direction — accumulate as received on the original entry
+                connections[conn_map[rev_key]]['bytes_recv'] = connections[conn_map[rev_key]].get('bytes_recv', 0) + pkt_bytes
+            else:
+                conn_map[key] = len(connections)
+                connections.append({
+                    'process': 'pcap',
+                    'pid': '',
+                    'protocol': protocol,
+                    'local': src,
+                    'localport': sport,
+                    'remote': dst,
+                    'remoteport': dport,
+                    'ip_type': ip_type,
+                    'hostname': local_hostname,
+                    'bytes_sent': pkt_bytes,
+                    'bytes_recv': 0,
+                })
 
         return connections
