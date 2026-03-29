@@ -99,7 +99,7 @@ from PySide6.QtWebChannel import QWebChannel
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
-VERSION = "3.3.3" # Current script version
+VERSION = "3.3.4" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -217,6 +217,8 @@ NAME_ROW_INDEX = 9        # Index of the 'Name' column in the table
 IP_TYPE_ROW_INDEX = 10     # Index of the 'IP Type' column in the table
 LOCATION_LAT_ROW_INDEX = 11   # Index of the 'Location' column in the table
 LOCATION_LON_ROW_INDEX = 12  # Index of the 'Location' column in the table
+BYTES_SENT_ROW_INDEX = 13    # Index of the 'Sent' column in the table
+BYTES_RECV_ROW_INDEX = 14    # Index of the 'Recv' column in the table
 PID_COLUMN_SIZE = 60
 SUSPECT_COLUMN_SIZE = 30
 PROTOCOL_COLUMN_SIZE = 55
@@ -243,6 +245,7 @@ do_drawlines_between_local_and_remote = True  # Set to True to draw lines betwee
 do_c2_check = False    # Set to True to enable C2-TRACKER checks
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
 do_pause_table_sorting = False  # Set to True to pause table sorting without stopping updates
+do_show_traffic_gauge = False   # Set to True to show sent/recv traffic gauges next to markers (requires Scapy/PCAP collector)
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
 # Server / Agent mode globals
@@ -779,6 +782,19 @@ class PsutilCollector(ConnectionCollectorPlugin):
 # Plugin discovery
 # ---------------------------------------------------------------------------
 
+def _format_bytes(num_bytes):
+    """Return a human-readable byte string (e.g. '1.2 MB')."""
+    if not num_bytes:
+        return ''
+    num_bytes = int(num_bytes)
+    if num_bytes == 0:
+        return '0 B'
+    k = 1024
+    sizes = ('B', 'KB', 'MB', 'GB', 'TB')
+    i = min(int(num_bytes > 0 and (num_bytes).bit_length() - 1) // 10, len(sizes) - 1)
+    val = num_bytes / (k ** i)
+    return f'{val:.1f} {sizes[i]}'
+
 def _discover_collector_plugins():
     """Scan the ``plugins/`` directory for ConnectionCollectorPlugin subclasses.
 
@@ -791,6 +807,13 @@ def _discover_collector_plugins():
     plugins_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plugins')
     if not os.path.isdir(plugins_dir):
         return collectors
+
+    # Ensure the project root is on sys.path so plugin modules can
+    # ``from connection_collector_plugin import ...`` regardless of how
+    # the application was launched.
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
     for fname in sorted(os.listdir(plugins_dir)):
         if not fname.endswith('.py') or fname.startswith('_'):
@@ -1352,7 +1375,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1363,6 +1386,7 @@ class TCPConnectionViewer(QMainWindow):
             'do_resolve_public_ip': do_resolve_public_ip,
             'do_capture_screenshots': do_capture_screenshots,
             'do_pause_table_sorting': do_pause_table_sorting,
+            'do_show_traffic_gauge': do_show_traffic_gauge,
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
@@ -1451,7 +1475,7 @@ class TCPConnectionViewer(QMainWindow):
                 global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections
                 global show_only_remote_connections, do_reverse_dns, map_refresh_interval
                 global table_column_sort_index, table_column_sort_reverse
-                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting
+                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
@@ -1462,6 +1486,7 @@ class TCPConnectionViewer(QMainWindow):
                 do_resolve_public_ip = settings.get('do_resolve_public_ip', do_resolve_public_ip)
                 do_capture_screenshots = settings.get('do_capture_screenshots', do_capture_screenshots)
                 do_pause_table_sorting = settings.get('do_pause_table_sorting', do_pause_table_sorting)
+                do_show_traffic_gauge = settings.get('do_show_traffic_gauge', do_show_traffic_gauge)
                 map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
                 table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                 table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
@@ -1646,6 +1671,7 @@ class TCPConnectionViewer(QMainWindow):
                 self.resolve_public_ip.setChecked(do_resolve_public_ip)
                 self.capture_screenshots_check.setChecked(do_capture_screenshots)
                 self.pause_table_sorting_check.setChecked(do_pause_table_sorting)
+                self.show_traffic_gauge_check.setChecked(do_show_traffic_gauge)
 
                 # Update buffer size input field
                 if hasattr(self, 'buffer_size_input'):
@@ -3513,6 +3539,12 @@ class TCPConnectionViewer(QMainWindow):
         self.save_settings()
 
     @Slot()
+    def update_show_traffic_gauge(self):
+        global do_show_traffic_gauge
+        do_show_traffic_gauge = self.show_traffic_gauge_check.isChecked()
+        self.save_settings()
+
+    @Slot()
     def update_refresh_interval(self):
         global map_refresh_interval
 
@@ -3795,9 +3827,9 @@ class TCPConnectionViewer(QMainWindow):
         self.stop_capture_btn.setStyleSheet("font-family: 'Consolas', 'Courier New', monospace;")
         
         # Connection table
-        self.connection_table = QTableWidget(0, LOCATION_LON_ROW_INDEX+1)
+        self.connection_table = QTableWidget(0, BYTES_RECV_ROW_INDEX+1)
         self.connection_table.setHorizontalHeaderLabels([
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon", "Sent", "Recv"
         ])
 
         # Connect the header clicked signal to a custom sort function
@@ -3825,7 +3857,7 @@ class TCPConnectionViewer(QMainWindow):
         # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
         _filter_placeholders = [
             "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port",
-            "Remote Addr", "Remote Port", "Name", "IP Type", "Lat", "Lon"
+            "Remote Addr", "Remote Port", "Name", "IP Type", "Lat", "Lon", "Sent", "Recv"
         ]
         self._connection_filter_inner = QWidget()
         _filter_inner_layout = QHBoxLayout(self._connection_filter_inner)
@@ -3998,10 +4030,10 @@ class TCPConnectionViewer(QMainWindow):
         summary_title_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
         summary_tab_layout.addWidget(summary_title_label)
 
-        # Create summary table with 10 columns
-        self.summary_table = QTableWidget(0, 10)
+        # Create summary table with 12 columns
+        self.summary_table = QTableWidget(0, 12)
         self.summary_table.setHorizontalHeaderLabels([
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count", "Sent", "Recv"
         ])
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -4015,7 +4047,7 @@ class TCPConnectionViewer(QMainWindow):
 
         # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
         _summary_filter_placeholders = [
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count", "Sent", "Recv"
         ]
         self._summary_filter_inner = QWidget()
         _summary_filter_inner_layout = QHBoxLayout(self._summary_filter_inner)
@@ -4122,6 +4154,12 @@ class TCPConnectionViewer(QMainWindow):
         self.pause_table_sorting_check.setChecked(False)
         self.pause_table_sorting_check.stateChanged.connect(self.update_pause_table_sorrting)
         settings_tab_layout.addWidget(self.pause_table_sorting_check)
+
+        # Show traffic gauge on markers checkbox
+        self.show_traffic_gauge_check = QCheckBox("Show traffic gauge on map markers (sent/recv — requires Scapy or PCAP collector)")
+        self.show_traffic_gauge_check.setChecked(do_show_traffic_gauge)
+        self.show_traffic_gauge_check.stateChanged.connect(self.update_show_traffic_gauge)
+        settings_tab_layout.addWidget(self.show_traffic_gauge_check)
 
         # --- Connection Collector plugin selector ---
         collector_separator = QLabel("─── Connection Collector Plugin ───")
@@ -4912,6 +4950,8 @@ class TCPConnectionViewer(QMainWindow):
                 remote_port = rc.get('remoteport', '')
                 ip_type = rc.get('ip_type', '')
                 hostname = rc.get('hostname', LOCAL_HOSTNAME)
+                bytes_sent = rc.get('bytes_sent', 0)
+                bytes_recv = rc.get('bytes_recv', 0)
 
                 lat = lng = None
                 name = ""
@@ -4967,6 +5007,8 @@ class TCPConnectionViewer(QMainWindow):
                                     'lng': lng,
                                     'icon': 'redIcon',
                                     'hostname': hostname,
+                                    'bytes_sent': bytes_sent,
+                                    'bytes_recv': bytes_recv,
                                 })
                         except Exception:
                             pass
@@ -4987,6 +5029,8 @@ class TCPConnectionViewer(QMainWindow):
                     'lng': lng,
                     'icon': 'greenIcon',
                     'hostname': hostname,
+                    'bytes_sent': bytes_sent,
+                    'bytes_recv': bytes_recv,
                 })
 
                 # New connection detection — O(1) set lookup
@@ -5398,8 +5442,18 @@ class TCPConnectionViewer(QMainWindow):
         if enable_agent_mode and getattr(self, '_agent_server_unreachable', False):
             agent_status_text = f'\u26a0 Server unreachable: {agent_server_host}:{FLASK_AGENT_PORT}'
 
-        # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay, and agent status to JS
-        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)}); setDateTime({json.dumps(datetime_text)}); setRecordingIndicator({str(is_recording).lower()}); setModeIndicator({json.dumps(mode_indicator_text)}); setRejectedOverlay({show_rejected}); setAgentStatus({json.dumps(agent_status_text)});"
+        # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay, and agent status to JS.
+        # Each call is wrapped in its own try/catch so that a failure in one (e.g. updateConnections
+        # throwing on bad data) does not prevent the subsequent status/overlay calls from executing.
+        js = (
+            f"try{{updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}, {str(do_show_traffic_gauge).lower()})}}catch(e){{console.error('updateConnections error',e)}};"
+            f"try{{setStats({json.dumps(stats_text)})}}catch(e){{}};"
+            f"try{{setDateTime({json.dumps(datetime_text)})}}catch(e){{}};"
+            f"try{{setRecordingIndicator({str(is_recording).lower()})}}catch(e){{}};"
+            f"try{{setModeIndicator({json.dumps(mode_indicator_text)})}}catch(e){{}};"
+            f"try{{setRejectedOverlay({show_rejected})}}catch(e){{}};"
+            f"try{{setAgentStatus({json.dumps(agent_status_text)})}}catch(e){{}}"
+        )
 
         # Check reload attempt limit to prevent infinite loops
         if not getattr(self, "map_initialized", False):
@@ -5494,6 +5548,16 @@ class TCPConnectionViewer(QMainWindow):
                            padding:24px 36px; max-width:70%; text-align:center; pointer-events:auto; box-shadow:0 4px 24px rgba(0,0,0,0.3); }
                        #agent-rejected-overlay .rejected-title { font-size:20px; font-weight:bold; color:#cc0000; margin-bottom:8px; }
                        #agent-rejected-overlay .rejected-msg { font-size:14px; color:#333; }
+                       /* Traffic gauge styles */
+                       .traffic-gauge-icon { background:transparent !important; border:none !important; }
+                       .traffic-gauge {
+                           display:flex; flex-direction:column; width:10px;
+                           border:1px solid rgba(0,0,0,0.35); border-radius:2px; overflow:hidden;
+                           background:#eee; box-shadow:0 0 3px rgba(0,0,0,0.25);
+                       }
+                       .tg-empty { width:100%; }
+                       .tg-recv { background:#4caf50; width:100%; }
+                       .tg-sent { background:#f44336; width:100%; }
                 </style>
             </head>
             <body>
@@ -5764,6 +5828,10 @@ class TCPConnectionViewer(QMainWindow):
                                     map.createPane('pinnedPane');
                                     map.getPane('pinnedPane').style.zIndex = 640;  // Above markers (600) but below public IP (650)
 
+                                    // Create custom pane for traffic gauges so they render below markers
+                                    map.createPane('gaugePane');
+                                    map.getPane('gaugePane').style.zIndex = 590;  // Below markers (600)
+
                                     // Fit-all / reset-view control (bottom-left) — fits map to all markers or resets to world view
                                     var FitAllControl = L.Control.extend({
                                         options: { position: 'bottomleft' },
@@ -5874,7 +5942,17 @@ class TCPConnectionViewer(QMainWindow):
 
                                     var liveMarkers = [];
 
-                                    function updateConnections(conns, showTooltip, drawLines) {
+                                    // Helper: format byte count to human-readable string
+                                    function _formatBytes(bytes) {
+                                        if (bytes === 0) return '0 B';
+                                        var k = 1024;
+                                        var sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+                                        var i = Math.floor(Math.log(bytes) / Math.log(k));
+                                        if (i >= sizes.length) i = sizes.length - 1;
+                                        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+                                    }
+
+                                    function updateConnections(conns, showTooltip, drawLines, showGauge) {
                                         // Guard: suppress popupclose handlers during programmatic marker removal
                                         // Unbind popupclose on all markers BEFORE removing them to avoid
                                         // async events falsely setting _pinnedPopupDismissed.
@@ -5887,6 +5965,18 @@ class TCPConnectionViewer(QMainWindow):
                                         liveMarkers = [];
 
                                         if (!conns || !Array.isArray(conns)) { return; }
+
+                                        // Pre-compute maximum sent and received bytes across all connections for gauge scaling
+                                        var maxSent = 1;
+                                        var maxRecv = 1;
+                                        if (showGauge) {
+                                            conns.forEach(function(c) {
+                                                var s = c.bytes_sent || 0;
+                                                var r = c.bytes_recv || 0;
+                                                if (s > maxSent) maxSent = s;
+                                                if (r > maxRecv) maxRecv = r;
+                                            });
+                                        }
 
                                         var publicIpCoords = null;
                                         // Per-agent origin coordinates: { hostname: [lat, lng] }
@@ -6003,6 +6093,7 @@ class TCPConnectionViewer(QMainWindow):
                                                     }
                                                     marker.bindTooltip(tooltipText, tooltipOptions);
 
+                                                    // Build popup HTML — include byte stats when available
                                                     var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
                                                                     "Protocol: " + (conn.protocol || 'TCP') + "<br>" +
                                                                     "PID: " + (conn.pid || '') + "<br>" +
@@ -6010,7 +6101,40 @@ class TCPConnectionViewer(QMainWindow):
                                                                     "Local: " + (conn.local || '') + "<br>" +
                                                                     (conn.name ? "Name: " + conn.name + "<br>" : "") +
                                                                     (conn.origin_hostname ? "Source: " + conn.origin_hostname + "<br>" : "");
+                                                    var bSent = conn.bytes_sent || 0;
+                                                    var bRecv = conn.bytes_recv || 0;
+                                                    if (bSent > 0 || bRecv > 0) {
+                                                        popupHtml += "<hr style='margin:4px 0'>" +
+                                                                     "<span style='color:#d32f2f'>&#9650; Sent:</span> " + _formatBytes(bSent) + "<br>" +
+                                                                     "<span style='color:#388e3c'>&#9660; Recv:</span> " + _formatBytes(bRecv) + "<br>";
+                                                    }
                                                     marker.bindPopup(popupHtml, {autoClose: false, closeOnClick: false});
+
+                                                    // --- Traffic gauge (DivIcon marker beside the main marker) ---
+                                                    if (showGauge && (bSent > 0 || bRecv > 0)) {
+                                                        var gaugeHeight = 40; // px — fixed total height
+                                                        // Each portion's height is proportional to the global max
+                                                        var sentH = Math.round((bSent / maxSent) * (gaugeHeight / 2));
+                                                        var recvH = Math.round((bRecv / maxRecv) * (gaugeHeight / 2));
+                                                        var emptyH = gaugeHeight - sentH - recvH;
+                                                        var gaugeHtml = '<div class="traffic-gauge" style="height:' + gaugeHeight + 'px" title="Sent: ' + _formatBytes(bSent) + ' / Recv: ' + _formatBytes(bRecv) + '">' +
+                                                                        '<div class="tg-empty" style="height:' + emptyH + 'px;"></div>' +
+                                                                        '<div class="tg-recv" style="height:' + recvH + 'px;"></div>' +
+                                                                        '<div class="tg-sent" style="height:' + sentH + 'px;"></div>' +
+                                                                        '</div>';
+                                                        var gaugeIcon = L.divIcon({
+                                                            className: 'traffic-gauge-icon',
+                                                            html: gaugeHtml,
+                                                            iconSize: [12, gaugeHeight + 2],
+                                                            iconAnchor: [-8, gaugeHeight]
+                                                        });
+                                                        var gaugeMarker = L.marker([conn.lat, conn.lng], {
+                                                            icon: gaugeIcon,
+                                                            interactive: false,
+                                                            pane: 'gaugePane'
+                                                        }).addTo(map);
+                                                        liveMarkers.push(gaugeMarker);
+                                                    }
 
                                                     // Add click handler to select corresponding table row in Python.
                                                      // We unbind the popup before calling pinConnection so that
@@ -6576,6 +6700,8 @@ class TCPConnectionViewer(QMainWindow):
                     self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
                     self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
                     self.connection_table.setItem(row, HOSTNAME_ROW_INDEX, QTableWidgetItem(conn.get('hostname', '')))
+                    self.connection_table.setItem(row, BYTES_SENT_ROW_INDEX, QTableWidgetItem(_format_bytes(conn.get('bytes_sent', 0))))
+                    self.connection_table.setItem(row, BYTES_RECV_ROW_INDEX, QTableWidgetItem(_format_bytes(conn.get('bytes_recv', 0))))
 
                 if ip in ('*', '0.0.0.0', '::', ''):
                     # UDP listener with no remote peer — not a real unresolved address
@@ -7314,7 +7440,7 @@ class TCPConnectionViewer(QMainWindow):
                 self.summary_table.setUpdatesEnabled(True)
                 return
 
-            # Dictionary to track unique connections: (process, pid, suspect, remote, name) -> count
+            # Dictionary to track unique connections: key -> { 'count': int, 'bytes_sent': int, 'bytes_recv': int }
             connection_stats = {}
 
             # Get current setting for filtering local connections
@@ -7348,17 +7474,23 @@ class TCPConnectionViewer(QMainWindow):
                     # Use tuple as dictionary key for grouping
                     key = (hostname, process, pid, suspect, protocol, local, remote, ip_type, name)
 
-                    # Increment count for this unique connection
+                    b_sent = conn.get('bytes_sent', 0) or 0
+                    b_recv = conn.get('bytes_recv', 0) or 0
+
+                    # Increment count and accumulate bytes for this unique connection
                     if key in connection_stats:
-                        connection_stats[key] += 1
+                        connection_stats[key]['count'] += 1
+                        connection_stats[key]['bytes_sent'] = max(connection_stats[key]['bytes_sent'], b_sent)
+                        connection_stats[key]['bytes_recv'] = max(connection_stats[key]['bytes_recv'], b_recv)
                     else:
-                        connection_stats[key] = 1
+                        connection_stats[key] = {'count': 1, 'bytes_sent': b_sent, 'bytes_recv': b_recv}
 
             # Sort by count descending (highest first)
-            sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1], reverse=True)
+            sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1]['count'], reverse=True)
 
             # Populate table with sorted results
-            for (hostname, process, pid, suspect, protocol, local, remote, ip_type, name), count in sorted_stats:
+            for (hostname, process, pid, suspect, protocol, local, remote, ip_type, name), stats in sorted_stats:
+                count = stats['count']
                 row = self.summary_table.rowCount()
                 self.summary_table.insertRow(row)
 
@@ -7372,6 +7504,8 @@ class TCPConnectionViewer(QMainWindow):
                 self.summary_table.setItem(row, 7, QTableWidgetItem(ip_type))
                 self.summary_table.setItem(row, 8, QTableWidgetItem(name))
                 self.summary_table.setItem(row, 9, QTableWidgetItem(str(count)))
+                self.summary_table.setItem(row, 10, QTableWidgetItem(_format_bytes(stats['bytes_sent'])))
+                self.summary_table.setItem(row, 11, QTableWidgetItem(_format_bytes(stats['bytes_recv'])))
 
                 # Highlight suspect connections in red
                 if suspect == "Yes":
@@ -7382,7 +7516,7 @@ class TCPConnectionViewer(QMainWindow):
 
             # Update title with total count
             total_unique = len(sorted_stats)
-            total_connections = sum(count for _, count in sorted_stats)
+            total_connections = sum(s['count'] for _, s in sorted_stats)
 
             # Find the title label and update it
             for i in range(self.tab_widget.widget(1).layout().count()):

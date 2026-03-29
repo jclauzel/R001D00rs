@@ -238,19 +238,43 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             if not proc_name:
                 proc_name = 'capture'
 
-            conn = {
-                'process': proc_name,
-                'pid': pid_str,
-                'protocol': protocol,
-                'local': src,
-                'localport': sport,
-                'remote': dst,
-                'remoteport': dport,
-                'ip_type': ip_type,
-                'hostname': self._hostname,
-            }
+            # --- Byte accounting ---------------------------------------------
+            # Determine packet payload size (IP total length is the most
+            # reliable cross-platform metric; fall back to raw packet len).
+            try:
+                pkt_bytes = int(ip_layer.len)
+            except Exception:
+                pkt_bytes = len(pkt)
+
+            # Direction heuristic: if the source port belongs to a local
+            # process (found in PID cache), this is an *outbound* packet
+            # (bytes sent).  Otherwise treat it as *inbound* (bytes recv).
+            _, _src_proc = self._lookup_pid(sport, protocol)
+            is_outbound = bool(_src_proc)
+
             with self._lock:
-                self._connections[key] = conn
+                existing = self._connections.get(key)
+                if existing:
+                    # Accumulate byte counters on the existing entry
+                    if is_outbound:
+                        existing['bytes_sent'] = existing.get('bytes_sent', 0) + pkt_bytes
+                    else:
+                        existing['bytes_recv'] = existing.get('bytes_recv', 0) + pkt_bytes
+                else:
+                    conn = {
+                        'process': proc_name,
+                        'pid': pid_str,
+                        'protocol': protocol,
+                        'local': src,
+                        'localport': sport,
+                        'remote': dst,
+                        'remoteport': dport,
+                        'ip_type': ip_type,
+                        'hostname': self._hostname,
+                        'bytes_sent': pkt_bytes if is_outbound else 0,
+                        'bytes_recv': pkt_bytes if not is_outbound else 0,
+                    }
+                    self._connections[key] = conn
 
         # BPF filter: only TCP and UDP (ignore ARP, ICMP, etc.)
         bpf_filter = "tcp or udp"
