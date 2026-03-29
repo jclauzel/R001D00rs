@@ -99,7 +99,7 @@ from PySide6.QtWebChannel import QWebChannel
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
-VERSION = "3.3.4" # Current script version
+VERSION = "3.4.0" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
