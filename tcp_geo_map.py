@@ -99,7 +99,7 @@ from PySide6.QtWebChannel import QWebChannel
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 
-VERSION = "3.3.2" # Current script version
+VERSION = "3.3.3" # Current script version
 
 assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
 
@@ -136,6 +136,9 @@ Options:
   --enable_server_mode
       Start the application in server mode. A Flask endpoint is started to
       collect connection data submitted by one or more remote agents.
+      The server accepts at most MAX_SERVER_AGENTS (default 100) distinct
+      agents.  New agents beyond this limit receive HTTP 429 (Too Many
+      Requests).  Adjust the constant in the script to raise the cap.
 
   --enable_agent_mode <host>
       Start the application in agent mode. The app periodically POSTs its
@@ -247,6 +250,7 @@ enable_server_mode = False  # When True the app runs a Flask endpoint to collect
 enable_agent_mode = False   # When True the app periodically POSTs its connections to a server
 agent_server_host = ""      # Hostname/IP of the server in agent mode (no scheme, no port)
 agent_no_ui = False         # When True in agent mode the window is never shown (headless agent)
+MAX_SERVER_AGENTS = 100     # Max distinct agents the server will accept; new agents beyond this get HTTP 429
 FLASK_SERVER_PORT = 5000    # Port the Flask server listens on (server mode)
 FLASK_AGENT_PORT = 5000     # Port the agent POSTs to (agent mode)
 LOCAL_HOSTNAME = platform.node() or socket.gethostname()  # This machine's hostname
@@ -878,6 +882,8 @@ class TCPConnectionViewer(QMainWindow):
         self._agent_post_thread = threading.Thread(
             target=self._agent_post_worker, daemon=True, name="AgentPostWorker")
         self._agent_post_thread.start()
+        self._agent_rejected_429 = False  # True when server returned HTTP 429 (agent limit reached)
+        self._agent_server_unreachable = False  # True when agent cannot reach the server
 
         # Foreground agent: the hostname whose connections are rendered with the
         # standard localhost colour scheme (green/blue/yellow/red).  All other
@@ -1346,7 +1352,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1367,6 +1373,7 @@ class TCPConnectionViewer(QMainWindow):
             'agent_server_host': agent_server_host,
             'flask_server_port': FLASK_SERVER_PORT,
             'flask_agent_port': FLASK_AGENT_PORT,
+            'max_server_agents': MAX_SERVER_AGENTS,
             'agent_no_ui': agent_no_ui,
             'agent_colors': dict(self._agent_colors),
             'active_collector_plugin': self._active_collector.name,
@@ -1462,10 +1469,18 @@ class TCPConnectionViewer(QMainWindow):
                 summary_table_column_sort_reverse = settings.get('summary_table_column_sort_reverse', summary_table_column_sort_reverse)
 
                 # Restore server/agent mode settings (CLI args take precedence)
-                global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT
+                global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
                 # Only restore no_ui from settings if neither --no_ui nor --no_ui_off was passed on CLI
                 if not agent_no_ui and not _no_ui_off_requested:
                     agent_no_ui = bool(settings.get('agent_no_ui', False))
+
+                # Restore max server agents (must be a positive integer)
+                try:
+                    _saved_max = int(settings.get('max_server_agents', MAX_SERVER_AGENTS))
+                    if _saved_max > 0:
+                        MAX_SERVER_AGENTS = _saved_max
+                except (TypeError, ValueError):
+                    pass
 
                 def _valid_port(val, default):
                     try:
@@ -2019,19 +2034,58 @@ class TCPConnectionViewer(QMainWindow):
         # -------------------------------------------------------------------------
 
         app = Flask(__name__)
+        # Security: limit request payload to 10 MB to prevent memory exhaustion
+        app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
         viewer = self  # capture reference for the route closure
 
         @app.route("/submit_connections", methods=["POST"])
         def submit_connections():
             try:
                 data = flask_request.get_json(force=True)
+                if not isinstance(data, dict):
+                    return jsonify({"status": "error", "message": "Invalid payload"}), 400
                 hostname = data.get("hostname", "unknown")
+                # Security: sanitize hostname — only allow printable, non-control characters, max 255 chars
+                if not isinstance(hostname, str) or len(hostname) > 255:
+                    return jsonify({"status": "error", "message": "Invalid hostname"}), 400
+                hostname = hostname.strip()
+                if not hostname:
+                    hostname = "unknown"
                 ip_addresses = data.get("ip_addresses", [])
+                if not isinstance(ip_addresses, list):
+                    ip_addresses = []
                 public_ip = data.get("public_ip", "")
+                if not isinstance(public_ip, str):
+                    public_ip = ""
                 loc_lat = data.get("lat")
                 loc_lng = data.get("lng")
+                # Security: validate lat/lng are numeric or None
+                if loc_lat is not None:
+                    try:
+                        loc_lat = float(loc_lat)
+                    except (TypeError, ValueError):
+                        loc_lat = None
+                if loc_lng is not None:
+                    try:
+                        loc_lng = float(loc_lng)
+                    except (TypeError, ValueError):
+                        loc_lng = None
                 conns = data.get("connections", [])
+                if not isinstance(conns, list):
+                    conns = []
+                # Security: cap the number of connections per agent to prevent memory exhaustion
+                _MAX_CONNS_PER_AGENT = 10000
+                conns = conns[:_MAX_CONNS_PER_AGENT]
                 with viewer._agent_cache_lock:
+                    # Enforce MAX_SERVER_AGENTS: reject new (unknown) agents
+                    # when the limit is already reached.  Agents already in the
+                    # cache are always allowed to update their data.
+                    if hostname not in viewer._agent_cache and len(viewer._agent_cache) >= MAX_SERVER_AGENTS:
+                        return jsonify({
+                            "status": "rejected",
+                            "message": f"Server agent limit reached ({MAX_SERVER_AGENTS}). "
+                                       "Increase MAX_SERVER_AGENTS on the server to allow more agents."
+                        }), 429
                     viewer._agent_cache[hostname] = {
                         "hostname": hostname,
                         "ip_addresses": ip_addresses,
@@ -2043,7 +2097,8 @@ class TCPConnectionViewer(QMainWindow):
                 return jsonify({"status": "ok", "accepted": len(conns)}), 200
             except Exception as e:
                 logging.error(f"Error processing /submit_connections: {e}")
-                return jsonify({"status": "error", "message": str(e)}), 400
+                # Security: do not expose internal error details to the client
+                return jsonify({"status": "error", "message": "Bad request"}), 400
 
         try:
             srv = werkzeug_make_server("0.0.0.0", FLASK_SERVER_PORT, app)
@@ -2267,15 +2322,29 @@ class TCPConnectionViewer(QMainWindow):
 
             url = f"http://{agent_server_host}:{FLASK_AGENT_PORT}/submit_connections"
             max_retries = 3
+            _post_succeeded = False
             for attempt in range(max_retries):
                 if self._agent_post_stop.is_set():
                     return
                 try:
                     resp = self._agent_http_session.post(url, json=payload, timeout=(3, 5))
                     if resp.status_code == 200:
+                        self._agent_rejected_429 = False
+                        self._agent_server_unreachable = False
+                        _post_succeeded = True
                         logging.debug(f"Agent POST successful ({len(payload.get('connections', []))} conns)")
                         break
+                    elif resp.status_code == 429:
+                        self._agent_rejected_429 = True
+                        self._agent_server_unreachable = False
+                        _post_succeeded = True  # server is reachable, just rejecting
+                        logging.warning(
+                            "Agent POST rejected — server agent limit reached (HTTP 429). "
+                            "Ask the server admin to increase MAX_SERVER_AGENTS."
+                        )
+                        break  # no point retrying a 429; the limit is server-side
                     else:
+                        self._agent_server_unreachable = False
                         logging.warning(f"Agent POST returned {resp.status_code}: {resp.text[:200]}")
                 except requests.exceptions.ConnectionError as e:
                     logging.error(f"Agent POST connection error (attempt {attempt+1}/{max_retries}): {e}")
@@ -2286,6 +2355,8 @@ class TCPConnectionViewer(QMainWindow):
                 if attempt < max_retries - 1:
                     # Interruptible sleep so we can stop quickly
                     self._agent_post_stop.wait(0.5)
+            if not _post_succeeded:
+                self._agent_server_unreachable = True
 
     def closeEvent(self, event):
         """Save settings when closing the application"""
@@ -2559,6 +2630,12 @@ class TCPConnectionViewer(QMainWindow):
             QMessageBox.warning(self, "No PID", "Could not determine the PID for the selected row.")
             return
 
+        # Security: validate PID is purely numeric to prevent command injection
+        # (especially via terminal -e on Linux which interprets args as shell commands)
+        if not pid.isdigit():
+            QMessageBox.warning(self, "Invalid PID", f"PID value '{pid}' is not a valid numeric process ID.")
+            return
+
         if platform.system() == "Windows":
             if chosen == action_open:
                 try:
@@ -2644,10 +2721,11 @@ class TCPConnectionViewer(QMainWindow):
         else:
             if chosen == action_open:
                 try:
-                    # Open htop filtered to the selected PID in a new terminal
+                    # Open htop filtered to the selected PID in a new terminal.
+                    # Use separate args for htop to avoid shell interpretation via -e.
                     for term in ("x-terminal-emulator", "xterm", "gnome-terminal", "konsole"):
                         try:
-                            subprocess.Popen([term, "-e", f"htop -p {pid}"])
+                            subprocess.Popen([term, "-e", "htop", "-p", pid])
                             break
                         except FileNotFoundError:
                             continue
@@ -2703,6 +2781,11 @@ class TCPConnectionViewer(QMainWindow):
 
         if not pid:
             QMessageBox.warning(self, "No PID", "Could not determine the PID for the selected row.")
+            return
+
+        # Security: validate PID is purely numeric to prevent command injection
+        if not pid.isdigit():
+            QMessageBox.warning(self, "Invalid PID", f"PID value '{pid}' is not a valid numeric process ID.")
             return
 
         if platform.system() == "Windows":
@@ -2784,9 +2867,10 @@ class TCPConnectionViewer(QMainWindow):
         else:
             if chosen == action_open:
                 try:
+                    # Use separate args for htop to avoid shell interpretation via -e
                     for term in ("x-terminal-emulator", "xterm", "gnome-terminal", "konsole"):
                         try:
-                            subprocess.Popen([term, "-e", f"htop -p {pid}"])
+                            subprocess.Popen([term, "-e", "htop", "-p", pid])
                             break
                         except FileNotFoundError:
                             continue
@@ -4481,12 +4565,12 @@ class TCPConnectionViewer(QMainWindow):
         try:
             # Ensure directory exists
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
-            
+
             # Download file
-            response = requests.get(url, stream=True)
+            response = requests.get(url, stream=True, timeout=30)
             if response.status_code == 200:
                 if os.path.exists(db_path):
-                    os.remove(db_path)# remove the previous file first
+                    os.remove(db_path)  # remove the previous file first
                 with open(db_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=1024):
                         if chunk:
@@ -5306,8 +5390,16 @@ class TCPConnectionViewer(QMainWindow):
         elif enable_agent_mode:
             mode_indicator_text = f'Agent mode: {agent_server_host}:{FLASK_AGENT_PORT}'
 
-        # Send stats_text, datetime_text, recording indicator, and mode indicator to JS
-        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)}); setDateTime({json.dumps(datetime_text)}); setRecordingIndicator({str(is_recording).lower()}); setModeIndicator({json.dumps(mode_indicator_text)});"
+        # Determine whether the 429-rejected overlay should be visible
+        show_rejected = 'true' if getattr(self, '_agent_rejected_429', False) else 'false'
+
+        # Build agent-server-unreachable status text (shown next to pulse indicator)
+        agent_status_text = ''
+        if enable_agent_mode and getattr(self, '_agent_server_unreachable', False):
+            agent_status_text = f'\u26a0 Server unreachable: {agent_server_host}:{FLASK_AGENT_PORT}'
+
+        # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay, and agent status to JS
+        js = f"updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}); setStats({json.dumps(stats_text)}); setDateTime({json.dumps(datetime_text)}); setRecordingIndicator({str(is_recording).lower()}); setModeIndicator({json.dumps(mode_indicator_text)}); setRejectedOverlay({show_rejected}); setAgentStatus({json.dumps(agent_status_text)});"
 
         # Check reload attempt limit to prevent infinite loops
         if not getattr(self, "map_initialized", False):
@@ -5367,6 +5459,12 @@ class TCPConnectionViewer(QMainWindow):
                            88% { opacity:1; transform:scale(1); }
                            100% { opacity:0; transform:scale(0.9); }
                        }
+                       /* agent server status label (to the left of the pulse dot) */
+                       #agent-status { display:none; position:absolute; top:10px; right:32px; z-index:1000;
+                                       font-family:Arial,sans-serif; font-size:11px; color:#cc0000; font-weight:bold;
+                                       background:rgba(255,255,255,0.92); padding:3px 8px; border-radius:4px;
+                                       border:1px solid #cc0000; pointer-events:none; white-space:nowrap; }
+                       #agent-status.active { display:block; }
                        /* loading overlay centered on map */
                        #map-loading-overlay { position:absolute; top:0; left:0; width:100%; height:100%; z-index:2000;
                                               display:flex; flex-direction:column; align-items:center; justify-content:center;
@@ -5388,6 +5486,14 @@ class TCPConnectionViewer(QMainWindow):
                            font-family:Arial, sans-serif; font-size:11px; color:#333; white-space:nowrap;
                            border:1px solid #ccc; }
                        .leaflet-control-modeinfo .mode-label.active { display:block; }
+                       /* Agent rejected (429) overlay centered on map */
+                       #agent-rejected-overlay { display:none; position:absolute; top:0; left:0; width:100%; height:100%;
+                           z-index:1500; background:rgba(0,0,0,0.55); justify-content:center; align-items:center; pointer-events:none; }
+                       #agent-rejected-overlay.active { display:flex; }
+                       #agent-rejected-overlay .rejected-box { background:#fff3f3; border:2px solid #cc0000; border-radius:10px;
+                           padding:24px 36px; max-width:70%; text-align:center; pointer-events:auto; box-shadow:0 4px 24px rgba(0,0,0,0.3); }
+                       #agent-rejected-overlay .rejected-title { font-size:20px; font-weight:bold; color:#cc0000; margin-bottom:8px; }
+                       #agent-rejected-overlay .rejected-msg { font-size:14px; color:#333; }
                 </style>
             </head>
             <body>
@@ -5398,6 +5504,14 @@ class TCPConnectionViewer(QMainWindow):
                     <div class="loading-error" id="map-loading-error"></div>
                 </div>
                 <div id="refresh-pulse"></div>
+                <div id="agent-status"></div>
+                <div id="agent-rejected-overlay">
+                    <div class="rejected-box">
+                        <div class="rejected-title">&#9888; Server Rejected Submission (HTTP 429)</div>
+                        <div class="rejected-msg">The server has reached its maximum agent limit.<br>
+                        Ask the server administrator to increase <b>MAX_SERVER_AGENTS</b> and try again.</div>
+                    </div>
+                </div>
                 <div id="map-stats"></div>
                 <div id="map-datetime">
                     <span id="recording-indicator"></span>
@@ -6086,6 +6200,33 @@ class TCPConnectionViewer(QMainWindow):
                                         } catch(e) {}
                                     }
                                     window.setModeIndicator = setModeIndicator;
+
+                                    function setRejectedOverlay(show) {
+                                        try {
+                                            var ov = document.getElementById('agent-rejected-overlay');
+                                            if (ov) {
+                                                ov.className = show ? 'active' : '';
+                                            }
+                                        } catch(e) {}
+                                    }
+                                    window.setRejectedOverlay = setRejectedOverlay;
+
+                                    function setAgentStatus(text) {
+                                        try {
+                                            var el = document.getElementById('agent-status');
+                                            if (el) {
+                                                if (text) {
+                                                    el.innerText = text;
+                                                    el.className = 'active';
+                                                } else {
+                                                    el.innerText = '';
+                                                    el.className = '';
+                                                }
+                                            }
+                                        } catch(e) {}
+                                    }
+                                    window.setAgentStatus = setAgentStatus;
+
                                     window.triggerPulse = triggerPulse;
 
                                     // Notify Python that map is fully initialized

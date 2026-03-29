@@ -256,6 +256,7 @@ The table below documents every key stored in `settings.json`.
 | `flask_server_port` | integer | `5000` | TCP port the Flask server listens on in server mode. Must be reachable by all agents; a firewall rule may be required. |
 | `flask_agent_port` | integer | `5000` | TCP port the agent POSTs to on the server. Must match `flask_server_port` on the server side. |
 | `agent_no_ui` | boolean | `false` | When `true`, the application window is never shown — the process runs headless as a background agent. Equivalent to passing `--no_ui` on the command line. Set to `false` explicitly via `--no_ui_off`. Only meaningful when `enable_agent_mode` is also `true`. |
+| `max_server_agents` | integer | `100` | Maximum number of distinct agents the server will accept simultaneously. When the limit is reached, new (unknown) agents receive HTTP 429 (Too Many Requests) and a rejection overlay is shown on their map. Agents already in the cache are unaffected. Persisted to and loaded from `settings.json`; also editable by changing the `MAX_SERVER_AGENTS` constant in the script. Must be a positive integer. |
 | `agent_colors` | object | `{}` | Maps each remote agent hostname to a display colour used for its map markers and table rows, e.g. `{"laptop": "blue", "server": "green"}`. Managed automatically by the **Agent Management** tab; colours persist across restarts. |
 
 ---
