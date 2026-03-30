@@ -279,14 +279,11 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     }
                     self._connections[key] = conn
 
-        # BPF filter: only TCP and UDP (ignore ARP, ICMP, etc.)
-        bpf_filter = "tcp or udp"
         stop_fn = lambda _pkt: self._stop_event.is_set()
 
         def _run_sniff(l2socket=None):
             kwargs = dict(
                 prn=_process_packet,
-                filter=bpf_filter,
                 store=0,
                 stop_filter=stop_fn,
             )
