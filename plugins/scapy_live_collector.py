@@ -283,16 +283,27 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         bpf_filter = "tcp or udp"
         stop_fn = lambda _pkt: self._stop_event.is_set()
 
+        def _get_local_ip():
+            # Try to get a non-loopback local IP address
+            try:
+                hostname = _platform.node()
+                local_ips = []
+                import socket
+                for iface in socket.getaddrinfo(hostname, None):
+                    ip = iface[4][0]
+                    if not ip.startswith('127.') and ':' not in ip:
+                        local_ips.append(ip)
+                if local_ips:
+                    return local_ips[0]
+            except Exception:
+                pass
+            return '127.0.0.1'
+
         def _run_sniff(use_l3socket=False):
-            # Only pass filter/type for Layer 2. For L3socket, set conf.L3socket and call sniff() without filter/type/L2socket.
+            # Only pass filter/type for Layer 2. For L3socket, use iface=local_ip and no filter/type/L2socket.
             if use_l3socket:
-                from scapy.all import conf
-                orig_l3socket = conf.L3socket
-                try:
-                    conf.L3socket = conf.L3socket  # Explicitly set (no-op, but for clarity)
-                    sniff(prn=_process_packet, store=0, stop_filter=stop_fn)
-                finally:
-                    conf.L3socket = orig_l3socket
+                local_ip = _get_local_ip()
+                sniff(prn=_process_packet, store=0, stop_filter=stop_fn, iface=local_ip)
             else:
                 sniff(prn=_process_packet, filter=bpf_filter, store=0, stop_filter=stop_fn)
 
