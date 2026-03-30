@@ -283,12 +283,16 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         bpf_filter = "tcp or udp"
         stop_fn = lambda _pkt: self._stop_event.is_set()
 
-        def _run_sniff(use_l3socket=False):
-            # Only pass filter/type for Layer 2. For L3socket fallback, do not pass iface, filter, or L2socket.
-            if use_l3socket:
-                sniff(prn=_process_packet, store=0, stop_filter=stop_fn)
-            else:
-                sniff(prn=_process_packet, filter=bpf_filter, store=0, stop_filter=stop_fn)
+        def _run_sniff(l2socket=None):
+            kwargs = dict(
+                prn=_process_packet,
+                filter=bpf_filter,
+                store=0,
+                stop_filter=stop_fn,
+            )
+            if l2socket is not None:
+                kwargs['L2socket'] = l2socket
+            sniff(**kwargs)
 
         try:
             # --- Attempt 1: default (Layer 2, requires Npcap on Windows) ----
@@ -303,7 +307,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     "Falling back to Layer 3 socket — install Npcap for full capture."
                 )
                 try:
-                    _run_sniff(use_l3socket=True)
+                    _run_sniff(l2socket=conf.L3socket)
                 except PermissionError:
                     logging.error(
                         "Scapy live capture requires elevated privileges "
