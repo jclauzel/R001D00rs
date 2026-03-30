@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 
 import psutil
@@ -37,7 +35,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 
 # --- Constants that must be defined early ---
 DB_DIR = "databases"
-VERSION = "3.5.2" # Current script version
+VERSION = "3.5.3" # Current script version
 
 # --- Standard library imports ---
 import os

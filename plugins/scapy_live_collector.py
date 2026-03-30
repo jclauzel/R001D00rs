@@ -59,38 +59,65 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
     def __init__(self):
         super().__init__()
         self._lock = threading.Lock()
-        # Accumulated connections: key=(src, sport, dst, dport, proto) -> dict
+        # Now each value is a dict with connection info + 'last_seen'
         self._connections: dict = {}
         self._sniffer_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._started = False
         self._hostname = _platform.node()
-        # PID lookup cache: (laddr, lport, proto) -> (pid, process_name)
-        # Refreshed at most once per _PID_CACHE_TTL seconds to avoid
-        # calling psutil on every packet.
         self._pid_cache: dict = {}
         self._pid_cache_time: float = 0.0
         self._pid_cache_lock = threading.Lock()
+        self._CONN_TIMEOUT = 10  # seconds to keep a connection "alive"
 
     _PID_CACHE_TTL = 2.0  # seconds between psutil connection-table refreshes
 
     # ---- public API ---------------------------------------------------------
 
     def collect_raw_connections(self) -> list:
-        """Return connections observed since the last call, then reset.
-
-        On the very first call the background sniffer is started; subsequent
-        calls simply drain the accumulated buffer.
-        """
+        """Return all connections seen within the last N seconds."""
         if not self._started:
             self._start_sniffer()
-
+        now = time.monotonic()
         with self._lock:
-            snapshot = list(self._connections.values())
-            self._connections.clear()
+            # Only keep connections seen within the timeout window
+            to_remove = []
+            for key, conn in self._connections.items():
+                if now - conn.get('last_seen', 0) > self._CONN_TIMEOUT:
+                    to_remove.append(key)
+            for key in to_remove:
+                del self._connections[key]
+            snapshot = [dict(conn) for conn in self._connections.values()]
         return snapshot
 
-    # ---- PID / process correlation ------------------------------------------
+        # In _process_packet (inside the sniffer loop), update as follows:
+        with self._lock:
+            existing = self._connections.get(key)
+            now = time.monotonic()
+            if existing:
+                # Update byte counters as before
+                if is_outbound:
+                    existing['bytes_sent'] = existing.get('bytes_sent', 0) + pkt_bytes
+                else:
+                    existing['bytes_recv'] = existing.get('bytes_recv', 0) + pkt_bytes
+                existing['last_seen'] = now
+            else:
+                conn = {
+                    'process': proc_name,
+                    'pid': pid_str,
+                    'protocol': protocol,
+                    'local': src,
+                    'localport': sport,
+                    'remote': dst,
+                    'remoteport': dport,
+                    'ip_type': ip_type,
+                    'hostname': self._hostname,
+                    'bytes_sent': pkt_bytes if is_outbound else 0,
+                    'bytes_recv': pkt_bytes if not is_outbound else 0,
+                    'last_seen': now,
+                }
+                self._connections[key] = conn
+        # ---- PID / process correlation ------------------------------------------
 
     def _refresh_pid_cache(self):
         """Rebuild the port-based PID lookup table from the live OS connection table.
@@ -253,6 +280,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             is_outbound = bool(_src_proc)
 
             with self._lock:
+                now = time.monotonic()
                 existing = self._connections.get(key)
                 if existing:
                     # Accumulate byte counters on the existing entry
@@ -260,6 +288,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                         existing['bytes_sent'] = existing.get('bytes_sent', 0) + pkt_bytes
                     else:
                         existing['bytes_recv'] = existing.get('bytes_recv', 0) + pkt_bytes
+                    existing['last_seen'] = now
                 else:
                     conn = {
                         'process': proc_name,
@@ -273,6 +302,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                         'hostname': self._hostname,
                         'bytes_sent': pkt_bytes if is_outbound else 0,
                         'bytes_recv': pkt_bytes if not is_outbound else 0,
+                        'last_seen': now,
                     }
                     self._connections[key] = conn
 
