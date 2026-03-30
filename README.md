@@ -70,6 +70,9 @@ When using server and agent mode, the server will start by default a flask web s
 * scapy
 You may replace psutil collection by scapy live packet capture. To do so navigate to the settings tab and select the scapy collector. This requires to run the script (python) as an administrator. By default the scapy plugin will try to capture layer 2 packets and then falls back to layer 3 if not found. For layer 2 capture you will need to install https://npcap.com/ but this is not mandatory as if not present the default plugin will fallback to layer 3 (requiring administrative privileges though).
 
+* aiodns
+Is now used for async reverse dns name resolution.
+
 tcp_geo_map uses:
 
 * maxminddb
@@ -81,6 +84,7 @@ tcp_geo_map uses:
 * flask
 * scapy
 * https://github.com/pointhi/leaflet-color-markers
+* aiodns
 
 When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process performing such a call will be tagged in red and "C2" column will mark "Yes".
 
@@ -114,7 +118,7 @@ python3 -m venv ./R001D00rs
 
 source R001D00rs/bin/activate
 
-pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser flask scapy
+pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser flask scapy aiodns
 
 or
 
@@ -135,7 +139,7 @@ Download source from latest "release" located on the right side of https://githu
 
 Install required packages:
 
-pip3 install pyside6 requests maxminddb opencv-python procmon-parser flask scapy
+pip3 install pyside6 requests maxminddb opencv-python procmon-parser flask scapy aiodns
 
 or
 
