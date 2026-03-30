@@ -287,8 +287,8 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                 store=0,
                 stop_filter=stop_fn,
             )
+            kwargs.pop('type', None)   # ignore if present
             if l2socket is not None:
-                kwargs.pop('type', None)   # ignore if present
                 kwargs['L2socket'] = l2socket
             sniff(**kwargs)
 
