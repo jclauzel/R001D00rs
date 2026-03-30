@@ -331,7 +331,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     "Falling back to Layer 3 socket — install Npcap for full capture."
                 )
                 try:
-                    _run_sniff(use_l3socket=True)
+                    _run_sniff(l2socket=conf.L3socket)
                 except PermissionError:
                     logging.error(
                         "Scapy live capture requires elevated privileges "
