@@ -1,4 +1,6 @@
+aiodns
 PySide6>=6.5.1
+PySide6-WebEngine
 psutil>=5.9.5
 maxminddb>=2.2.0
 pandas>=2.0.3
