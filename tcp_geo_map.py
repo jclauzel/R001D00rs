@@ -1,4 +1,60 @@
+
+
 #!/usr/bin/env python3
+
+import psutil
+import subprocess
+import csv
+import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# --- Constants that must be defined early ---
+DATABASE_EXPIRE_AFTER_DAYS = 7
+DATABASE_EXPIRE_TIME_CHECK_INTERVAL = 600000
+import os
+import sys
+import platform
+import socket
+import json
+import logging
+import time
+import datetime
+import requests
+import maxminddb
+import ipaddress
+from collections import deque
+
+# --- PySide6 imports (for Qt integration) ---
+from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QSize, Qt, QThreadPool
+from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+    QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
+from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
+from PySide6.QtWebChannel import QWebChannel
+
+# Import ConnectionCollectorPlugin for plugin system
+from connection_collector_plugin import ConnectionCollectorPlugin
+
+# --- Constants that must be defined early ---
+DB_DIR = "databases"
+VERSION = "3.5.2" # Current script version
+
+# --- Standard library imports ---
+import os
+import sys
+import platform
+import socket
+import json
+import logging
+
+# --- PySide6 imports (for Qt integration) ---
+from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QSize
+from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+    QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
+from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
+from PySide6.QtWebChannel import QWebChannel
 
 # R001D00rs tcp_geo_map https://github.com/jclauzel/R001D00rs/
 
@@ -10,102 +66,96 @@
 
 # Summary
 # R001D00rs tcp_geo_map is a cross-platform desktop network visibility and threat-hunting tool built with Python and PySide6.
-#
-# Core features:
-#   - Live capture: enumerates active TCP/UDP connections in real time using psutil, with a configurable refresh interval.
-#   - Geolocation: resolves remote IP addresses (IPv4 and IPv6) to city/country using the MaxMind GeoLite2 database (.mmdb).
-#   - Interactive map: displays connections on a Leaflet/OpenStreetMap map embedded in a QWebEngineView, with colored markers
-#       (green = normal, red = suspect/C2), polylines between local and remote endpoints, and clickable popups per connection.
-#       A loading overlay with spinner is shown on map startup and replaced with a human-readable error if tiles fail to load
-#       (e.g. no internet connectivity).
-#   - C2/threat intel: optional cross-reference of remote IPs against the C2-Tracker community IOC feed (Shodan/Censys-sourced).
-#   - Reverse DNS: background resolution of remote hostnames via a persistent DNS worker thread with in-memory and optional
-#       on-disk cache (ip_cache.json) to accelerate repeated lookups.
-#   - Connection table: sortable, filterable table of active connections showing process, PID, protocol, local/remote address
-#       and port, resolved hostname, IP type, geolocation, and suspect flag.
-#   - Summary table: per-process/IP aggregation view for quick traffic profiling.
-#   - Time-travel replay: a FILO buffer (up to 1000 snapshots) with a time slider to replay historical connection states.
-#   - Database management: automatic expiration check (7-day TTL) at startup and every 10 minutes at runtime; expired or missing
-#       databases trigger a guided download flow (with --accept_eula flag for unattended automation).
-#   - Screenshot capture: periodic JPEG snapshots of the map view saved to screen_captures/ for later review.
-#   - Video export: assembles captured screenshots into an .mp4 timelapse using OpenCV.
-#   - CSV export: exports the current connection table or full snapshot history to CSV.
-#   - Process tools (Windows): right-click a connection to open its process in Task Manager, launch ProcDump for memory dump,
-#       or auto-generate and launch a Process Monitor (.pmc) filter configuration scoped to that PID/process name.
-#   - Settings persistence: UI state (map position/zoom, toggles, sort order, window geometry) saved to settings.json on exit
-#       and restored on next launch.
-#   - Offline resilience: Leaflet JS/CSS and marker icons can be downloaded locally (resources/leaflet/) and are used as
-#       automatic CDN fallback so the map renders without internet access.
-#   - Main UI handler class: `TCPConnectionViewer`.
 
-""" 
 
-Warranty, Disclaimer of Warranty, Limitation of Liability.
+# --- Async DNS Worker using asyncio and aiodns ---
+import asyncio
+import aiodns
+import threading
+import queue
 
-THE SCRIPT SOFTWARE IS PROVIDED "AS IS." THE AUTHOR MAKES NO WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SCRIPT SOFTWARE WHICH MAY CONTAIN THIRD PARTY COMMERCIAL SOFTWARE. 
+class AsyncDNSWorker:
+    """
+    Async DNS resolver using asyncio and aiodns, running in a background thread.
+    Use enqueue(ip) to schedule lookups. Results are cached and callback is called on resolve.
+    """
+    def __init__(self, cache, lock, on_resolve=None, max_queue=10000):
+        self.cache = cache
+        self.lock = lock
+        self.on_resolve = on_resolve
+        self.queue = queue.Queue(maxsize=max_queue)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="AsyncDNSWorker")
 
-IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR FOR DIRECT, SPECIAL, INDIRECT, CONSEQUENTIAL, INCIDENTAL OR PUNITIVE DAMAGES HOWEVER CAUSED AND REGARDLESS OF THE THEORY OF LIABILITY ARISING OUT OF THE USE OF OR INABILITY TO USE THE SCRIPT SOFTWARE, EVEN IF THE AUTHOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+    def enqueue(self, ip):
+        try:
+            self.queue.put_nowait(ip)
+        except queue.Full:
+            pass
 
-    Other Important Notices:
+    def enqueue_many(self, ips):
+        for ip in ips:
+            self.enqueue(ip)
 
-    - When starting the application will download icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img so internet access is required.
+    def stop(self):
+        self._stop.set()
+        # Put a dummy item to unblock the queue if waiting
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
 
-    - Using this application requires that YOU FULLY AGREE AND ACCEPT:
-    
-            MaxMind / GeoLite, folium, leaflet, OpenStreetMap, pyside licensing terms.
-        
-                as well as licensing terms of all contributing libraries to this script even though you use the --accept_eula startup option.
+    def start(self):
+        self._thread.start()
 
-    - This script will persist to disk by default the dns names ip cache file defined in IP_DNS_NAME_CACHE_FILE to speed up startup (when PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is set to True).. 
-        If you don't want any cache file to speed up the application startup then set PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK to False.
+    def join(self, timeout=None):
+        self._thread.join(timeout=timeout)
 
-    - Settings are persisted on applicaton end in a file called by default settings.json (defined in SETTINGS_FILE_NAME) that will be loaded next time the application start up. To reset settings simply delete the generated settings.json file.
+    def _run_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._worker(loop))
 
-    (kali) linux install using venv:
-
-    git clone https://github.com/jclauzel/R001D00rs
-    python3 -m venv ./venv
-    source venv/bin/activate
-    pip3 install psutil pyside6 requests maxminddb opencv-python procmon-parser scapy
-    python3 tcp_geo_map.py
-
-    Windows:
-    pip3 install pyside6 requests maxminddb opencv-python procmon-parser scapy
-"""
-
-import requests, datetime, sys, os, threading, time, socket, csv, psutil, maxminddb, json, queue, logging, platform, subprocess, signal, ipaddress
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# Suppress Qt WebEngine Chromium warnings (must be set before QApplication)
-os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.webenginecontext.debug=false'
-os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-logging --log-level=3'
-
-# Configure logging
-logging.basicConfig(
-    level=logging.WARNING,  # Changed to INFO to see cleanup diagnostic messages
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
-                             QWidget, QTableWidget, QTableWidgetItem, QLabel,
-                             QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog)
-from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
-from PySide6.QtCore import Qt, QTimer, QByteArray, QUrl, QObject, Signal, QRunnable, QThreadPool, Slot, QPoint, QSize
-from PySide6.QtWidgets import QStyle
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
-from PySide6.QtWebChannel import QWebChannel
-
-from connection_collector_plugin import ConnectionCollectorPlugin
-
-VERSION = "3.5.1" # Current script version
-
-assert sys.version_info >= (3, 8) # minimum required version of python for PySide6, maxminddb, psutil...
-
-DATABASE_EXPIRE_AFTER_DAYS = 7 # Databases expiration time in days from download date, default 7 days (1 week)
-DATABASE_EXPIRE_TIME_CHECK_INTERVAL = 600000 # Check for database expiration every 10 minutes (600000 ms)
-DB_DIR = "databases" # Database location are contained in this subdirectory under the main script directory
+    async def _worker(self, loop):
+        resolver = aiodns.DNSResolver(loop=loop)
+        while not self._stop.is_set():
+            try:
+                ip = await loop.run_in_executor(None, self.queue.get)
+            except Exception:
+                continue
+            if self._stop.is_set() or not ip:
+                break
+            # skip if already in cache
+            with self.lock:
+                if ip in self.cache:
+                    try:
+                        self.queue.task_done()
+                    except Exception:
+                        pass
+                    continue
+            # perform async resolution
+            hostname = None
+            try:
+                result = await resolver.gethostbyaddr(ip)
+                hostname = result.name if result and hasattr(result, 'name') else None
+            except Exception:
+                hostname = None
+            # update cache
+            try:
+                with self.lock:
+                    self.cache[ip] = hostname
+            except Exception:
+                pass
+            # notify caller (UI) if positive result
+            if hostname and self.on_resolve:
+                try:
+                    self.on_resolve(ip, hostname)
+                except Exception:
+                    pass
+            try:
+                self.queue.task_done()
+            except Exception:
+                pass
 SCREENSHOTS_DIR = "screen_captures"  # Screenshot directory for captured map images
 
 IPV4_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv4.mmdb")
@@ -932,7 +982,8 @@ class TCPConnectionViewer(QMainWindow):
                 # fallback: no UI notification available
                 pass
 
-        self.dns_worker = DNSWorker(ip_cache, cache_lock, on_resolve=_dns_notify)
+        # Use AsyncDNSWorker instead of DNSWorker for non-blocking DNS
+        self.dns_worker = AsyncDNSWorker(ip_cache, cache_lock, on_resolve=_dns_notify)
         self.dns_worker.start()
 
         # Initialize thread pool for async operations (video generation, etc.)
@@ -3629,7 +3680,7 @@ class TCPConnectionViewer(QMainWindow):
             QMessageBox.information(
                 self,
                 "Save complete",
-                f"Connection list timeline {timeline_index} data saved to {full_path}"
+                f"Connection list for {timeline_time} saved to {full_path}"
             )
             
         except IndexError as e:
