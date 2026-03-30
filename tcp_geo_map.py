@@ -2046,17 +2046,19 @@ class TCPConnectionViewer(QMainWindow):
     def _on_conn_check_success(self):
         if not hasattr(self, 'agent_conn_status_label'):
             return
+        logging.info("_on_conn_check_success: Setting label to ✔ Reachable")
         self.agent_conn_status_label.setText("✔ Reachable")
         self.agent_conn_status_label.setStyleSheet("color: green; font-weight: bold;")
-        self.agent_conn_status_label.repaint()
+        QApplication.processEvents()
 
     @Slot(str)
     def _on_conn_check_failure(self, error_msg: str):
         if not hasattr(self, 'agent_conn_status_label'):
             return
+        logging.info(f"_on_conn_check_failure: Setting label to ✖ Unreachable, error: {error_msg}")
         self.agent_conn_status_label.setText("✖ Unreachable")
         self.agent_conn_status_label.setStyleSheet("color: red; font-weight: bold;")
-        self.agent_conn_status_label.repaint()
+        QApplication.processEvents()
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Connection check failed")
