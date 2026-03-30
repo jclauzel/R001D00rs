@@ -90,33 +90,6 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             snapshot = [dict(conn) for conn in self._connections.values()]
         return snapshot
 
-        # In _process_packet (inside the sniffer loop), update as follows:
-        with self._lock:
-            existing = self._connections.get(key)
-            now = time.monotonic()
-            if existing:
-                # Update byte counters as before
-                if is_outbound:
-                    existing['bytes_sent'] = existing.get('bytes_sent', 0) + pkt_bytes
-                else:
-                    existing['bytes_recv'] = existing.get('bytes_recv', 0) + pkt_bytes
-                existing['last_seen'] = now
-            else:
-                conn = {
-                    'process': proc_name,
-                    'pid': pid_str,
-                    'protocol': protocol,
-                    'local': src,
-                    'localport': sport,
-                    'remote': dst,
-                    'remoteport': dport,
-                    'ip_type': ip_type,
-                    'hostname': self._hostname,
-                    'bytes_sent': pkt_bytes if is_outbound else 0,
-                    'bytes_recv': pkt_bytes if not is_outbound else 0,
-                    'last_seen': now,
-                }
-                self._connections[key] = conn
         # ---- PID / process correlation ------------------------------------------
 
     def _refresh_pid_cache(self):
@@ -280,10 +253,10 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             is_outbound = bool(_src_proc)
 
             with self._lock:
-                now = time.monotonic()
                 existing = self._connections.get(key)
+                now = time.monotonic()
                 if existing:
-                    # Accumulate byte counters on the existing entry
+                    # Update byte counters as before
                     if is_outbound:
                         existing['bytes_sent'] = existing.get('bytes_sent', 0) + pkt_bytes
                     else:
