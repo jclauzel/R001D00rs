@@ -35,7 +35,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 
 # --- Constants that must be defined early ---
 DB_DIR = "databases"
-VERSION = "3.5.3" # Current script version
+VERSION = "3.5.4" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -2019,9 +2019,16 @@ class TCPConnectionViewer(QMainWindow):
 
         viewer = self
 
+        class _ConnCheckSignals(QObject):
+            success = Signal()
+            failure = Signal(str)
+
         class _ConnCheckWorker(QRunnable):
+            def __init__(self):
+                super().__init__()
+                self.signals = _ConnCheckSignals()
+
             def run(self):
-                url = f"http://{host}:{port}/submit_connections"
                 try:
                     resp = requests.get(
                         f"http://{host}:{port}/",
@@ -2029,18 +2036,22 @@ class TCPConnectionViewer(QMainWindow):
                         allow_redirects=False
                     )
                     # Any HTTP response means the server is reachable
-                    QTimer.singleShot(0, lambda: viewer._on_conn_check_success())
+                    self.signals.success.emit()
                 except requests.exceptions.ConnectionError:
-                    msg = f"Connection refused — is the server running on {host}:{port}?"
-                    QTimer.singleShot(0, lambda m=msg: viewer._on_conn_check_failure(m))
+                    self.signals.failure.emit(
+                        f"Connection refused — is the server running on {host}:{port}?"
+                    )
                 except requests.exceptions.Timeout:
-                    msg = f"Connection timed out reaching {host}:{port}."
-                    QTimer.singleShot(0, lambda m=msg: viewer._on_conn_check_failure(m))
+                    self.signals.failure.emit(
+                        f"Connection timed out reaching {host}:{port}."
+                    )
                 except Exception as exc:
-                    msg = str(exc)
-                    QTimer.singleShot(0, lambda m=msg: viewer._on_conn_check_failure(m))
+                    self.signals.failure.emit(str(exc))
 
-        self.thread_pool.start(_ConnCheckWorker())
+        worker = _ConnCheckWorker()
+        worker.signals.success.connect(viewer._on_conn_check_success)
+        worker.signals.failure.connect(viewer._on_conn_check_failure)
+        self.thread_pool.start(worker)
 
     @Slot()
     def _on_conn_check_success(self):
@@ -5928,16 +5939,17 @@ class TCPConnectionViewer(QMainWindow):
                                     // Global helper called by the fit-all button
                                     window._fitAllMarkers = function() {
                                         var bounds = [];
-                                        for (var i = 0; i < liveMarkers.length; i++) {
+                                        // Iterate over the differential marker map (primary source)
+                                        Object.keys(_markerMap).forEach(function(key) {
                                             try {
-                                                var m = liveMarkers[i];
+                                                var m = _markerMap[key].marker;
                                                 if (typeof m.getLatLng === 'function') {
                                                     bounds.push(m.getLatLng());
                                                 } else if (typeof m.getBounds === 'function') {
                                                     bounds.push(m.getBounds().getCenter());
                                                 }
                                             } catch(ex) {}
-                                        }
+                                        });
                                         if (bounds.length > 0) {
                                             map.fitBounds(L.latLngBounds(bounds).pad(0.15));
                                         } else {
@@ -6001,6 +6013,12 @@ class TCPConnectionViewer(QMainWindow):
                                     console.log('Tile layer added successfully');
 
                                     var liveMarkers = [];
+                                    // Differential update state: keyed marker map for in-place updates
+                                    // Key: stable connection identifier string
+                                    // Value: { marker, gaugeMarker, conn (last data), iconName }
+                                    var _markerMap = {};
+                                    // Separate array for polylines (cheap to rebuild each cycle)
+                                    var _liveLines = [];
 
                                     // Helper: format byte count to human-readable string
                                     function _formatBytes(bytes) {
@@ -6012,19 +6030,67 @@ class TCPConnectionViewer(QMainWindow):
                                         return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
                                     }
 
-                                    function updateConnections(conns, showTooltip, drawLines, showGauge) {
-                                        // Guard: suppress popupclose handlers during programmatic marker removal
-                                        // Unbind popupclose on all markers BEFORE removing them to avoid
-                                        // async events falsely setting _pinnedPopupDismissed.
-                                        window._removingMarkers = true;
-                                        for (var i=0; i<liveMarkers.length; i++) {
-                                            try { liveMarkers[i].off('popupclose'); } catch(e) {}
-                                            try { map.removeLayer(liveMarkers[i]); } catch(e) {}
+                                    // Build a stable unique key for a connection object.
+                                    // For special markers (redCircle, agentCircle) use their type + coords.
+                                    // For regular markers use process+pid+protocol+local+localport+remote_raw+remoteport.
+                                    function _connKey(conn) {
+                                        var icon = conn.icon || 'greenIcon';
+                                        if (icon === 'redCircle') {
+                                            return '_publicip_' + conn.lat + '_' + conn.lng;
                                         }
-                                        window._removingMarkers = false;
-                                        liveMarkers = [];
+                                        if (icon === 'agentCircle') {
+                                            return '_agent_' + (conn.origin_hostname || conn.name || '') + '_' + conn.lat + '_' + conn.lng;
+                                        }
+                                        // Strip DNS enrichment from remote for stable keying
+                                        var rawRemote = (conn.remote || '').split(' (')[0];
+                                        return (conn.process || '') + '|' + (conn.pid || '') + '|' +
+                                               (conn.protocol || 'TCP') + '|' + (conn.local || '') + '|' +
+                                               (conn.localport || '') + '|' + rawRemote + '|' +
+                                               (conn.remoteport || '') + '|' + (conn.origin_hostname || '');
+                                    }
 
-                                        if (!conns || !Array.isArray(conns)) { return; }
+                                    // Build popup HTML for a regular marker
+                                    function _buildPopupHtml(conn) {
+                                        var html = "<b>" + (conn.process || '') + "</b><br>" +
+                                                   "Protocol: " + (conn.protocol || 'TCP') + "<br>" +
+                                                   "PID: " + (conn.pid || '') + "<br>" +
+                                                   "Remote: " + (conn.remote || '') + "<br>" +
+                                                   "Local: " + (conn.local || '') + "<br>" +
+                                                   (conn.name ? "Name: " + conn.name + "<br>" : "") +
+                                                   (conn.origin_hostname ? "Source: " + conn.origin_hostname + "<br>" : "");
+                                        var bSent = conn.bytes_sent || 0;
+                                        var bRecv = conn.bytes_recv || 0;
+                                        if (bSent > 0 || bRecv > 0) {
+                                            html += "<hr style='margin:4px 0'>" +
+                                                    "<span style='color:#d32f2f'>&#9650; Sent:</span> " + _formatBytes(bSent) + "<br>" +
+                                                    "<span style='color:#388e3c'>&#9660; Recv:</span> " + _formatBytes(bRecv) + "<br>";
+                                        }
+                                        return html;
+                                    }
+
+                                    function updateConnections(conns, showTooltip, drawLines, showGauge) {
+                                        if (!conns || !Array.isArray(conns)) {
+                                            // No data — remove everything
+                                            window._removingMarkers = true;
+                                            Object.keys(_markerMap).forEach(function(k) {
+                                                var entry = _markerMap[k];
+                                                try { entry.marker.off('popupclose'); } catch(e) {}
+                                                try { map.removeLayer(entry.marker); } catch(e) {}
+                                                if (entry.gaugeMarker) { try { map.removeLayer(entry.gaugeMarker); } catch(e) {} }
+                                            });
+                                            _markerMap = {};
+                                            window._removingMarkers = false;
+                                            // Also clear legacy liveMarkers for any leftover refs
+                                            for (var i=0; i<liveMarkers.length; i++) {
+                                                try { map.removeLayer(liveMarkers[i]); } catch(e) {}
+                                            }
+                                            liveMarkers = [];
+                                            for (var j=0; j<_liveLines.length; j++) {
+                                                try { map.removeLayer(_liveLines[j]); } catch(e) {}
+                                            }
+                                            _liveLines = [];
+                                            return;
+                                        }
 
                                         // Pre-compute maximum sent and received bytes across all connections for gauge scaling
                                         var maxSent = 1;
@@ -6038,144 +6104,180 @@ class TCPConnectionViewer(QMainWindow):
                                             });
                                         }
 
-                                        var publicIpCoords = null;
-                                        // Per-agent origin coordinates: { hostname: [lat, lng] }
-                                        var agentOriginCoords = {};
-                                        // Per-agent color: { hostname: colorName }
-                                        var agentOriginColors = {};
-                                        // Markers originating from server (no origin_hostname)
-                                        var serverMarkerCoords = [];
-                                        // Markers originating from agents: { hostname: [[lat,lng], ...] }
-                                        var agentMarkerCoords = {};
-
+                                        // --- Phase 1: Build incoming key set and index ---
+                                        var incomingKeys = {};
                                         conns.forEach(function(conn) {
                                             if (conn.lat && conn.lng) {
-                                                var iconName = conn.icon || 'greenIcon';
+                                                var key = _connKey(conn);
+                                                incomingKeys[key] = conn;
+                                            }
+                                        });
 
-                                                if (iconName === 'redCircle') {
-                                                    // Create a red circle for server public IP - ON TOP OF ALL MARKERS
-                                                    var circle = L.circle([conn.lat, conn.lng], {
-                                                        color: 'red',
-                                                        fillColor: '#f03',
-                                                        fillOpacity: 0.5,
-                                                        radius: 100000,
-                                                        pane: 'publicIpPane'  // Use custom pane with higher z-index
-                                                    }).addTo(map);
+                                        // --- Phase 2: Remove markers no longer present ---
+                                        window._removingMarkers = true;
+                                        Object.keys(_markerMap).forEach(function(key) {
+                                            if (!incomingKeys[key]) {
+                                                var entry = _markerMap[key];
+                                                try { entry.marker.off('popupclose'); } catch(e) {}
+                                                try { map.removeLayer(entry.marker); } catch(e) {}
+                                                if (entry.gaugeMarker) { try { map.removeLayer(entry.gaugeMarker); } catch(e) {} }
+                                                delete _markerMap[key];
+                                            }
+                                        });
+                                        window._removingMarkers = false;
 
-                                                    var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
-                                                    circle.bindTooltip(conn.remote || 'Public IP', tooltipOptions);
+                                        // --- Phase 3: Remove old polylines (cheap, rebuild below) ---
+                                        for (var li = 0; li < _liveLines.length; li++) {
+                                            try { map.removeLayer(_liveLines[li]); } catch(e) {}
+                                        }
+                                        _liveLines = [];
 
-                                                    var popupHtml = "<b>Server Public IP</b><br>" +
-                                                                    "IP: " + (conn.remote || '') + "<br>";
-                                                    circle.bindPopup(popupHtml);
-                                                    liveMarkers.push(circle);
+                                        // Also clear any legacy liveMarkers that were polylines from before the diff upgrade
+                                        for (var lmi = 0; lmi < liveMarkers.length; lmi++) {
+                                            try { map.removeLayer(liveMarkers[lmi]); } catch(e) {}
+                                        }
+                                        liveMarkers = [];
 
-                                                    // Save server public IP coordinates for line drawing
-                                                    publicIpCoords = [conn.lat, conn.lng];
+                                        var publicIpCoords = null;
+                                        var agentOriginCoords = {};
+                                        var agentOriginColors = {};
+                                        var serverMarkerCoords = [];
+                                        var agentMarkerCoords = {};
 
-                                                } else if (iconName === 'agentCircle') {
-                                                                     // Create a colored circle for agent exit point using the agent's assigned color
-                                                                     var agentColor = conn.agent_color || 'orange';
-                                                                     // Map palette names to CSS fill colors
-                                                                     var agentFillColors = {
-                                                                         orange: '#ff8c00', violet: '#9c2bcb',
-                                                                         grey:   '#7b7b7b', black:  '#3d3d3d',
-                                                                         gold:   '#ffd326'
-                                                                     };
-                                                                     var fillColor = agentFillColors[agentColor] || agentColor;
+                                        // --- Phase 4: Add new markers / update existing ones ---
+                                        Object.keys(incomingKeys).forEach(function(key) {
+                                            var conn = incomingKeys[key];
+                                            var iconName = conn.icon || 'greenIcon';
+                                            var existing = _markerMap[key];
 
-                                                                     // Create a dedicated pane for this agent if it doesn't exist yet,
-                                                                     // using the z-index provided by Python for z-layer ordering.
-                                                                     var agentHostname = conn.origin_hostname || conn.name || '';
-                                                                     var agentPaneName = agentHostname
-                                                                         ? 'agentPane_' + agentHostname.replace(/[^a-zA-Z0-9]/g, '_')
-                                                                         : 'publicIpPane';
-                                                                     var agentPaneZ = (typeof conn.pane_z === 'number') ? conn.pane_z : 620;
-                                                                     if (agentHostname && !map.getPane(agentPaneName)) {
-                                                                         map.createPane(agentPaneName);
-                                                                         map.getPane(agentPaneName).style.zIndex = agentPaneZ;
-                                                                     }
-
-                                                                     var agentCircle = L.circle([conn.lat, conn.lng], {
-                                                                         color: agentColor,
-                                                                         fillColor: fillColor,
-                                                                         fillOpacity: 0.5,
-                                                                         radius: 80000,
-                                                                         pane: agentHostname ? agentPaneName : 'publicIpPane'
-                                                                     }).addTo(map);
-
-                                                                     var tooltipOptions = { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' };
-                                                                     agentCircle.bindTooltip(conn.remote || 'Agent', tooltipOptions);
-
-                                                                     var popupHtml = "<b>Agent Exit Point</b><br>" +
-                                                                                     (conn.remote || '') + "<br>" +
-                                                                                     "Hostname: " + (conn.name || '') + "<br>" +
-                                                                                     "<i style='font-size:11px;color:#555'>Click to bring to foreground</i>";
-                                                                     agentCircle.bindPopup(popupHtml);
-
-                                                                     // Click on agent circle → promote that agent to foreground
-                                                                     (function(hostName) {
-                                                                         agentCircle.on('click', function(e) {
-                                                                             try {
-                                                                                 if (mapBridge && typeof mapBridge.setForegroundHost === 'function') {
-                                                                                     console.log('[AgentCircle Click] Bringing to foreground:', hostName);
-                                                                                     mapBridge.setForegroundHost(hostName);
-                                                                                 }
-                                                                             } catch(ex) {
-                                                                                 console.error('[AgentCircle Click] Error:', ex);
-                                                                             }
-                                                                         });
-                                                                     })(agentHostname);
-
-                                                                     liveMarkers.push(agentCircle);
-
-                                                                     // Track agent origin coordinates and color for line drawing
-                                                                     if (agentHostname) {
-                                                                         agentOriginCoords[agentHostname] = [conn.lat, conn.lng];
-                                                                         agentOriginColors[agentHostname] = agentColor;
-                                                                     }
-
+                                            if (iconName === 'redCircle') {
+                                                publicIpCoords = [conn.lat, conn.lng];
+                                                if (existing) {
+                                                    // Already on map — update tooltip if remote changed
+                                                    try {
+                                                        existing.marker.unbindTooltip();
+                                                        existing.marker.bindTooltip(conn.remote || 'Public IP', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
+                                                    } catch(e) {}
+                                                    existing.conn = conn;
                                                 } else {
-                                                    // Regular marker
-                                                    var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
-                                                    var markerOptions = { icon: icon };
-                                                    // Pinned (yellow) markers render on a higher pane so they stay on top
-                                                    if (iconName === 'yellowIcon') {
-                                                        markerOptions.pane = 'pinnedPane';
-                                                    }
-                                                    var marker = L.marker([conn.lat, conn.lng], markerOptions).addTo(map);
-                                                    // Show permanent tooltip if global setting is on OR if this is a new connection (blue marker)
-                                                    var isNewConn = (iconName === 'blueIcon');
-                                                    var tooltipOptions = { permanent: (!!showTooltip || isNewConn), opacity: 0.9, direction: 'auto' };
+                                                    var circle = L.circle([conn.lat, conn.lng], {
+                                                        color: 'red', fillColor: '#f03', fillOpacity: 0.5,
+                                                        radius: 100000, pane: 'publicIpPane'
+                                                    }).addTo(map);
+                                                    circle.bindTooltip(conn.remote || 'Public IP', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
+                                                    circle.bindPopup("<b>Server Public IP</b><br>IP: " + (conn.remote || '') + "<br>");
+                                                    _markerMap[key] = { marker: circle, gaugeMarker: null, conn: conn, iconName: iconName };
+                                                }
 
-                                                    // Include protocol and hostname in tooltip for agent connections
-                                                    var tooltipText = (conn.process || '') + ' [' + (conn.protocol || 'TCP') + ']';
-                                                    if (conn.origin_hostname) {
-                                                        tooltipText += ' @' + conn.origin_hostname;
-                                                    }
-                                                    marker.bindTooltip(tooltipText, tooltipOptions);
+                                            } else if (iconName === 'agentCircle') {
+                                                var agentColor = conn.agent_color || 'orange';
+                                                var agentFillColors = {
+                                                    orange: '#ff8c00', violet: '#9c2bcb',
+                                                    grey: '#7b7b7b', black: '#3d3d3d', gold: '#ffd326'
+                                                };
+                                                var fillColor = agentFillColors[agentColor] || agentColor;
+                                                var agentHostname = conn.origin_hostname || conn.name || '';
+                                                var agentPaneName = agentHostname
+                                                    ? 'agentPane_' + agentHostname.replace(/[^a-zA-Z0-9]/g, '_')
+                                                    : 'publicIpPane';
+                                                var agentPaneZ = (typeof conn.pane_z === 'number') ? conn.pane_z : 620;
+                                                if (agentHostname && !map.getPane(agentPaneName)) {
+                                                    map.createPane(agentPaneName);
+                                                    map.getPane(agentPaneName).style.zIndex = agentPaneZ;
+                                                }
 
-                                                    // Build popup HTML — include byte stats when available
-                                                    var popupHtml = "<b>" + (conn.process || '') + "</b><br>" +
-                                                                    "Protocol: " + (conn.protocol || 'TCP') + "<br>" +
-                                                                    "PID: " + (conn.pid || '') + "<br>" +
-                                                                    "Remote: " + (conn.remote || '') + "<br>" +
-                                                                    "Local: " + (conn.local || '') + "<br>" +
-                                                                    (conn.name ? "Name: " + conn.name + "<br>" : "") +
-                                                                    (conn.origin_hostname ? "Source: " + conn.origin_hostname + "<br>" : "");
+                                                if (existing) {
+                                                    // Update color if changed
+                                                    try {
+                                                        existing.marker.setStyle({ color: agentColor, fillColor: fillColor });
+                                                        existing.marker.unbindTooltip();
+                                                        existing.marker.bindTooltip(conn.remote || 'Agent', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
+                                                    } catch(e) {}
+                                                    // Update pane z-index if changed
+                                                    try {
+                                                        var pane = map.getPane(agentPaneName);
+                                                        if (pane) pane.style.zIndex = agentPaneZ;
+                                                    } catch(e) {}
+                                                    existing.conn = conn;
+                                                } else {
+                                                    var agentCircle = L.circle([conn.lat, conn.lng], {
+                                                        color: agentColor, fillColor: fillColor, fillOpacity: 0.5,
+                                                        radius: 80000, pane: agentHostname ? agentPaneName : 'publicIpPane'
+                                                    }).addTo(map);
+                                                    agentCircle.bindTooltip(conn.remote || 'Agent', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
+                                                    var agPopupHtml = "<b>Agent Exit Point</b><br>" +
+                                                                      (conn.remote || '') + "<br>" +
+                                                                      "Hostname: " + (conn.name || '') + "<br>" +
+                                                                      "<i style='font-size:11px;color:#555'>Click to bring to foreground</i>";
+                                                    agentCircle.bindPopup(agPopupHtml);
+                                                    (function(hostName) {
+                                                        agentCircle.on('click', function(e) {
+                                                            try {
+                                                                if (mapBridge && typeof mapBridge.setForegroundHost === 'function') {
+                                                                    mapBridge.setForegroundHost(hostName);
+                                                                }
+                                                            } catch(ex) {}
+                                                        });
+                                                    })(agentHostname);
+                                                    _markerMap[key] = { marker: agentCircle, gaugeMarker: null, conn: conn, iconName: iconName };
+                                                }
+
+                                                if (agentHostname) {
+                                                    agentOriginCoords[agentHostname] = [conn.lat, conn.lng];
+                                                    agentOriginColors[agentHostname] = agentColor;
+                                                }
+
+                                            } else {
+                                                // --- Regular marker ---
+                                                var isNewConn = (iconName === 'blueIcon');
+                                                var tooltipText = (conn.process || '') + ' [' + (conn.protocol || 'TCP') + ']';
+                                                if (conn.origin_hostname) { tooltipText += ' @' + conn.origin_hostname; }
+
+                                                if (existing) {
+                                                    // --- UPDATE existing marker in-place ---
+                                                    var m = existing.marker;
+
+                                                    // Update icon if changed (e.g. green→blue→yellow→grey)
+                                                    if (existing.iconName !== iconName) {
+                                                        var newIcon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
+                                                        try { m.setIcon(newIcon); } catch(e) {}
+                                                        // Move to/from pinned pane if needed
+                                                        if (iconName === 'yellowIcon' && m.options.pane !== 'pinnedPane') {
+                                                            // Leaflet doesn't support changing pane in-place; must re-add
+                                                            try { map.removeLayer(m); } catch(e) {}
+                                                            m.options.pane = 'pinnedPane';
+                                                            m.addTo(map);
+                                                        } else if (existing.iconName === 'yellowIcon' && iconName !== 'yellowIcon') {
+                                                            try { map.removeLayer(m); } catch(e) {}
+                                                            delete m.options.pane;
+                                                            m.addTo(map);
+                                                        }
+                                                        existing.iconName = iconName;
+                                                    }
+
+                                                    // Update tooltip (permanent state may change with showTooltip or new-conn)
+                                                    try {
+                                                        m.unbindTooltip();
+                                                        m.bindTooltip(tooltipText, { permanent: (!!showTooltip || isNewConn), opacity: 0.9, direction: 'auto' });
+                                                    } catch(e) {}
+
+                                                    // Update popup content (bytes change each cycle)
+                                                    try {
+                                                        m.setPopupContent(_buildPopupHtml(conn));
+                                                    } catch(e) {
+                                                        // If no popup bound yet, bind one
+                                                        try { m.bindPopup(_buildPopupHtml(conn), {autoClose: false, closeOnClick: false}); } catch(e2) {}
+                                                    }
+
+                                                    // Update gauge marker
+                                                    if (existing.gaugeMarker) {
+                                                        try { map.removeLayer(existing.gaugeMarker); } catch(e) {}
+                                                        existing.gaugeMarker = null;
+                                                    }
                                                     var bSent = conn.bytes_sent || 0;
                                                     var bRecv = conn.bytes_recv || 0;
-                                                    if (bSent > 0 || bRecv > 0) {
-                                                        popupHtml += "<hr style='margin:4px 0'>" +
-                                                                     "<span style='color:#d32f2f'>&#9650; Sent:</span> " + _formatBytes(bSent) + "<br>" +
-                                                                     "<span style='color:#388e3c'>&#9660; Recv:</span> " + _formatBytes(bRecv) + "<br>";
-                                                    }
-                                                    marker.bindPopup(popupHtml, {autoClose: false, closeOnClick: false});
-
-                                                    // --- Traffic gauge (DivIcon marker beside the main marker) ---
                                                     if (showGauge && (bSent > 0 || bRecv > 0)) {
-                                                        var gaugeHeight = 40; // px — fixed total height
-                                                        // Each portion's height is proportional to the global max
+                                                        var gaugeHeight = 40;
                                                         var sentH = Math.round((bSent / maxSent) * (gaugeHeight / 2));
                                                         var recvH = Math.round((bRecv / maxRecv) * (gaugeHeight / 2));
                                                         var emptyH = gaugeHeight - sentH - recvH;
@@ -6185,61 +6287,90 @@ class TCPConnectionViewer(QMainWindow):
                                                                         '<div class="tg-sent" style="height:' + sentH + 'px;"></div>' +
                                                                         '</div>';
                                                         var gaugeIcon = L.divIcon({
-                                                            className: 'traffic-gauge-icon',
-                                                            html: gaugeHtml,
-                                                            iconSize: [12, gaugeHeight + 2],
-                                                            iconAnchor: [-8, gaugeHeight]
+                                                            className: 'traffic-gauge-icon', html: gaugeHtml,
+                                                            iconSize: [12, gaugeHeight + 2], iconAnchor: [-8, gaugeHeight]
                                                         });
-                                                        var gaugeMarker = L.marker([conn.lat, conn.lng], {
-                                                            icon: gaugeIcon,
-                                                            interactive: false,
-                                                            pane: 'gaugePane'
+                                                        existing.gaugeMarker = L.marker([conn.lat, conn.lng], {
+                                                            icon: gaugeIcon, interactive: false, pane: 'gaugePane'
                                                         }).addTo(map);
-                                                        liveMarkers.push(gaugeMarker);
                                                     }
 
-                                                    // Add click handler to select corresponding table row in Python.
-                                                     // We unbind the popup before calling pinConnection so that
-                                                     // Leaflet's internal click-to-open-popup path doesn't fire
-                                                     // a popup that will immediately be destroyed by the refresh.
-                                                     (function(connection, m) {
-                                                         m.on('click', function(e) {
-                                                             try {
-                                                                 // Prevent Leaflet from opening / re-opening the popup
-                                                                 // on this click — the refresh will handle it.
-                                                                 m.closePopup();
-                                                                 m.off('popupclose');
-                                                                 if (mapBridge && typeof mapBridge.pinConnection === 'function') {
-                                                                     console.log('[Marker Click] Calling Python pinConnection:', connection.process, connection.pid, connection.remote, connection.local);
-                                                                     mapBridge.pinConnection(
-                                                                         connection.process || '',
-                                                                         connection.pid || '',
-                                                                         connection.protocol || 'TCP',
-                                                                         connection.local || '',
-                                                                         connection.localport || '',
-                                                                         connection.remote || '',
-                                                                         connection.remoteport || '',
-                                                                         connection.ip_type || ''
-                                                                     );
-                                                                 } else {
-                                                                     console.warn('[Marker Click] mapBridge not ready yet');
-                                                                 }
-                                                                 // Bring the marker's agent to the foreground layer
-                                                                 var markerHost = connection.origin_hostname || connection.hostname || '';
-                                                                 if (markerHost && mapBridge && typeof mapBridge.setForegroundHost === 'function') {
-                                                                     mapBridge.setForegroundHost(markerHost);
-                                                                 }
-                                                             } catch(e) {
-                                                                 console.error('[Marker Click] Error calling pinConnection:', e);
-                                                             }
-                                                         });
-                                                     })(conn, marker);
+                                                    // Handle autoPopup for pinned connection
+                                                    if (conn.autoPopup) {
+                                                        try { m.openPopup(); } catch(e) {}
+                                                        (function(gen, mk) {
+                                                            mk.off('popupclose');
+                                                            mk.on('popupclose', function() {
+                                                                if (!window._removingMarkers) {
+                                                                    try {
+                                                                        if (mapBridge && typeof mapBridge.notifyPopupClosed === 'function') {
+                                                                            mapBridge.notifyPopupClosed(gen);
+                                                                        }
+                                                                    } catch(e) {}
+                                                                }
+                                                            });
+                                                        })(conn.popupGeneration || 0, m);
+                                                    }
 
-                                                    // Auto-open popup when triggered by pinned connection
+                                                    existing.conn = conn;
+
+                                                } else {
+                                                    // --- CREATE new marker ---
+                                                    var icon = iconDefinitions[iconName] || iconDefinitions['greenIcon'];
+                                                    var markerOptions = { icon: icon };
+                                                    if (iconName === 'yellowIcon') { markerOptions.pane = 'pinnedPane'; }
+                                                    var marker = L.marker([conn.lat, conn.lng], markerOptions).addTo(map);
+                                                    marker.bindTooltip(tooltipText, { permanent: (!!showTooltip || isNewConn), opacity: 0.9, direction: 'auto' });
+                                                    marker.bindPopup(_buildPopupHtml(conn), {autoClose: false, closeOnClick: false});
+
+                                                    // Traffic gauge
+                                                    var gm = null;
+                                                    var bSent2 = conn.bytes_sent || 0;
+                                                    var bRecv2 = conn.bytes_recv || 0;
+                                                    if (showGauge && (bSent2 > 0 || bRecv2 > 0)) {
+                                                        var gh = 40;
+                                                        var sH = Math.round((bSent2 / maxSent) * (gh / 2));
+                                                        var rH = Math.round((bRecv2 / maxRecv) * (gh / 2));
+                                                        var eH = gh - sH - rH;
+                                                        var gHtml = '<div class="traffic-gauge" style="height:' + gh + 'px" title="Sent: ' + _formatBytes(bSent2) + ' / Recv: ' + _formatBytes(bRecv2) + '">' +
+                                                                    '<div class="tg-empty" style="height:' + eH + 'px;"></div>' +
+                                                                    '<div class="tg-recv" style="height:' + rH + 'px;"></div>' +
+                                                                    '<div class="tg-sent" style="height:' + sH + 'px;"></div>' +
+                                                                    '</div>';
+                                                        var gIcon = L.divIcon({
+                                                            className: 'traffic-gauge-icon', html: gHtml,
+                                                            iconSize: [12, gh + 2], iconAnchor: [-8, gh]
+                                                        });
+                                                        gm = L.marker([conn.lat, conn.lng], {
+                                                            icon: gIcon, interactive: false, pane: 'gaugePane'
+                                                        }).addTo(map);
+                                                    }
+
+                                                    // Click handler
+                                                    (function(connection, m) {
+                                                        m.on('click', function(e) {
+                                                            try {
+                                                                m.closePopup();
+                                                                m.off('popupclose');
+                                                                if (mapBridge && typeof mapBridge.pinConnection === 'function') {
+                                                                    mapBridge.pinConnection(
+                                                                        connection.process || '', connection.pid || '',
+                                                                        connection.protocol || 'TCP', connection.local || '',
+                                                                        connection.localport || '', connection.remote || '',
+                                                                        connection.remoteport || '', connection.ip_type || ''
+                                                                    );
+                                                                }
+                                                                var markerHost = connection.origin_hostname || connection.hostname || '';
+                                                                if (markerHost && mapBridge && typeof mapBridge.setForegroundHost === 'function') {
+                                                                    mapBridge.setForegroundHost(markerHost);
+                                                                }
+                                                            } catch(e) {}
+                                                        });
+                                                    })(conn, marker);
+
+                                                    // Auto-open popup for pinned connection
                                                     if (conn.autoPopup) {
                                                         marker.openPopup();
-                                                        // Notify Python when the user manually closes the popup.
-                                                        // Pass the generation counter so Python can ignore stale events.
                                                         (function(gen) {
                                                             marker.on('popupclose', function() {
                                                                 if (!window._removingMarkers) {
@@ -6253,68 +6384,49 @@ class TCPConnectionViewer(QMainWindow):
                                                         })(conn.popupGeneration || 0);
                                                     }
 
-                                                    liveMarkers.push(marker);
+                                                    _markerMap[key] = { marker: marker, gaugeMarker: gm, conn: conn, iconName: iconName };
+                                                }
 
-                                                    // Classify marker for line drawing based on origin
-                                                    var connOrigin = conn.origin_hostname || '';
-                                                    if (connOrigin) {
-                                                        // Agent connection — group under its agent origin
-                                                        if (!agentMarkerCoords[connOrigin]) {
-                                                            agentMarkerCoords[connOrigin] = [];
-                                                        }
-                                                        agentMarkerCoords[connOrigin].push([conn.lat, conn.lng]);
-                                                    } else {
-                                                        // Server (local) connection
-                                                        serverMarkerCoords.push([conn.lat, conn.lng]);
-                                                    }
+                                                // Classify for line drawing
+                                                var connOrigin = conn.origin_hostname || '';
+                                                if (connOrigin) {
+                                                    if (!agentMarkerCoords[connOrigin]) { agentMarkerCoords[connOrigin] = []; }
+                                                    agentMarkerCoords[connOrigin].push([conn.lat, conn.lng]);
+                                                } else {
+                                                    serverMarkerCoords.push([conn.lat, conn.lng]);
                                                 }
                                             }
                                         });
 
-                                        // Draw lines if enabled
+                                        // --- Phase 5: Draw lines (always rebuilt — cheap, no visual blink) ---
                                         if (drawLines) {
-                                            // Draw blue dashed lines from server public IP to server connections
                                             if (publicIpCoords && serverMarkerCoords.length > 0) {
                                                 serverMarkerCoords.forEach(function(markerCoords) {
                                                     var polyline = L.polyline([publicIpCoords, markerCoords], {
-                                                        color: 'blue',
-                                                        weight: 2,
-                                                        opacity: 0.6,
-                                                        dashArray: '5, 10'
+                                                        color: 'blue', weight: 2, opacity: 0.6, dashArray: '5, 10'
                                                     }).addTo(map);
-                                                    liveMarkers.push(polyline);
+                                                    _liveLines.push(polyline);
                                                 });
                                             }
-
-                                            // Draw colored dashed lines from each agent's exit point to its connections
                                             Object.keys(agentOriginCoords).forEach(function(hostname) {
                                                 var originCoords = agentOriginCoords[hostname];
                                                 var lineColor = agentOriginColors[hostname] || 'orange';
                                                 var markers = agentMarkerCoords[hostname] || [];
                                                 markers.forEach(function(markerCoords) {
                                                     var polyline = L.polyline([originCoords, markerCoords], {
-                                                        color: lineColor,
-                                                        weight: 2,
-                                                        opacity: 0.6,
-                                                        dashArray: '5, 10'
+                                                        color: lineColor, weight: 2, opacity: 0.6, dashArray: '5, 10'
                                                     }).addTo(map);
-                                                    liveMarkers.push(polyline);
+                                                    _liveLines.push(polyline);
                                                 });
                                             });
-
-                                            // For agent connections whose origin has no geolocation,
-                                            // fall back to drawing from server public IP if available
                                             if (publicIpCoords) {
                                                 Object.keys(agentMarkerCoords).forEach(function(hostname) {
                                                     if (!agentOriginCoords[hostname]) {
                                                         agentMarkerCoords[hostname].forEach(function(markerCoords) {
                                                             var polyline = L.polyline([publicIpCoords, markerCoords], {
-                                                                color: 'gray',
-                                                                weight: 1,
-                                                                opacity: 0.4,
-                                                                dashArray: '3, 8'
+                                                                color: 'gray', weight: 1, opacity: 0.4, dashArray: '3, 8'
                                                             }).addTo(map);
-                                                            liveMarkers.push(polyline);
+                                                            _liveLines.push(polyline);
                                                         });
                                                     }
                                                 });
