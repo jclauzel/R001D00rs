@@ -301,6 +301,7 @@ logging.basicConfig(
 # Known limitations
 - Proxies since this is where the remote IP address is.
 - Tor usage will only show the first hop node.
+- When using the scapy collector and you have not installed npcap from https://npcap.com/ (recommended) administrative privileges are required. As a result, if you start python tcp_geo_map.py from Windows Task manager make sure tick the box "Run with the highest privileges" or the scapy collector will not be able to collect the flowing packets. Another workaround is to switch back to the default psutil collector but some features such as traffic flow will not show up.
 
 # Warranty, Disclaimer of Warranty, Limitation of Liability.
 THE SCRIPT SOFTWARE IS PROVIDED "AS IS." THE AUTHOR MAKES NO WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SCRIPT SOFTWARE WHICH MAY CONTAIN THIRD PARTY COMMERCIAL SOFTWARE. 
