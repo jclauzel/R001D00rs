@@ -35,7 +35,9 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 
 # --- Constants that must be defined early ---
 DB_DIR = "databases"
-VERSION = "3.5.4" # Current script version
+CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
+MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
+VERSION = "3.5.6" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -203,6 +205,15 @@ Options:
       so future launches without any flag also show the UI. Takes precedence
       over any saved "agent_no_ui" value in settings.json.
 
+  --force_complete_database_load
+      When the database persistence layer is enabled, temporarily overrides the
+      in-memory buffer size (max_connection_list_filo_buffer_size) with the
+      database limit (max_connection_list_database_size from settings.json) so
+      the entire stored history can be loaded and replayed via the time slider.
+      Agents discovered in the database are added to the Agent Management pane
+      even if they originate from another machine.  This flag has no effect when
+      the database layer is set to "Disabled".
+
   -h, -?, /?, --h, --help
       Show this help message and exit.
 """)
@@ -288,13 +299,19 @@ table_column_sort_reverse = False  # Default sort order
 summary_table_column_sort_index = -1  # Default column index to sort the summary table by the index
 summary_table_column_sort_reverse = False  # Default sort order for summary table
 do_reverse_dns = True  # Set to False to disable reverse DNS lookups
-do_resolve_public_ip = False  # Set to True to resolve public IP addresses to hostnames (may slow down refresh)
+do_resolve_public_ip = True  # Set to True to resolve public IP addresses to hostnames (may slow down refresh)
+do_pulse_exit_points = True  # Set to True to animate a pulsing ring on agent/server exit-point circles
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
-do_c2_check = False    # Set to True to enable C2-TRACKER checks
+do_c2_check = False
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
 do_pause_table_sorting = False  # Set to True to pause table sorting without stopping updates
 do_show_traffic_gauge = False   # Set to True to show sent/recv traffic gauges next to markers (requires Scapy/PCAP collector)
+do_show_traffic_histogram = True  # Set to True to show the network traffic histogram overlay on the map
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
+
+# Database persistence layer globals
+db_provider_name = "Disabled"       # "Disabled" | "SQLite" | "MongoDB" | "SQL Server" | "Oracle"
+max_connection_list_database_size = 100000  # max snapshots kept in database; oldest are purged beyond this
 
 # Server / Agent mode globals
 enable_server_mode = False  # When True the app runs a Flask endpoint to collect agent data
@@ -349,7 +366,10 @@ if _no_ui_off_requested:
 if enable_server_mode and enable_agent_mode:
     enable_server_mode = False
 
- 
+# --force_complete_database_load: override in-memory buffer with DB size
+force_complete_database_load = "--force_complete_database_load" in sys.argv
+
+
 
 # Global cache and lock for thread-safe IP lookups
 ip_cache = {}
@@ -888,10 +908,10 @@ def _discover_collector_plugins():
 class TCPConnectionViewer(QMainWindow):
     # Colors available for agent assignment (round-robin).
     # Excluded colors (reserved by the local-host UI):
-    #   green  = local connections, blue = new connections,
-    #   red    = suspect/C2,        yellow = pinned marker,
-    #   gold   = too similar to yellow (both ~#FFD326 / #CAC428).
-    _AGENT_COLOR_PALETTE = ['orange', 'violet', 'black']
+    #   blue   = new connections,   red    = suspect/C2,
+    #   yellow = pinned marker,     gold   = too similar to yellow.
+    # green is included but reserved as the default for the local server.
+    _AGENT_COLOR_PALETTE = ['green', 'orange', 'violet', 'black']
 
     def __init__(self):
         super().__init__()
@@ -911,6 +931,7 @@ class TCPConnectionViewer(QMainWindow):
         self.reader_c2_tracker = None
         self.reader_c2_tracker_set = None  # Fast O(1) lookup set
         self.connections = []
+        self._last_map_connections = []  # fully-processed connections for map re-renders
 
         # Pinned (double-clicked) connection — persists across refreshes, shown as yellow marker
         self._pinned_connection = None
@@ -934,14 +955,24 @@ class TCPConnectionViewer(QMainWindow):
         #   hostname, ip_addresses, lat, lng, connections (list of connection dicts)
         self._agent_cache = {}          # protected by _agent_cache_lock
         self._agent_cache_lock = threading.Lock()
+        self._agent_last_seen = {}      # hostname -> time.monotonic() of last POST
         self._last_agent_count = 0      # number of agents collected in last cycle
         self._flask_thread = None       # daemon thread running Flask
         self._werkzeug_server = None    # werkzeug BaseServer instance (stoppable)
         # Per-agent color assignment: hostname -> color name (e.g. 'violet')
         # Colors are drawn round-robin from the agent palette (excludes colors
-        # reserved for the UI: green=local, red=suspect, blue=new, yellow=pinned).
+        # reserved for the UI: red=suspect, blue=new, yellow=pinned).
+        # green is palette[0] but is reserved for LOCAL_HOSTNAME (the server),
+        # so the round-robin index starts at 1 to skip it for remote agents.
         self._agent_colors = {}         # hostname -> color name
-        self._agent_color_index = 0     # next index into _AGENT_COLOR_PALETTE
+        self._agent_colors[LOCAL_HOSTNAME] = 'green'   # server default
+        self._agent_hidden = {}         # hostname -> True if hidden on map
+        self._agent_color_index = 1     # start at 1 — index 0 (green) reserved for server
+        # Database persistence layer (None when disabled)
+        self._db_provider = None
+        self._db_queue = None       # queue.Queue — created when a provider is activated
+        self._db_thread = None      # daemon thread consuming _db_queue
+        self._db_stop = threading.Event()
         # Agent mode: HTTP session with short timeout for POSTing to server
         self._agent_http_session = requests.Session()
         self._agent_http_session.headers.update({'Content-Type': 'application/json'})
@@ -1424,7 +1455,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1433,9 +1464,11 @@ class TCPConnectionViewer(QMainWindow):
             'show_only_remote_connections': show_only_remote_connections,
             'do_reverse_dns': do_reverse_dns,
             'do_resolve_public_ip': do_resolve_public_ip,
+            'do_pulse_exit_points': do_pulse_exit_points,
             'do_capture_screenshots': do_capture_screenshots,
             'do_pause_table_sorting': do_pause_table_sorting,
             'do_show_traffic_gauge': do_show_traffic_gauge,
+            'do_show_traffic_histogram': do_show_traffic_histogram,
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
@@ -1449,8 +1482,11 @@ class TCPConnectionViewer(QMainWindow):
             'max_server_agents': MAX_SERVER_AGENTS,
             'agent_no_ui': agent_no_ui,
             'agent_colors': dict(self._agent_colors),
+            'agent_hidden': {h: v for h, v in self._agent_hidden.items() if v},
             'active_collector_plugin': self._active_collector.name,
             'pcap_file_path': getattr(self, '_pcap_file_path', ''),
+            'db_provider_name': db_provider_name,
+            'max_connection_list_database_size': max_connection_list_database_size,
         }
 
         # Save current map position and zoom
@@ -1524,7 +1560,8 @@ class TCPConnectionViewer(QMainWindow):
                 global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections
                 global show_only_remote_connections, do_reverse_dns, map_refresh_interval
                 global table_column_sort_index, table_column_sort_reverse
-                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge
+                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram
+                global db_provider_name, max_connection_list_database_size
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
@@ -1533,14 +1570,25 @@ class TCPConnectionViewer(QMainWindow):
                 show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
                 do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
                 do_resolve_public_ip = settings.get('do_resolve_public_ip', do_resolve_public_ip)
+                do_pulse_exit_points = settings.get('do_pulse_exit_points', do_pulse_exit_points)
                 do_capture_screenshots = settings.get('do_capture_screenshots', do_capture_screenshots)
                 do_pause_table_sorting = settings.get('do_pause_table_sorting', do_pause_table_sorting)
                 do_show_traffic_gauge = settings.get('do_show_traffic_gauge', do_show_traffic_gauge)
+                do_show_traffic_histogram = settings.get('do_show_traffic_histogram', do_show_traffic_histogram)
                 map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
                 table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                 table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
                 summary_table_column_sort_index = settings.get('summary_table_column_sort_index', summary_table_column_sort_index)
                 summary_table_column_sort_reverse = settings.get('summary_table_column_sort_reverse', summary_table_column_sort_reverse)
+
+                # Restore database persistence layer settings
+                db_provider_name = settings.get('db_provider_name', db_provider_name)
+                try:
+                    _saved_db_size = int(settings.get('max_connection_list_database_size', max_connection_list_database_size))
+                    if _saved_db_size > 0:
+                        max_connection_list_database_size = _saved_db_size
+                except (ValueError, TypeError):
+                    pass
 
                 # Restore server/agent mode settings (CLI args take precedence)
                 global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
@@ -1599,13 +1647,24 @@ class TCPConnectionViewer(QMainWindow):
                     for h, c in saved_colors.items():
                         if isinstance(h, str) and isinstance(c, str) and c in self._AGENT_COLOR_PALETTE:
                             self._agent_colors[h] = c
-                    # Advance color index past already-claimed colors so new agents
+                    # Ensure the local server always has a color (default: green)
+                    if LOCAL_HOSTNAME not in self._agent_colors:
+                        self._agent_colors[LOCAL_HOSTNAME] = 'green'
+                    # Advance color index past already-claimed colors so new remote agents
                     # don't collide with persisted assignments.
-                    used_colors = list(self._agent_colors.values())
-                    for _color in self._AGENT_COLOR_PALETTE:
-                        if _color not in used_colors:
+                    # Start at 1 to skip green (index 0), which is reserved for the server.
+                    self._agent_color_index = 1
+                    remote_used = [c for h, c in self._agent_colors.items() if h != LOCAL_HOSTNAME]
+                    for _color in self._AGENT_COLOR_PALETTE[1:]:
+                        if _color not in remote_used:
                             break
                         self._agent_color_index += 1
+
+                    # Restore per-agent hidden state
+                    saved_hidden = settings.get('agent_hidden', {})
+                    for h, v in saved_hidden.items():
+                        if isinstance(h, str) and v:
+                            self._agent_hidden[h] = True
 
                     # Restore active connection collector plugin
                     saved_collector = settings.get('active_collector_plugin', '')
@@ -1718,13 +1777,27 @@ class TCPConnectionViewer(QMainWindow):
                 self.reverse_dns_check.setChecked(do_reverse_dns)
                 self.c2_check.setChecked(do_c2_check)
                 self.resolve_public_ip.setChecked(do_resolve_public_ip)
+                self.pulse_exit_points_check.setChecked(do_pulse_exit_points)
                 self.capture_screenshots_check.setChecked(do_capture_screenshots)
                 self.pause_table_sorting_check.setChecked(do_pause_table_sorting)
                 self.show_traffic_gauge_check.setChecked(do_show_traffic_gauge)
+                self.show_traffic_histogram_check.setChecked(do_show_traffic_histogram)
 
                 # Update buffer size input field
                 if hasattr(self, 'buffer_size_input'):
                     self.buffer_size_input.setText(str(max_connection_list_filo_buffer_size))
+
+                # Sync database persistence UI
+                if hasattr(self, 'db_provider_combo'):
+                    self.db_provider_combo.blockSignals(True)
+                    self.db_provider_combo.setCurrentText(db_provider_name)
+                    self.db_provider_combo.blockSignals(False)
+                if hasattr(self, 'db_buffer_size_input'):
+                    self.db_buffer_size_input.setText(str(max_connection_list_database_size))
+
+                # Activate the database provider if one was persisted
+                if db_provider_name and db_provider_name != "Disabled":
+                    self._activate_db_provider(db_provider_name)
 
                 # Restore splitter states if saved
                 try:
@@ -1758,7 +1831,7 @@ class TCPConnectionViewer(QMainWindow):
 
                 # Populate Agent Management table if server mode is active and agents were saved
                 if enable_server_mode and self._agent_colors:
-                    self._refresh_agent_management_table()
+                    self._refresh_agent_management_table(force_rebuild=True)
 
                 # Restore active collector plugin in combo box
                 if hasattr(self, '_collector_combo'):
@@ -1797,46 +1870,41 @@ class TCPConnectionViewer(QMainWindow):
         if hasattr(self, 'tab_widget') and hasattr(self, '_agent_mgmt_tab_index'):
             self.tab_widget.setTabVisible(self._agent_mgmt_tab_index, enable_server_mode)
             if enable_server_mode:
-                self._refresh_agent_management_table()
+                self._refresh_agent_management_table(force_rebuild=True)
         logging.info(f"Server mode {'enabled' if enable_server_mode else 'disabled'}")
 
-    def _refresh_agent_management_table(self):
-        """Rebuild the Agent Management table from the current agent registry."""
+    def _refresh_agent_management_table(self, force_rebuild=False):
+        """Update the Agent Management table from the current agent registry.
+
+        On periodic refresh cycles only the volatile columns (Hide, Is Active) are
+        updated in-place so that open combo-box dropdowns are never destroyed.
+        A full rebuild only happens when the set of known hosts changes or when
+        force_rebuild=True (e.g. after a Clear action).
+        """
         if not hasattr(self, 'agent_mgmt_table'):
             return
         try:
-            # Collect all known hostnames: from color map and from live cache
+            # Collect all known hostnames: from color map, live cache, and local host
             known_hosts = set(self._agent_colors.keys())
             with self._agent_cache_lock:
                 known_hosts.update(self._agent_cache.keys())
+            # Always include the local server so it can be hidden/unhidden
+            known_hosts.add(LOCAL_HOSTNAME)
             known_hosts = sorted(known_hosts)
 
-            self.agent_mgmt_table.setRowCount(0)
+            # Active threshold: last POST within 2 full refresh cycles
+            active_threshold = (map_refresh_interval / 1000.0) * 2
+            now = time.monotonic()
 
-            for hostname in known_hosts:
-                row = self.agent_mgmt_table.rowCount()
-                self.agent_mgmt_table.insertRow(row)
+            # --- Decide whether a full rebuild is needed ---
+            current_rows = getattr(self, '_agent_mgmt_rows', None)
+            need_rebuild = force_rebuild or (current_rows != known_hosts)
 
-                # Column 0 — hostname
-                host_item = QTableWidgetItem(hostname)
-                host_item.setFlags(Qt.ItemIsEnabled)
-                self.agent_mgmt_table.setItem(row, 0, host_item)
+            if need_rebuild:
+                self._agent_mgmt_rows = known_hosts
+                self.agent_mgmt_table.setRowCount(0)
 
-                # Column 1 — color combo box with swatch + label per item
-                color_combo = QComboBox()
-                color_combo.setIconSize(QSize(16, 16))
-
-                for color in self._AGENT_COLOR_PALETTE:
-                    # Build a solid 16×16 swatch icon for each palette entry
-                    pix = QPixmap(16, 16)
-                    pix.fill(QColor(color))
-                    color_combo.addItem(QIcon(pix), color)
-
-                current_color = self._agent_colors.get(hostname)
-                if current_color and current_color in self._AGENT_COLOR_PALETTE:
-                    color_combo.setCurrentText(current_color)
-
-                # Style the combo's display button to reflect the chosen color
+                # Shared helper — defined once, referenced in closures below
                 def _apply_combo_style(combo, chosen):
                     fg = 'white' if chosen in ('black', 'violet') else 'black'
                     combo.setStyleSheet(
@@ -1844,38 +1912,137 @@ class TCPConnectionViewer(QMainWindow):
                         f"QComboBox QAbstractItemView {{ background-color: white; color: black; }}"
                     )
 
-                if current_color and current_color in self._AGENT_COLOR_PALETTE:
-                    _apply_combo_style(color_combo, current_color)
+                for hostname in known_hosts:
+                    row = self.agent_mgmt_table.rowCount()
+                    self.agent_mgmt_table.insertRow(row)
 
-                # Capture hostname in closure
-                def make_color_changed(hn, combo):
-                    def _on_color_changed(_index):
-                        chosen = combo.currentText()
-                        self._agent_colors[hn] = chosen
-                        _apply_combo_style(combo, chosen)
-                        self.save_settings()
-                        self._update_map_with_filter()
-                    return _on_color_changed
+                    # Column 0 — hostname
+                    is_server = (hostname == LOCAL_HOSTNAME)
+                    display_hostname = f"{hostname} (SERVER)" if is_server else hostname
+                    host_item = QTableWidgetItem(display_hostname)
+                    host_item.setFlags(Qt.ItemIsEnabled)
+                    self.agent_mgmt_table.setItem(row, 0, host_item)
 
-                color_combo.currentIndexChanged.connect(make_color_changed(hostname, color_combo))
-                self.agent_mgmt_table.setCellWidget(row, 1, color_combo)
+                    # Column 1 — color combo box with swatch + label per item
+                    color_combo = QComboBox()
+                    color_combo.setIconSize(QSize(16, 16))
 
-                # Column 2 — Clear button
-                clear_btn = QPushButton("Clear")
-                clear_btn.setToolTip(f"Remove all saved settings for {hostname}")
+                    for color in self._AGENT_COLOR_PALETTE:
+                        pix = QPixmap(16, 16)
+                        pix.fill(QColor(color))
+                        color_combo.addItem(QIcon(pix), color)
 
-                def make_clear_handler(hn):
-                    def _on_clear():
-                        self._agent_colors.pop(hn, None)
-                        with self._agent_cache_lock:
-                            self._agent_cache.pop(hn, None)
-                        self.save_settings()
-                        self._refresh_agent_management_table()
-                        self._update_map_with_filter()
-                    return _on_clear
+                    # Default the server to green if not yet assigned
+                    current_color = self._agent_colors.get(hostname)
+                    if current_color is None and is_server:
+                        current_color = 'green'
+                        self._agent_colors[hostname] = 'green'
+                    if current_color and current_color in self._AGENT_COLOR_PALETTE:
+                        color_combo.blockSignals(True)
+                        color_combo.setCurrentText(current_color)
+                        color_combo.blockSignals(False)
+                        _apply_combo_style(color_combo, current_color)
 
-                clear_btn.clicked.connect(make_clear_handler(hostname))
-                self.agent_mgmt_table.setCellWidget(row, 2, clear_btn)
+                    def make_color_changed(hn, combo):
+                        def _on_color_changed(_index):
+                            chosen = combo.currentText()
+                            self._agent_colors[hn] = chosen
+                            _apply_combo_style(combo, chosen)
+                            self.save_settings()
+                            # Re-stamp agent_color and icon on every live connection
+                            # belonging to this agent so the map reflects the new color
+                            # immediately without waiting for the next full refresh cycle.
+                            if hasattr(self, 'connections') and self.connections:
+                                for _conn in self.connections:
+                                    if _conn.get('origin_hostname') == hn or _conn.get('hostname') == hn:
+                                        _conn['agent_color'] = chosen
+                                        if _conn.get('icon') not in ('redIcon', 'yellowIcon'):
+                                            _conn['icon'] = chosen + 'Icon'
+                            self._update_map_with_filter()
+                        return _on_color_changed
+
+                    color_combo.currentIndexChanged.connect(make_color_changed(hostname, color_combo))
+                    self.agent_mgmt_table.setCellWidget(row, 1, color_combo)
+
+                    # Column 2 — Hide toggle button
+                    is_hidden = self._agent_hidden.get(hostname, False)
+                    hide_btn = QPushButton("✖" if is_hidden else "✔")
+                    hide_btn.setToolTip("Click to unhide agent on the map" if is_hidden else "Click to hide agent on the map")
+                    hide_btn.setStyleSheet(
+                        "color: red; font-weight: bold;" if is_hidden else "color: green; font-weight: bold;"
+                    )
+
+                    def make_hide_handler(hn):
+                        def _on_hide_toggle():
+                            currently_hidden = self._agent_hidden.get(hn, False)
+                            self._agent_hidden[hn] = not currently_hidden
+                            self.save_settings()
+                            self._refresh_agent_management_table(force_rebuild=True)
+                            self._update_map_with_filter()
+                        return _on_hide_toggle
+
+                    hide_btn.clicked.connect(make_hide_handler(hostname))
+                    self.agent_mgmt_table.setCellWidget(row, 2, hide_btn)
+
+                    # Column 3 — Is Active indicator
+                    last_seen = self._agent_last_seen.get(hostname)
+                    if last_seen is not None and (now - last_seen) <= active_threshold:
+                        active_text, active_color = "✔", "green"
+                    else:
+                        active_text, active_color = "✖", "red"
+                    active_item = QTableWidgetItem(active_text)
+                    active_item.setTextAlignment(Qt.AlignCenter)
+                    active_item.setForeground(QColor(active_color))
+                    active_item.setFlags(Qt.ItemIsEnabled)
+                    self.agent_mgmt_table.setItem(row, 3, active_item)
+
+                    # Column 4 — Clear button
+                    clear_btn = QPushButton("Clear")
+                    clear_btn.setToolTip(f"Remove all saved settings for {hostname}")
+
+                    def make_clear_handler(hn):
+                        def _on_clear():
+                            self._agent_colors.pop(hn, None)
+                            self._agent_hidden.pop(hn, None)
+                            self._agent_last_seen.pop(hn, None)
+                            with self._agent_cache_lock:
+                                self._agent_cache.pop(hn, None)
+                            self.save_settings()
+                            self._refresh_agent_management_table(force_rebuild=True)
+                            self._update_map_with_filter()
+                        return _on_clear
+
+                    clear_btn.clicked.connect(make_clear_handler(hostname))
+                    self.agent_mgmt_table.setCellWidget(row, 4, clear_btn)
+
+            else:
+                # --- In-place update: only touch volatile columns (2 and 3) ---
+                for row, hostname in enumerate(known_hosts):
+                    # Column 2 — Hide toggle button: update text/style only
+                    hide_btn = self.agent_mgmt_table.cellWidget(row, 2)
+                    if hide_btn is not None:
+                        is_hidden = self._agent_hidden.get(hostname, False)
+                        new_text = "✖" if is_hidden else "✔"
+                        new_tip  = "Click to unhide agent on the map" if is_hidden else "Click to hide agent on the map"
+                        new_style = "color: red; font-weight: bold;" if is_hidden else "color: green; font-weight: bold;"
+                        if hide_btn.text() != new_text:
+                            hide_btn.setText(new_text)
+                        if hide_btn.toolTip() != new_tip:
+                            hide_btn.setToolTip(new_tip)
+                        if hide_btn.styleSheet() != new_style:
+                            hide_btn.setStyleSheet(new_style)
+
+                    # Column 3 — Is Active indicator
+                    last_seen = self._agent_last_seen.get(hostname)
+                    if last_seen is not None and (now - last_seen) <= active_threshold:
+                        active_text, active_color = "✔", "green"
+                    else:
+                        active_text, active_color = "✖", "red"
+                    active_item = self.agent_mgmt_table.item(row, 3)
+                    if active_item is not None:
+                        if active_item.text() != active_text:
+                            active_item.setText(active_text)
+                            active_item.setForeground(QColor(active_color))
 
         except Exception as e:
             logging.error(f"Error refreshing agent management table: {e}")
@@ -2184,6 +2351,7 @@ class TCPConnectionViewer(QMainWindow):
                         "lng": loc_lng,
                         "connections": conns,
                     }
+                    viewer._agent_last_seen[hostname] = time.monotonic()
                 return jsonify({"status": "ok", "accepted": len(conns)}), 200
             except Exception as e:
                 logging.error(f"Error processing /submit_connections: {e}")
@@ -2308,10 +2476,9 @@ class TCPConnectionViewer(QMainWindow):
             snapshot = dict(self._agent_cache)
         self._last_agent_count = len(snapshot)
 
-        # If any hostname in the snapshot is new (not yet in the table),
-        # schedule a table refresh on the main thread.
-        new_hosts = set(snapshot.keys()) - set(self._agent_colors.keys())
-        if new_hosts and hasattr(self, 'agent_mgmt_table'):
+        # If the agent management table exists, schedule a refresh every cycle
+        # so that the "Is Active" column stays current.
+        if hasattr(self, 'agent_mgmt_table'):
             QTimer.singleShot(0, self._refresh_agent_management_table)
 
         return snapshot
@@ -2470,6 +2637,9 @@ class TCPConnectionViewer(QMainWindow):
                 self._active_collector.stop()
         except Exception:
             pass
+
+        # Cleanly close the database provider
+        self._deactivate_db_provider()
 
         self.save_settings()
         if self.reader_ipv4 is not None:
@@ -2691,6 +2861,19 @@ class TCPConnectionViewer(QMainWindow):
         action_bring_to_top.setEnabled(bool(row_hostname) and row_hostname != foreground_host)
         menu.addSeparator()
 
+        # Hide / Unhide agent actions (only when in server mode with agents)
+        action_hide_agent = action_unhide_agent = None
+        action_hide_all_others = action_unhide_all = None
+        if enable_server_mode and row_hostname and row_hostname in self._agent_colors:
+            is_hidden = self._agent_hidden.get(row_hostname, False)
+            if is_hidden:
+                action_unhide_agent = menu.addAction(f"Unhide agent \"{row_hostname}\" on map")
+            else:
+                action_hide_agent = menu.addAction(f"Hide agent \"{row_hostname}\" on map")
+            action_hide_all_others = menu.addAction(f"Hide all other agents except \"{row_hostname}\"")
+            action_unhide_all = menu.addAction("Unhide all agents")
+            menu.addSeparator()
+
         # Only offer local-process tools when the row comes from this machine
         _is_remote_agent = bool(row_hostname) and row_hostname != LOCAL_HOSTNAME
         action_open = action_memory = action_procmon = None
@@ -2714,6 +2897,39 @@ class TCPConnectionViewer(QMainWindow):
         if chosen == action_bring_to_top:
             if row_hostname:
                 self.bring_to_top_layer(row_hostname)
+            return
+
+        if chosen == action_hide_agent:
+            self._agent_hidden[row_hostname] = True
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
+            return
+
+        if chosen == action_unhide_agent:
+            self._agent_hidden.pop(row_hostname, None)
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
+            return
+
+        if chosen == action_hide_all_others:
+            all_agents = set(self._agent_colors.keys()) | {LOCAL_HOSTNAME}
+            for hn in all_agents:
+                if hn != row_hostname:
+                    self._agent_hidden[hn] = True
+                else:
+                    self._agent_hidden.pop(hn, None)
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
+            return
+
+        if chosen == action_unhide_all:
+            self._agent_hidden.clear()
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
             return
 
         if not pid:
@@ -2853,6 +3069,19 @@ class TCPConnectionViewer(QMainWindow):
 
         menu = QMenu(self)
 
+        # Hide / Unhide agent actions (only when in server mode with agents)
+        action_hide_agent = action_unhide_agent = None
+        action_hide_all_others = action_unhide_all = None
+        if enable_server_mode and row_hostname and row_hostname in self._agent_colors:
+            is_hidden = self._agent_hidden.get(row_hostname, False)
+            if is_hidden:
+                action_unhide_agent = menu.addAction(f"Unhide agent \"{row_hostname}\" on map")
+            else:
+                action_hide_agent = menu.addAction(f"Hide agent \"{row_hostname}\" on map")
+            action_hide_all_others = menu.addAction(f"Hide all other agents except \"{row_hostname}\"")
+            action_unhide_all = menu.addAction("Unhide all agents")
+            menu.addSeparator()
+
         # Only offer local-process tools when the row comes from this machine
         _is_remote_agent = bool(row_hostname) and row_hostname != LOCAL_HOSTNAME
         action_open = action_memory = action_procmon = None
@@ -2867,6 +3096,39 @@ class TCPConnectionViewer(QMainWindow):
 
         chosen = menu.exec(self.summary_table.viewport().mapToGlobal(pos))
         if chosen is None:
+            return
+
+        if chosen == action_hide_agent:
+            self._agent_hidden[row_hostname] = True
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
+            return
+
+        if chosen == action_unhide_agent:
+            self._agent_hidden.pop(row_hostname, None)
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
+            return
+
+        if chosen == action_hide_all_others:
+            all_agents = set(self._agent_colors.keys()) | {LOCAL_HOSTNAME}
+            for hn in all_agents:
+                if hn != row_hostname:
+                    self._agent_hidden[hn] = True
+                else:
+                    self._agent_hidden.pop(hn, None)
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
+            return
+
+        if chosen == action_unhide_all:
+            self._agent_hidden.clear()
+            self.save_settings()
+            self._refresh_agent_management_table(force_rebuild=True)
+            self._update_map_with_filter()
             return
 
         if not pid:
@@ -3136,17 +3398,31 @@ class TCPConnectionViewer(QMainWindow):
             logging.error(f"bring_to_top_layer error: {e}")
 
     def _update_map_with_filter(self):
-        """Re-render the map using the current connections list filtered by the active
-        column filters.  Agent exit-point circles are always rendered for every known
-        agent regardless of whether any of their connections survive the filter."""
+        """Re-render the map using the last fully-processed connection list filtered
+        by the active column filters.  Agent exit-point circles are always rendered
+        for every known agent regardless of whether any of their connections survive
+        the filter."""
         try:
-            if not hasattr(self, 'connections') or self.connections is None:
-                return
+            # Use the cached fully-processed list (includes remote agent data)
+            # instead of self.connections which only holds raw local connections.
+            source = getattr(self, '_last_map_connections', None)
+            if not source:
+                # Fallback for the very first render before any refresh has run
+                if not hasattr(self, 'connections') or self.connections is None:
+                    return
+                source = self.connections
 
             active_filters = self._get_active_filters()
 
             if not active_filters:
-                # No filter — the last full render (from refresh_connections) is already correct
+                # No filter — re-render with the full connection list as-is.
+                # (Do not return early: callers such as _on_color_changed rely on
+                # this path to push an immediate map update without a full refresh.)
+                stats_line = getattr(self, '_last_stats_line', '')
+                datetime_text = getattr(self, '_last_datetime_text', '')
+                force_tooltip = show_tooltip
+                self.update_map(list(source), force_tooltip,
+                                stats_text=stats_line, datetime_text=datetime_text)
                 return
 
             filtered = []
@@ -3154,13 +3430,13 @@ class TCPConnectionViewer(QMainWindow):
             # list so we can inject stub entries for any agent that has no matched connections
             # (their exit-point circle must still appear on the map).
             all_agent_origins = {}   # hostname -> first conn that carries origin info
-            for conn in self.connections:
+            for conn in source:
                 oh = conn.get('origin_hostname')
                 if oh and oh not in all_agent_origins:
                     all_agent_origins[oh] = conn
 
             matched_agent_origins = set()
-            for conn in self.connections:
+            for conn in source:
                 if self._conn_matches_filters(conn, active_filters):
                     filtered.append(conn)
                     oh = conn.get('origin_hostname')
@@ -3180,7 +3456,7 @@ class TCPConnectionViewer(QMainWindow):
                         'origin_lat':      ref_conn.get('origin_lat'),
                         'origin_lng':      ref_conn.get('origin_lng'),
                         'origin_public_ip': ref_conn.get('origin_public_ip', ''),
-                        'agent_color':     ref_conn.get('agent_color', 'orange'),
+                        'agent_color':     self._agent_colors.get(hostname, ref_conn.get('agent_color', 'orange')),
                         'hostname':        hostname,
                     })
 
@@ -3391,6 +3667,20 @@ class TCPConnectionViewer(QMainWindow):
         self.save_settings()
 
     @Slot()
+    def update_pulse_exit_points(self):
+        global do_pulse_exit_points
+
+        do_pulse_exit_points = self.pulse_exit_points_check.isChecked()
+        self.save_settings()
+
+    @Slot()
+    def update_show_traffic_histogram(self):
+        global do_show_traffic_histogram
+
+        do_show_traffic_histogram = self.show_traffic_histogram_check.isChecked()
+        self.save_settings()
+
+    @Slot()
     def update_capture_screenshots(self):
         global do_capture_screenshots
 
@@ -3407,6 +3697,200 @@ class TCPConnectionViewer(QMainWindow):
         else:
             do_capture_screenshots = False
         self.save_settings()
+
+    # ------------------------------------------------------------------ #
+    # Database persistence layer helpers
+    # ------------------------------------------------------------------ #
+    def _activate_db_provider(self, provider_name: str) -> bool:
+        """Instantiate and connect the chosen database provider.
+
+        Returns True on success, False on failure (logs a warning and
+        leaves ``self._db_provider`` as None so the app keeps running).
+        """
+        self._deactivate_db_provider()
+        if not provider_name or provider_name == "Disabled":
+            return True  # nothing to activate
+        try:
+            from db_providers import create_provider
+            prov = create_provider(provider_name)
+            if prov is None:
+                logging.warning(f"Database provider '{provider_name}' is not available.")
+                return False
+            # Ensure the connection_databases subfolder exists
+            os.makedirs(CONNECTION_DATABASES_DIR, exist_ok=True)
+            # For file-based providers (e.g. SQLite) store inside the subfolder
+            db_path = os.path.join(CONNECTION_DATABASES_DIR, "connection_history.db")
+            prov.connect(db_path=db_path)
+            self._db_provider = prov
+            logging.info(f"Database provider '{provider_name}' connected.")
+            # Pre-load historical snapshots into the in-memory timeline
+            self._restore_snapshots_from_db()
+            # Start the background worker thread for non-blocking DB writes
+            self._db_stop.clear()
+            self._db_queue = queue.Queue()
+            self._db_thread = threading.Thread(
+                target=self._db_worker, daemon=True, name="DbWorker")
+            self._db_thread.start()
+            return True
+        except Exception as e:
+            logging.error(f"Failed to activate database provider '{provider_name}': {e}")
+            self._db_provider = None
+            return False
+
+    def _deactivate_db_provider(self) -> None:
+        """Cleanly shut down the current database provider (if any)."""
+        # Signal the worker thread to stop and wait for it to drain
+        if self._db_thread is not None and self._db_thread.is_alive():
+            self._db_stop.set()
+            self._db_thread.join(timeout=5)
+            self._db_thread = None
+        self._db_queue = None
+        if self._db_provider is not None:
+            try:
+                self._db_provider.close()
+            except Exception:
+                pass
+            self._db_provider = None
+
+    def _restore_snapshots_from_db(self) -> None:
+        """Load saved snapshots from the database into ``self.connection_list``
+        up to ``max_connection_list_filo_buffer_size`` so the slider can
+        replay them immediately.
+
+        When ``--force_complete_database_load`` is active the limit is
+        temporarily raised to ``max_connection_list_database_size`` and the
+        deque is resized accordingly so the full database history can be
+        browsed with the time slider.
+        """
+        if self._db_provider is None:
+            return
+        try:
+            # Determine effective load limit
+            if force_complete_database_load:
+                effective_limit = max_connection_list_database_size
+                logging.info(
+                    f"--force_complete_database_load: loading up to "
+                    f"{effective_limit} snapshots from database.")
+            else:
+                effective_limit = max_connection_list_filo_buffer_size
+
+            snapshots = self._db_provider.load_snapshots(effective_limit)
+            if not snapshots:
+                return
+            logging.info(f"Restoring {len(snapshots)} snapshots from database.")
+            # Reset the deque with the (possibly enlarged) maxlen
+            self.connection_list = deque(snapshots, maxlen=effective_limit)
+            self.connection_list_counter = len(self.connection_list)
+
+            # Discover agents stored in the database so they appear in the
+            # Agent Management pane even when the DB was captured on another
+            # machine or agents are no longer posting live data.
+            for snap in snapshots:
+                agent_data = snap.get('agent_data')
+                if not agent_data or not isinstance(agent_data, dict):
+                    continue
+                for hostname in agent_data.keys():
+                    if hostname and hostname not in self._agent_colors:
+                        palette = self._AGENT_COLOR_PALETTE
+                        self._agent_colors[hostname] = palette[
+                            self._agent_color_index % len(palette)]
+                        self._agent_color_index += 1
+                        logging.info(
+                            f"Discovered agent '{hostname}' from database history.")
+
+            # Sync slider (block signals to avoid triggering update_slider_value
+            # which would stop the capture timer and flip button state)
+            if hasattr(self, 'slider'):
+                self.slider.blockSignals(True)
+                self.slider.setMaximum(self.connection_list_counter)
+                self.slider.setValue(self.connection_list_counter)
+                self.slider.blockSignals(False)
+                self.slider_value_label.setText(
+                    TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list) - 1))
+        except Exception as e:
+            logging.error(f"Error restoring snapshots from database: {e}")
+
+    def _db_save_snapshot(self, timestamp, connections, agent_data) -> None:
+        """Enqueue a snapshot for the background DB worker thread.
+
+        Called at the end of each connection cycle.  The connections list
+        is deep-copied so the worker thread owns its own data and the
+        UI thread is never blocked by database I/O.
+        """
+        if self._db_queue is None:
+            return
+        try:
+            import copy
+            self._db_queue.put_nowait(
+                (timestamp, copy.deepcopy(connections), agent_data))
+        except Exception as e:
+            logging.error(f"Database snapshot enqueue error: {e}")
+
+    def _db_worker(self) -> None:
+        """Background thread that drains ``_db_queue`` and writes to the
+        database provider.  Runs until ``_db_stop`` is set **and** the
+        queue is empty, ensuring no snapshots are lost on shutdown."""
+        while not self._db_stop.is_set():
+            try:
+                item = self._db_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._db_process_item(item)
+        # Drain remaining items before exiting
+        while not self._db_queue.empty():
+            try:
+                item = self._db_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._db_process_item(item)
+        logging.info("Database worker thread stopped.")
+
+    def _db_process_item(self, item) -> None:
+        """Process a single queued snapshot write + purge."""
+        timestamp, connections, agent_data = item
+        try:
+            self._db_provider.save_snapshot(timestamp, connections, agent_data)
+            self._db_provider.purge_oldest(max_connection_list_database_size)
+        except Exception as e:
+            logging.error(f"Database snapshot save error: {e}")
+
+    @Slot(str)
+    def _on_db_provider_changed(self, text: str) -> None:
+        global db_provider_name
+        if text == db_provider_name:
+            return
+        if text == "Disabled":
+            self._deactivate_db_provider()
+            db_provider_name = "Disabled"
+            self.save_settings()
+            logging.info("Database persistence disabled.")
+            return
+        ok = self._activate_db_provider(text)
+        if ok:
+            db_provider_name = text
+            self.save_settings()
+        else:
+            QMessageBox.warning(
+                self, "Database Error",
+                f"Could not connect to the '{text}' provider.\n"
+                "Check logs for details. Reverting to Disabled."
+            )
+            self.db_provider_combo.blockSignals(True)
+            self.db_provider_combo.setCurrentText(db_provider_name)
+            self.db_provider_combo.blockSignals(False)
+
+    @Slot()
+    def _on_db_buffer_size_changed(self) -> None:
+        global max_connection_list_database_size
+        try:
+            val = int(self.db_buffer_size_input.text().strip())
+            if val <= 0:
+                raise ValueError("Must be positive")
+            max_connection_list_database_size = val
+            self.save_settings()
+            logging.info(f"Database max snapshot size set to {val}")
+        except (ValueError, TypeError):
+            self.db_buffer_size_input.setText(str(max_connection_list_database_size))
 
     @Slot()
     def update_buffer_size(self):
@@ -4191,6 +4675,18 @@ class TCPConnectionViewer(QMainWindow):
         settings_tab_layout.addWidget(self.resolve_public_ip)    
         self.resolve_public_ip.stateChanged.connect(self.update_resolve_public_ip)
 
+        # Pulse exit points checkbox
+        self.pulse_exit_points_check = QCheckBox("Pulse ipify.com exit points")
+        self.pulse_exit_points_check.setChecked(do_pulse_exit_points)
+        settings_tab_layout.addWidget(self.pulse_exit_points_check)
+        self.pulse_exit_points_check.stateChanged.connect(self.update_pulse_exit_points)
+
+        # Show traffic histogram on map checkbox
+        self.show_traffic_histogram_check = QCheckBox("Show network traffic histogram on map")
+        self.show_traffic_histogram_check.setChecked(do_show_traffic_histogram)
+        settings_tab_layout.addWidget(self.show_traffic_histogram_check)
+        self.show_traffic_histogram_check.stateChanged.connect(self.update_show_traffic_histogram)
+
         # Capture screenshots checkbox
         self.capture_screenshots_check = QCheckBox("Capture screenshots of the map to disk")
         self.capture_screenshots_check.setChecked(False)
@@ -4212,6 +4708,52 @@ class TCPConnectionViewer(QMainWindow):
         buffer_size_layout.addStretch()
 
         settings_tab_layout.addLayout(buffer_size_layout)
+
+        # --- Database persistence layer ---
+        db_section_label = QLabel("<b>Database Persistence</b>")
+        settings_tab_layout.addWidget(db_section_label)
+
+        db_provider_layout = QHBoxLayout()
+        db_provider_label = QLabel("Connection history database:")
+        db_provider_label.setToolTip(
+            "When enabled, every connection snapshot is persisted to the selected\n"
+            "database engine so history survives application restarts.\n"
+            "Set to 'Disabled' to run without a database (default)."
+        )
+        db_provider_layout.addWidget(db_provider_label)
+
+        self.db_provider_combo = QComboBox()
+        self.db_provider_combo.addItem("Disabled")
+        # Discover available providers from the db_providers package
+        try:
+            from db_providers import get_available_providers
+            for pname in sorted(get_available_providers().keys()):
+                self.db_provider_combo.addItem(pname)
+        except Exception:
+            pass  # package not importable — only "Disabled" shown
+        self.db_provider_combo.setCurrentText(db_provider_name)
+        self.db_provider_combo.currentTextChanged.connect(self._on_db_provider_changed)
+        db_provider_layout.addWidget(self.db_provider_combo)
+        db_provider_layout.addStretch()
+        settings_tab_layout.addLayout(db_provider_layout)
+
+        # Max database snapshot size
+        db_size_layout = QHBoxLayout()
+        db_size_label = QLabel("Maximum connection snapshots in database:")
+        db_size_label.setToolTip(
+            "Older snapshots beyond this limit are automatically deleted\n"
+            "to prevent the database from growing indefinitely."
+        )
+        db_size_layout.addWidget(db_size_label)
+
+        self.db_buffer_size_input = QLineEdit()
+        self.db_buffer_size_input.setText(str(max_connection_list_database_size))
+        self.db_buffer_size_input.setMaximumWidth(100)
+        self.db_buffer_size_input.setToolTip("Enter a positive number greater than 0 (default: 100000)")
+        self.db_buffer_size_input.editingFinished.connect(self._on_db_buffer_size_changed)
+        db_size_layout.addWidget(self.db_buffer_size_input)
+        db_size_layout.addStretch()
+        settings_tab_layout.addLayout(db_size_layout)
 
         # Pause table sorting checkbox
         self.pause_table_sorting_check = QCheckBox("Pause main tab connection table sorting")
@@ -4407,13 +4949,15 @@ class TCPConnectionViewer(QMainWindow):
         agent_mgmt_desc.setWordWrap(True)
         agent_mgmt_tab_layout.addWidget(agent_mgmt_desc)
 
-        self.agent_mgmt_table = QTableWidget(0, 3)
-        self.agent_mgmt_table.setHorizontalHeaderLabels(["Hostname", "Color", "Action"])
+        self.agent_mgmt_table = QTableWidget(0, 5)
+        self.agent_mgmt_table.setHorizontalHeaderLabels(["Hostname", "Color", "Hide", "Is Active", "Action"])
         self.agent_mgmt_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.agent_mgmt_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.agent_mgmt_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.agent_mgmt_table.verticalHeader().setVisible(False)
         self.agent_mgmt_table.setSelectionMode(QTableWidget.NoSelection)
         agent_mgmt_tab_layout.addWidget(self.agent_mgmt_table)
@@ -5149,15 +5693,20 @@ class TCPConnectionViewer(QMainWindow):
 
         # record timeline snapshot only when requested (position_timeline is None)
         if position_timeline is None:
+            snap_ts = datetime.datetime.now()
+            snap_agent = agent_snapshot if enable_server_mode and agent_snapshot else None
             another_connection = {
-                "datetime": datetime.datetime.now(),
+                "datetime": snap_ts,
                 "connection_list": connections,
-                "agent_data": agent_snapshot if enable_server_mode and agent_snapshot else None,
+                "agent_data": snap_agent,
             }
 
             # append — deque with maxlen auto-evicts the oldest entry
             self.connection_list.append(another_connection)
             self.connection_list_counter = len(self.connection_list)
+
+            # Persist to database if enabled
+            self._db_save_snapshot(snap_ts, connections, snap_agent)
 
             # keep slider in sync
             self.slider.setMaximum(self.connection_list_counter)
@@ -5414,7 +5963,8 @@ class TCPConnectionViewer(QMainWindow):
                             'ip_type': ip_type,
                             'lat': lat,
                             'lng': lng,
-                            'icon': 'redCircle'
+                            'icon': 'redCircle',
+                            'hostname': LOCAL_HOSTNAME,
                         })
             except Exception:
                 pass
@@ -5439,16 +5989,24 @@ class TCPConnectionViewer(QMainWindow):
             # Collect unique agent origins from the connection data
             # Iterate over a snapshot to avoid modifying list during iteration
             seen_agent_origins = set()
+            hidden_agents = getattr(self, '_agent_hidden', {})
+            # Remove connections belonging to hidden agents
+            if hidden_agents:
+                connection_data = [c for c in connection_data
+                                   if not hidden_agents.get(c.get('origin_hostname') or c.get('hostname'), False)]
             for conn in list(connection_data):
                 origin_hostname = conn.get('origin_hostname')
                 origin_lat = conn.get('origin_lat')
                 origin_lng = conn.get('origin_lng')
                 if origin_hostname and origin_lat is not None and origin_lng is not None:
+                    # Skip hidden agents — no exit-point circle on the map
+                    if hidden_agents.get(origin_hostname, False):
+                        continue
                     key = origin_hostname
                     if key not in seen_agent_origins:
                         seen_agent_origins.add(key)
                         origin_ip = conn.get('origin_public_ip', '')
-                        agent_color = conn.get('agent_color', 'orange')
+                        agent_color = self._agent_colors.get(origin_hostname, 'orange')
                         # Demote localhost circle colour when not foreground
                         if origin_hostname == LOCAL_HOSTNAME and foreground_host != LOCAL_HOSTNAME:
                             agent_color = 'grey'
@@ -5513,17 +6071,25 @@ class TCPConnectionViewer(QMainWindow):
         if enable_agent_mode and getattr(self, '_agent_server_unreachable', False):
             agent_status_text = f'\u26a0 Server unreachable: {agent_server_host}:{FLASK_AGENT_PORT}'
 
+        # Compute total bytes sent/received across all connections for the traffic histogram
+        total_bytes_sent = 0
+        total_bytes_recv = 0
+        for c in connection_data:
+            total_bytes_sent += c.get('bytes_sent', 0) or 0
+            total_bytes_recv += c.get('bytes_recv', 0) or 0
+
         # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay, and agent status to JS.
         # Each call is wrapped in its own try/catch so that a failure in one (e.g. updateConnections
         # throwing on bad data) does not prevent the subsequent status/overlay calls from executing.
         js = (
-            f"try{{updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}, {str(do_show_traffic_gauge).lower()})}}catch(e){{console.error('updateConnections error',e)}};"
+            f"try{{updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}, {str(do_show_traffic_gauge).lower()}, {str(do_pulse_exit_points).lower()})}}catch(e){{console.error('updateConnections error',e)}};"
             f"try{{setStats({json.dumps(stats_text)})}}catch(e){{}};"
             f"try{{setDateTime({json.dumps(datetime_text)})}}catch(e){{}};"
             f"try{{setRecordingIndicator({str(is_recording).lower()})}}catch(e){{}};"
             f"try{{setModeIndicator({json.dumps(mode_indicator_text)})}}catch(e){{}};"
             f"try{{setRejectedOverlay({show_rejected})}}catch(e){{}};"
-            f"try{{setAgentStatus({json.dumps(agent_status_text)})}}catch(e){{}}"
+            f"try{{setAgentStatus({json.dumps(agent_status_text)})}}catch(e){{}};"
+            f"try{{updateTrafficHistogram({total_bytes_sent},{total_bytes_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}}"
         )
 
         # Check reload attempt limit to prevent infinite loops
@@ -5611,6 +6177,38 @@ class TCPConnectionViewer(QMainWindow):
                            font-family:Arial, sans-serif; font-size:11px; color:#333; white-space:nowrap;
                            border:1px solid #ccc; }
                        .leaflet-control-modeinfo .mode-label.active { display:block; }
+                       /* Traffic histogram overlay (left side, below zoom controls) */
+                       #traffic-histogram {
+                           position:absolute; top:80px; left:10px; z-index:1000;
+                           width:120px; pointer-events:none;
+                           font-family:Arial, sans-serif; font-size:9px;
+                       }
+                       #traffic-histogram.th-hidden { display:none; }
+                       #traffic-histogram .th-digits {
+                           text-align:left; margin-bottom:2px; line-height:1.15;
+                           background:rgba(255,255,255,0.85); border-radius:4px;
+                           padding:2px 4px; white-space:nowrap;
+                       }
+                       #traffic-histogram .th-digits .th-sent { color:#d32f2f; }
+                       #traffic-histogram .th-digits .th-recv { color:#388e3c; }
+                       #traffic-histogram .th-bars {
+                           display:flex; flex-direction:column; align-items:stretch;
+                           gap:1px;
+                           background:rgba(255,255,255,0.65); border-radius:4px;
+                           padding:2px;
+                       }
+                       #traffic-histogram .th-bar-row {
+                           display:flex; flex-direction:row; align-items:center;
+                           height:4px; gap:0;
+                       }
+                       #traffic-histogram .th-bar-row .th-s {
+                           background:#d32f2f; height:100%; border-radius:1px 0 0 1px;
+                           transition:width 0.4s ease;
+                       }
+                       #traffic-histogram .th-bar-row .th-r {
+                           background:#388e3c; height:100%; border-radius:0 1px 1px 0;
+                           transition:width 0.4s ease;
+                       }
                        /* Agent rejected (429) overlay centered on map */
                        #agent-rejected-overlay { display:none; position:absolute; top:0; left:0; width:100%; height:100%;
                            z-index:1500; background:rgba(0,0,0,0.55); justify-content:center; align-items:center; pointer-events:none; }
@@ -5629,7 +6227,21 @@ class TCPConnectionViewer(QMainWindow):
                        .tg-empty { width:100%; }
                        .tg-recv { background:#4caf50; width:100%; }
                        .tg-sent { background:#f44336; width:100%; }
-                </style>
+                       /* exit-point pulse ring for agent circles and red server circle */
+                       .exit-pulse-icon { background:transparent !important; border:none !important; pointer-events:none !important; }
+                       .exit-pulse-ring {
+                           width:24px; height:24px; border-radius:50%;
+                           border:3px solid currentColor;
+                           position:absolute; top:50%; left:50%;
+                           transform:translate(-50%,-50%) scale(1);
+                           animation: exit-pulse-anim 2s ease-out infinite;
+                           pointer-events:none;
+                       }
+                       @keyframes exit-pulse-anim {
+                           0%   { transform:translate(-50%,-50%) scale(1);   opacity:0.8; }
+                           100% { transform:translate(-50%,-50%) scale(3.5); opacity:0;   }
+                       }
+                 </style>
             </head>
             <body>
                 <div id="map"></div>
@@ -5648,6 +6260,13 @@ class TCPConnectionViewer(QMainWindow):
                     </div>
                 </div>
                 <div id="map-stats"></div>
+                <div id="traffic-histogram">
+                    <div class="th-digits">
+                        <span class="th-sent" id="th-sent-val">&#9650; 0 B</span><br>
+                        <span class="th-recv" id="th-recv-val">&#9660; 0 B</span>
+                    </div>
+                    <div class="th-bars" id="th-bars"></div>
+                </div>
                 <div id="map-datetime">
                     <span id="recording-indicator"></span>
                     <span id="datetime-text"></span>
@@ -6068,7 +6687,7 @@ class TCPConnectionViewer(QMainWindow):
                                         return html;
                                     }
 
-                                    function updateConnections(conns, showTooltip, drawLines, showGauge) {
+                                    function updateConnections(conns, showTooltip, drawLines, showGauge, pulseExitPoints) {
                                         if (!conns || !Array.isArray(conns)) {
                                             // No data — remove everything
                                             window._removingMarkers = true;
@@ -6077,6 +6696,7 @@ class TCPConnectionViewer(QMainWindow):
                                                 try { entry.marker.off('popupclose'); } catch(e) {}
                                                 try { map.removeLayer(entry.marker); } catch(e) {}
                                                 if (entry.gaugeMarker) { try { map.removeLayer(entry.gaugeMarker); } catch(e) {} }
+                                                if (entry.pulseMarker) { try { map.removeLayer(entry.pulseMarker); } catch(e) {} }
                                             });
                                             _markerMap = {};
                                             window._removingMarkers = false;
@@ -6120,8 +6740,9 @@ class TCPConnectionViewer(QMainWindow):
                                                 var entry = _markerMap[key];
                                                 try { entry.marker.off('popupclose'); } catch(e) {}
                                                 try { map.removeLayer(entry.marker); } catch(e) {}
-                                                if (entry.gaugeMarker) { try { map.removeLayer(entry.gaugeMarker); } catch(e) {} }
-                                                delete _markerMap[key];
+                                                 if (entry.gaugeMarker) { try { map.removeLayer(entry.gaugeMarker); } catch(e) {} }
+                                                 if (entry.pulseMarker) { try { map.removeLayer(entry.pulseMarker); } catch(e) {} }
+                                                 delete _markerMap[key];
                                             }
                                         });
                                         window._removingMarkers = false;
@@ -6153,12 +6774,18 @@ class TCPConnectionViewer(QMainWindow):
                                             if (iconName === 'redCircle') {
                                                 publicIpCoords = [conn.lat, conn.lng];
                                                 if (existing) {
-                                                    // Already on map — update tooltip if remote changed
-                                                    try {
-                                                        existing.marker.unbindTooltip();
-                                                        existing.marker.bindTooltip(conn.remote || 'Public IP', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
-                                                    } catch(e) {}
-                                                    existing.conn = conn;
+                                                     // Already on map — update tooltip if remote changed
+                                                     try {
+                                                         existing.marker.unbindTooltip();
+                                                         existing.marker.bindTooltip(conn.remote || 'Public IP', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
+                                                     } catch(e) {}
+                                                     if (pulseExitPoints) {
+                                                         existing.pulseMarker = _applyExitPulse(existing.marker, 'red', 'publicIpPane', existing.pulseMarker || null);
+                                                     } else if (existing.pulseMarker) {
+                                                         try { map.removeLayer(existing.pulseMarker); } catch(e) {}
+                                                         existing.pulseMarker = null;
+                                                     }
+                                                     existing.conn = conn;
                                                 } else {
                                                     var circle = L.circle([conn.lat, conn.lng], {
                                                         color: 'red', fillColor: '#f03', fillOpacity: 0.5,
@@ -6166,7 +6793,8 @@ class TCPConnectionViewer(QMainWindow):
                                                     }).addTo(map);
                                                     circle.bindTooltip(conn.remote || 'Public IP', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
                                                     circle.bindPopup("<b>Server Public IP</b><br>IP: " + (conn.remote || '') + "<br>");
-                                                    _markerMap[key] = { marker: circle, gaugeMarker: null, conn: conn, iconName: iconName };
+                                                     var rPulse = pulseExitPoints ? _applyExitPulse(circle, 'red', 'publicIpPane', null) : null;
+                                                     _markerMap[key] = { marker: circle, gaugeMarker: null, conn: conn, iconName: iconName, pulseMarker: rPulse };
                                                 }
 
                                             } else if (iconName === 'agentCircle') {
@@ -6187,13 +6815,19 @@ class TCPConnectionViewer(QMainWindow):
                                                 }
 
                                                 if (existing) {
-                                                    // Update color if changed
-                                                    try {
-                                                        existing.marker.setStyle({ color: agentColor, fillColor: fillColor });
-                                                        existing.marker.unbindTooltip();
-                                                        existing.marker.bindTooltip(conn.remote || 'Agent', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
-                                                    } catch(e) {}
-                                                    // Update pane z-index if changed
+                                                     // Update color if changed
+                                                     try {
+                                                         existing.marker.setStyle({ color: agentColor, fillColor: fillColor });
+                                                         existing.marker.unbindTooltip();
+                                                         existing.marker.bindTooltip(conn.remote || 'Agent', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
+                                                         if (pulseExitPoints) {
+                                                             existing.pulseMarker = _applyExitPulse(existing.marker, agentColor, agentHostname ? agentPaneName : 'publicIpPane', existing.pulseMarker || null);
+                                                         } else if (existing.pulseMarker) {
+                                                             try { map.removeLayer(existing.pulseMarker); } catch(e) {}
+                                                             existing.pulseMarker = null;
+                                                         }
+                                                     } catch(e) {}
+                                                     // Update pane z-index if changed
                                                     try {
                                                         var pane = map.getPane(agentPaneName);
                                                         if (pane) pane.style.zIndex = agentPaneZ;
@@ -6201,10 +6835,11 @@ class TCPConnectionViewer(QMainWindow):
                                                     existing.conn = conn;
                                                 } else {
                                                     var agentCircle = L.circle([conn.lat, conn.lng], {
-                                                        color: agentColor, fillColor: fillColor, fillOpacity: 0.5,
-                                                        radius: 80000, pane: agentHostname ? agentPaneName : 'publicIpPane'
-                                                    }).addTo(map);
-                                                    agentCircle.bindTooltip(conn.remote || 'Agent', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
+                                                         color: agentColor, fillColor: fillColor, fillOpacity: 0.5,
+                                                         radius: 80000, pane: agentHostname ? agentPaneName : 'publicIpPane'
+                                                     }).addTo(map);
+                                                     var agPulse = pulseExitPoints ? _applyExitPulse(agentCircle, agentColor, agentHostname ? agentPaneName : 'publicIpPane', null) : null;
+                                                     agentCircle.bindTooltip(conn.remote || 'Agent', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
                                                     var agPopupHtml = "<b>Agent Exit Point</b><br>" +
                                                                       (conn.remote || '') + "<br>" +
                                                                       "Hostname: " + (conn.name || '') + "<br>" +
@@ -6219,7 +6854,7 @@ class TCPConnectionViewer(QMainWindow):
                                                             } catch(ex) {}
                                                         });
                                                     })(agentHostname);
-                                                    _markerMap[key] = { marker: agentCircle, gaugeMarker: null, conn: conn, iconName: iconName };
+                                                    _markerMap[key] = { marker: agentCircle, gaugeMarker: null, conn: conn, iconName: iconName, pulseMarker: agPulse };
                                                 }
 
                                                 if (agentHostname) {
@@ -6457,6 +7092,28 @@ class TCPConnectionViewer(QMainWindow):
                                         } catch(e) {}
                                     }
 
+                                    // Create / update a CSS-animated pulse ring overlay on top of an
+                                     // L.circle exit-point marker.  Returns the L.marker so callers can
+                                     // store it (e.g. in _markerMap.pulseMarker).
+                                     // existingPulse: previous pulse L.marker to reuse (or null).
+                                     function _applyExitPulse(leafletCircle, color, paneName, existingPulse) {
+                                         try {
+                                             var latlng = leafletCircle.getLatLng();
+                                             var pulseHtml = '<div style="position:relative;width:0;height:0;">' +
+                                                 '<div class="exit-pulse-ring" style="color:' + (color || 'red') + ';"></div></div>';
+                                             var pulseIcon = L.divIcon({ className: 'exit-pulse-icon', html: pulseHtml, iconSize: [0, 0], iconAnchor: [0, 0] });
+                                             if (existingPulse) {
+                                                 existingPulse.setLatLng(latlng);
+                                                 existingPulse.setIcon(pulseIcon);
+                                                 return existingPulse;
+                                             }
+                                             var opts = { icon: pulseIcon, interactive: false };
+                                             if (paneName) opts.pane = paneName;
+                                             var pm = L.marker(latlng, opts).addTo(map);
+                                             return pm;
+                                         } catch(e) { console.warn('[exitPulse]', e); return existingPulse; }
+                                     }
+
                                     function triggerPulse() {
                                         try {
                                             var pulse = document.getElementById('refresh-pulse');
@@ -6524,6 +7181,62 @@ class TCPConnectionViewer(QMainWindow):
                                         } catch(e) {}
                                     }
                                     window.setAgentStatus = setAgentStatus;
+
+                                    // --- Traffic histogram (rolling horizontal bars, newest at top) ---
+                                    var _thSentHistory = [];
+                                    var _thRecvHistory = [];
+                                    var _TH_MAX_BARS = """ + str(MAX_TRAFFIC_HISTOGRAM_BARS) + r""";
+
+                                    function _thFormatBytes(b) {
+                                        if (b <= 0) return '0 B';
+                                        var units = ['B','KB','MB','GB','TB'];
+                                        var i = 0;
+                                        var v = b;
+                                        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+                                        return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+                                    }
+
+                                    function updateTrafficHistogram(totalSent, totalRecv, visible) {
+                                        try {
+                                            var wrapper = document.getElementById('traffic-histogram');
+                                            if (!wrapper) return;
+                                            if (!visible) { wrapper.classList.add('th-hidden'); return; }
+                                            wrapper.classList.remove('th-hidden');
+
+                                            // New bar at front (top); oldest popped from end (bottom)
+                                            _thSentHistory.unshift(totalSent || 0);
+                                            _thRecvHistory.unshift(totalRecv || 0);
+                                            if (_thSentHistory.length > _TH_MAX_BARS) { _thSentHistory.pop(); _thRecvHistory.pop(); }
+
+                                            // Update digit labels
+                                            var sentEl = document.getElementById('th-sent-val');
+                                            var recvEl = document.getElementById('th-recv-val');
+                                            if (sentEl) sentEl.innerHTML = '&#9650; ' + _thFormatBytes(totalSent || 0);
+                                            if (recvEl) recvEl.innerHTML = '&#9660; ' + _thFormatBytes(totalRecv || 0);
+
+                                            // Find peak for scaling
+                                            var peak = 1;
+                                            for (var i = 0; i < _thSentHistory.length; i++) {
+                                                var sum = _thSentHistory[i] + _thRecvHistory[i];
+                                                if (sum > peak) peak = sum;
+                                            }
+
+                                            // Render horizontal bars (each row = one collection pass, newest first)
+                                            var container = document.getElementById('th-bars');
+                                            if (!container) return;
+                                            var barW = container.clientWidth || 112;
+                                            var html = '';
+                                            for (var j = 0; j < _thSentHistory.length; j++) {
+                                                var s = _thSentHistory[j];
+                                                var r = _thRecvHistory[j];
+                                                var sPx = peak > 0 ? Math.max(Math.round((s / peak) * barW), (s > 0 ? 1 : 0)) : 0;
+                                                var rPx = peak > 0 ? Math.max(Math.round((r / peak) * barW), (r > 0 ? 1 : 0)) : 0;
+                                                html += '<div class="th-bar-row"><div class="th-s" style="width:' + sPx + 'px"></div><div class="th-r" style="width:' + rPx + 'px"></div></div>';
+                                            }
+                                            container.innerHTML = html;
+                                        } catch(e) { console.error('[TrafficHistogram]', e); }
+                                    }
+                                    window.updateTrafficHistogram = updateTrafficHistogram;
 
                                     window.triggerPulse = triggerPulse;
 
@@ -6992,11 +7705,15 @@ class TCPConnectionViewer(QMainWindow):
                         'origin_lat':      ref_conn.get('origin_lat'),
                         'origin_lng':      ref_conn.get('origin_lng'),
                         'origin_public_ip': ref_conn.get('origin_public_ip', ''),
-                        'agent_color':     ref_conn.get('agent_color', 'orange'),
+                        'agent_color':     self._agent_colors.get(hostname, ref_conn.get('agent_color', 'orange')),
                         'hostname':        hostname,
                     })
         else:
             map_conns = connections_to_show_on_map
+
+        # Cache the fully-processed connection list so _update_map_with_filter can
+        # re-render the map (including remote agent data) without a full refresh.
+        self._last_map_connections = list(connections_to_show_on_map)
 
         self.update_map(map_conns, force_tooltip, stats_text=stats_line, datetime_text=datetime_text)
 
@@ -7100,8 +7817,8 @@ class TCPConnectionViewer(QMainWindow):
             QMessageBox.about(
                 self,
                 "Welcome to TCP Geo Map",
-                "By default ipify.com is disabled and your geo localization exit point will not show on the map.\n\n"
-                "To enable it navigate to the Settings tab on the top and check the "
+                "By default ipify.com is enabled and your geo localization exit point will show on the map.\n\n"
+                "To disable it navigate to the Settings tab on the top and check the "
                 '"Resolve public internet IP using ipify.com" option.'
             )
         except Exception as e:
@@ -7597,7 +8314,7 @@ class TCPConnectionViewer(QMainWindow):
                 QTimer.singleShot(0, self._sync_summary_filter_widths)
             # Refresh Agent Management table whenever it is activated
             if hasattr(self, '_agent_mgmt_tab_index') and index == self._agent_mgmt_tab_index:
-                self._refresh_agent_management_table()
+                self._refresh_agent_management_table(force_rebuild=True)
         except Exception as e:
             logging.error(f"Error updating tab: {e}")
 
