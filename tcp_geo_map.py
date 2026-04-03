@@ -37,7 +37,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.6.1" # Current script version
+VERSION = "3.6.2" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -965,6 +965,7 @@ class TCPConnectionViewer(QMainWindow):
         self._agent_cache_lock = threading.Lock()
         self._agent_posted_since_last_cycle = set()  # hostnames that POSTed since last timer cycle (protected by _agent_cache_lock)
         self._agent_inactive_strikes = {}  # hostname -> consecutive cycles without a POST
+        self._last_strike_advance_time = 0.0  # monotonic timestamp of last strike advancement
         self._last_agent_count = 0
         self._flask_thread = None       # daemon thread running Flask
         self._werkzeug_server = None    # werkzeug BaseServer instance (stoppable)
@@ -2482,14 +2483,26 @@ class TCPConnectionViewer(QMainWindow):
             self._agent_posted_since_last_cycle.clear()
         self._last_agent_count = len(snapshot)
 
-        # Advance inactive-strike counters once per timer cycle.
-        all_known = set(self._agent_inactive_strikes.keys()) | posted_this_cycle
-        for hostname in all_known:
-            if hostname in posted_this_cycle:
-                self._agent_inactive_strikes[hostname] = 0
-            else:
-                self._agent_inactive_strikes[hostname] = \
-                    self._agent_inactive_strikes.get(hostname, 0) + 1
+        # Advance inactive-strike counters at most once per timer interval.
+        # refresh_connections() can be called from multiple sources (timer,
+        # checkbox toggles, DNS flush, start button) — without this guard
+        # the strikes would be advanced multiple times per interval causing
+        # agents to transiently appear inactive.
+        import time as _time
+        now = _time.monotonic()
+        min_interval = (map_refresh_interval / 1000.0) * 0.8  # 80% of timer period
+        if (now - self._last_strike_advance_time) >= min_interval:
+            self._last_strike_advance_time = now
+            all_known = set(self._agent_inactive_strikes.keys()) | set(snapshot.keys()) | posted_this_cycle
+            for hostname in all_known:
+                # The local server never POSTs to itself — always treat it as active
+                if hostname == LOCAL_HOSTNAME:
+                    self._agent_inactive_strikes[hostname] = 0
+                elif hostname in posted_this_cycle:
+                    self._agent_inactive_strikes[hostname] = 0
+                else:
+                    self._agent_inactive_strikes[hostname] = \
+                        self._agent_inactive_strikes.get(hostname, 0) + 1
 
         # If the agent management table exists, schedule a refresh every cycle
         # so that the "Is Active" column stays current.
@@ -4488,6 +4501,9 @@ class TCPConnectionViewer(QMainWindow):
         self.map_initialized = False
         self._map_reload_attempts = 0  # Track reload attempts to prevent infinite loops
         self._map_loading_in_progress = False  # True while setHtml is in flight, prevents re-entry
+        # Previous cycle cumulative byte totals for computing histogram deltas
+        self._prev_histogram_bytes_sent = 0
+        self._prev_histogram_bytes_recv = 0
 
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.setHandleWidth(6)
@@ -6080,12 +6096,20 @@ class TCPConnectionViewer(QMainWindow):
         if enable_agent_mode and getattr(self, '_agent_server_unreachable', False):
             agent_status_text = f'\u26a0 Server unreachable: {agent_server_host}:{FLASK_AGENT_PORT}'
 
-        # Compute total bytes sent/received across all connections for the traffic histogram
+        # Compute total bytes sent/received across all connections for the traffic histogram.
+        # The per-connection bytes_sent/bytes_recv values are cumulative counters, so the
+        # raw totals grow monotonically.  The histogram needs per-interval *deltas* to show
+        # meaningful proportional bars; otherwise all bars converge toward the peak as the
+        # cumulative values dwarf the inter-cycle differences.
         total_bytes_sent = 0
         total_bytes_recv = 0
         for c in connection_data:
             total_bytes_sent += c.get('bytes_sent', 0) or 0
             total_bytes_recv += c.get('bytes_recv', 0) or 0
+        delta_sent = max(total_bytes_sent - self._prev_histogram_bytes_sent, 0)
+        delta_recv = max(total_bytes_recv - self._prev_histogram_bytes_recv, 0)
+        self._prev_histogram_bytes_sent = total_bytes_sent
+        self._prev_histogram_bytes_recv = total_bytes_recv
 
         # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay, and agent status to JS.
         # Each call is wrapped in its own try/catch so that a failure in one (e.g. updateConnections
@@ -6098,7 +6122,7 @@ class TCPConnectionViewer(QMainWindow):
             f"try{{setModeIndicator({json.dumps(mode_indicator_text)})}}catch(e){{}};"
             f"try{{setRejectedOverlay({show_rejected})}}catch(e){{}};"
             f"try{{setAgentStatus({json.dumps(agent_status_text)})}}catch(e){{}};"
-            f"try{{updateTrafficHistogram({total_bytes_sent},{total_bytes_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}}"
+            f"try{{updateTrafficHistogram({delta_sent},{delta_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}}"
         )
 
         # Check reload attempt limit to prevent infinite loops
