@@ -4,9 +4,17 @@ Live packet capture connection collector plugin using Scapy's ``sniff()``.
 Cross-platform: works on Windows (with or without Npcap), macOS, and Linux.
 
 This plugin runs a background sniffer thread that captures TCP and UDP
-packets in real time.  Each call to ``collect_raw_connections()`` (fired
-every refresh cycle by the main app) returns the unique connections
-observed since the *previous* call — i.e. a rolling live view.
+packets in real time.  Each call to ``collect_raw_connections()`` returns
+the **union** of:
+  * Connections observed by the packet sniffer (with byte-level sent/recv
+    accounting) — these cover any connection with active traffic.
+  * All ESTABLISHED TCP and active UDP connections from the OS connection
+    table (via psutil) — these cover idle connections that have no recent
+    packet flow (keep-alive, database pools, SSH sessions, etc.).
+
+The merge ensures the Scapy collector shows *at least* as many connections
+as the pure psutil collector, while adding byte-accounting for those with
+active packet traffic.
 
 Windows without Npcap:
     Scapy automatically falls back to its Layer 3 socket (conf.L3socket)
@@ -77,31 +85,49 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
     # ---- public API ---------------------------------------------------------
 
     def collect_raw_connections(self) -> list:
-        """Return all connections captured by Scapy that are still alive.
+        """Return the union of Scapy-captured connections and the OS table.
 
-        A connection is kept as long as it still appears in the OS connection
-        table (via psutil).  Connections that have timed out *and* are no
-        longer in the OS table are evicted.  This prevents the aggressive
-        packet-timeout from hiding idle-but-established connections that
-        psutil would show (e.g. keep-alive HTTP/2, database pools, SSH).
+        Scapy captures provide byte accounting (sent/recv) for connections
+        with active packet flow.  The OS connection table (via psutil)
+        provides the full set of established connections including idle ones.
+
+        The merge strategy:
+        1. Scapy-captured entries are kept as long as they remain in the OS
+           table *or* have had recent packet activity.
+        2. Any OS-table connection that Scapy has not (yet) captured is
+           included as a baseline entry with zero byte counters — this
+           ensures the Scapy collector shows at least as many connections
+           as the pure psutil collector.
+        3. Scapy entries that have timed out AND are gone from the OS table
+           are evicted.
         """
         if not self._started:
             self._start_sniffer()
 
-        # Build a set of currently active OS connections for liveness checks
-        os_alive = self._get_os_connection_set()
+        # Fetch the full OS connection table: keyed dict + flat set for lookups
+        os_conns, os_alive = self._get_os_connections()
 
         now = time.monotonic()
         with self._lock:
+            # Evict stale Scapy entries no longer in the OS table
             to_remove = []
             for key, conn in self._connections.items():
                 if now - conn.get('last_seen', 0) > self._CONN_TIMEOUT:
-                    # Timed out — only evict if also gone from OS table
                     if not self._is_alive_in_os(key, os_alive):
                         to_remove.append(key)
             for key in to_remove:
                 del self._connections[key]
+
+            # Build the snapshot: start with all Scapy-tracked connections
+            snapshot_keys = set(self._connections.keys())
             snapshot = [dict(conn) for conn in self._connections.values()]
+
+        # Supplement with OS-table connections that Scapy hasn't captured.
+        # These are idle/established connections with no recent packet flow.
+        for os_key, os_conn in os_conns.items():
+            if os_key not in snapshot_keys:
+                snapshot.append(os_conn)
+
         return snapshot
 
     # ---- OS connection table helpers ----------------------------------------
@@ -125,12 +151,17 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         self._local_addrs = addrs
         self._local_addrs_time = now
 
-    def _get_os_connection_set(self) -> set:
-        """Return a set of ``(local_ip, local_port, remote_ip, remote_port, proto)``
-        tuples for all active OS connections (TCP ESTABLISHED + UDP with remote)."""
+    def _get_os_connections(self) -> tuple:
+        """Return ``(os_conns_dict, os_alive_set)`` from the OS connection table.
+
+        ``os_conns_dict`` maps canonical keys to full connection dicts (same
+        schema as Scapy-captured entries but with zero byte counters).
+        ``os_alive_set`` is the flat set of keys for fast membership tests.
+        """
         if _psutil is None:
-            return set()
-        result = set()
+            return {}, set()
+        os_conns: dict = {}
+        os_alive: set = set()
         try:
             for c in _psutil.net_connections(kind='inet'):
                 if c.type == _socket.SOCK_STREAM:
@@ -150,24 +181,59 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     raddr_port = str(c.raddr.port)
                 else:
                     continue  # no remote — skip
-                result.add((laddr_ip, laddr_port, raddr_ip, raddr_port, proto))
+
+                family = getattr(c, 'family', None)
+                if family == _socket.AF_INET:
+                    ip_type = 'IPv4'
+                elif family == _socket.AF_INET6:
+                    ip_type = 'IPv6'
+                else:
+                    ip_type = ''
+
+                key = (laddr_ip, laddr_port, raddr_ip, raddr_port, proto)
+                os_alive.add(key)
+
+                # Build a full connection dict for supplementation
+                if key not in os_conns:
+                    pid = c.pid
+                    pid_str = str(pid) if pid else ''
+                    proc_name = ''
+                    if pid:
+                        try:
+                            proc_name = _psutil.Process(pid).name()
+                        except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                            proc_name = ''
+                    if not proc_name:
+                        proc_name = 'Unknown'
+
+                    os_conns[key] = {
+                        'process': proc_name,
+                        'pid': pid_str,
+                        'protocol': proto,
+                        'local': laddr_ip,
+                        'localport': laddr_port,
+                        'remote': raddr_ip,
+                        'remoteport': raddr_port,
+                        'ip_type': ip_type,
+                        'hostname': self._hostname,
+                        'bytes_sent': 0,
+                        'bytes_recv': 0,
+                    }
         except Exception as e:
-            logging.debug(f"ScapyLiveCollector: OS connection set error: {e}")
-        return result
+            logging.debug(f"ScapyLiveCollector: OS connections error: {e}")
+        return os_conns, os_alive
 
     def _is_alive_in_os(self, key: tuple, os_alive: set) -> bool:
         """Check whether the Scapy-tracked connection *key* still appears in
         the OS connection table.
 
-        The Scapy key is ``(src, sport, dst, dport, proto)`` based on packet
-        direction, so we must check both orientations against the OS table
-        (which always uses local-first ordering).
+        Keys are canonical ``(local, lport, remote, rport, proto)`` but the
+        OS may report the local address differently (e.g. ``0.0.0.0`` vs the
+        specific NIC IP), so we check both orientations.
         """
         src, sport, dst, dport, proto = key
-        # Forward: src is local
         if (src, sport, dst, dport, proto) in os_alive:
             return True
-        # Reverse: dst is local (inbound packet created the key)
         if (dst, dport, src, sport, proto) in os_alive:
             return True
         return False
