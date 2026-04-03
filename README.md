@@ -274,6 +274,33 @@ The table below documents every key stored in `settings.json`.
 
 ---
 
+### Database persistence
+
+Connection snapshots can optionally be persisted to a database so that history survives application restarts. The database layer is an abstraction — four back-ends are provided out of the box (SQLite, MongoDB, SQL Server, Oracle) and new providers can be added by dropping a `*_provider.py` file into the `db_providers/` package. Only the selected provider's dependencies are imported; the application continues to work normally when the feature is set to **Disabled** (the default).
+
+All database files created by file-based providers (e.g. SQLite) are stored in the `connection_databases/` subfolder next to the script.
+
+Database writes are performed on a dedicated background thread via a `queue.Queue` so that I/O never blocks the UI.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `db_provider_name` | string | `"Disabled"` | Active database back-end. One of `"Disabled"`, `"SQLite"`, `"MongoDB"`, `"SQL Server"`, or `"Oracle"`. When set to `"Disabled"` no database operations occur and no extra dependencies are needed. Selectable on the Settings tab. |
+| `max_connection_list_database_size` | integer | `100000` | Maximum number of snapshots retained in the database. When the count exceeds this value, the oldest entries are automatically purged after each new insert. Configurable on the Settings tab. |
+
+#### `--force_complete_database_load`
+
+When the database layer is enabled, passing `--force_complete_database_load` on the command line temporarily overrides the in-memory buffer size (`max_connection_list_filo_buffer_size`) with the database limit (`max_connection_list_database_size`) so the **entire** stored history can be loaded and replayed via the time slider. This is useful for forensic review of a large capture database.
+
+Agents discovered in the database snapshots are automatically registered in the **Agent Management** pane — even if the database was originally captured on a different machine — so their colour, hide and active-state columns are fully functional during replay.
+
+This flag has no effect when `db_provider_name` is `"Disabled"`.
+
+```
+python tcp_geo_map.py --force_complete_database_load
+```
+
+---
+
 ### Other settings configurable in the script itself
 
 The following constants are not exposed in the UI and must be changed directly in `tcp_geo_map.py`:
@@ -284,6 +311,7 @@ The following constants are not exposed in the UI and must be changed directly i
 | `IP_DNS_NAME_CACHE_FILE` | `"ip_cache.json"` | File name used for the on-disk DNS cache when `PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK` is enabled. |
 | `DATABASE_EXPIRE_AFTER_DAYS` | `7` | Number of days after which the GeoLite2 and C2-Tracker databases are considered stale and a refresh is prompted. |
 | `TILE_OPENSTREETMAP_SERVER` | `"tile.openstreetmap.org"` | Tile server hostname used to render the map. Change this to point to a self-hosted tile server for fully offline / private operation. |
+| `CONNECTION_DATABASES_DIR` | `"connection_databases"` | Subfolder (relative to the script) where file-based database providers (e.g. SQLite) store their database files. Created automatically when a provider is activated. |
 
 # Troubleshooting
 The script can spew additional information by changing in the tcp_geo_map.py:
