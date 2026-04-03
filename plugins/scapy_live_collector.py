@@ -68,29 +68,111 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         self._pid_cache: dict = {}
         self._pid_cache_time: float = 0.0
         self._pid_cache_lock = threading.Lock()
-        self._CONN_TIMEOUT = 10  # seconds to keep a connection "alive"
+        self._CONN_TIMEOUT = 30  # seconds before checking OS table for liveness
+        self._local_addrs: set = set()  # populated once at start
+        self._local_addrs_time: float = 0.0
 
     _PID_CACHE_TTL = 2.0  # seconds between psutil connection-table refreshes
 
     # ---- public API ---------------------------------------------------------
 
     def collect_raw_connections(self) -> list:
-        """Return all connections seen within the last N seconds."""
+        """Return all connections captured by Scapy that are still alive.
+
+        A connection is kept as long as it still appears in the OS connection
+        table (via psutil).  Connections that have timed out *and* are no
+        longer in the OS table are evicted.  This prevents the aggressive
+        packet-timeout from hiding idle-but-established connections that
+        psutil would show (e.g. keep-alive HTTP/2, database pools, SSH).
+        """
         if not self._started:
             self._start_sniffer()
+
+        # Build a set of currently active OS connections for liveness checks
+        os_alive = self._get_os_connection_set()
+
         now = time.monotonic()
         with self._lock:
-            # Only keep connections seen within the timeout window
             to_remove = []
             for key, conn in self._connections.items():
                 if now - conn.get('last_seen', 0) > self._CONN_TIMEOUT:
-                    to_remove.append(key)
+                    # Timed out — only evict if also gone from OS table
+                    if not self._is_alive_in_os(key, os_alive):
+                        to_remove.append(key)
             for key in to_remove:
                 del self._connections[key]
             snapshot = [dict(conn) for conn in self._connections.values()]
         return snapshot
 
-        # ---- PID / process correlation ------------------------------------------
+    # ---- OS connection table helpers ----------------------------------------
+
+    def _refresh_local_addrs(self):
+        """Cache the set of local IP addresses for direction detection."""
+        if _psutil is None:
+            return
+        now = time.monotonic()
+        if now - self._local_addrs_time < 30.0 and self._local_addrs:
+            return  # still fresh
+        addrs = set()
+        try:
+            for _iface, snics in _psutil.net_if_addrs().items():
+                for snic in snics:
+                    if snic.address:
+                        addrs.add(snic.address)
+        except Exception:
+            pass
+        addrs.update(('127.0.0.1', '::1', '0.0.0.0', '::'))
+        self._local_addrs = addrs
+        self._local_addrs_time = now
+
+    def _get_os_connection_set(self) -> set:
+        """Return a set of ``(local_ip, local_port, remote_ip, remote_port, proto)``
+        tuples for all active OS connections (TCP ESTABLISHED + UDP with remote)."""
+        if _psutil is None:
+            return set()
+        result = set()
+        try:
+            for c in _psutil.net_connections(kind='inet'):
+                if c.type == _socket.SOCK_STREAM:
+                    if c.status != 'ESTABLISHED':
+                        continue
+                    proto = 'TCP'
+                elif c.type == _socket.SOCK_DGRAM:
+                    proto = 'UDP'
+                else:
+                    continue
+                if not c.laddr:
+                    continue
+                laddr_ip = c.laddr.ip
+                laddr_port = str(c.laddr.port)
+                if c.raddr and c.raddr.ip and c.raddr.ip not in ('0.0.0.0', '::', '*', ''):
+                    raddr_ip = c.raddr.ip
+                    raddr_port = str(c.raddr.port)
+                else:
+                    continue  # no remote — skip
+                result.add((laddr_ip, laddr_port, raddr_ip, raddr_port, proto))
+        except Exception as e:
+            logging.debug(f"ScapyLiveCollector: OS connection set error: {e}")
+        return result
+
+    def _is_alive_in_os(self, key: tuple, os_alive: set) -> bool:
+        """Check whether the Scapy-tracked connection *key* still appears in
+        the OS connection table.
+
+        The Scapy key is ``(src, sport, dst, dport, proto)`` based on packet
+        direction, so we must check both orientations against the OS table
+        (which always uses local-first ordering).
+        """
+        src, sport, dst, dport, proto = key
+        # Forward: src is local
+        if (src, sport, dst, dport, proto) in os_alive:
+            return True
+        # Reverse: dst is local (inbound packet created the key)
+        if (dst, dport, src, sport, proto) in os_alive:
+            return True
+        return False
+
+    # ---- PID / process correlation ------------------------------------------
 
     def _refresh_pid_cache(self):
         """Rebuild the port-based PID lookup table from the live OS connection table.
@@ -156,6 +238,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
     def _start_sniffer(self):
         """Spin up the background packet-capture thread."""
         self._stop_event.clear()
+        self._refresh_local_addrs()
         self._sniffer_thread = threading.Thread(
             target=self._sniffer_loop, daemon=True, name="ScapyLiveSniffer"
         )
@@ -226,51 +309,72 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             else:
                 return
 
-            key = (src, sport, dst, dport, protocol)
+            # --- Direction detection -----------------------------------------
+            # Determine which side is local so we always store the connection
+            # as (local_ip, local_port, remote_ip, remote_port) — the same
+            # orientation psutil uses.  This prevents a single TCP connection
+            # from creating two entries (one per packet direction).
+            self._refresh_local_addrs()
+            src_is_local = src in self._local_addrs
+            dst_is_local = dst in self._local_addrs
+
+            if src_is_local and not dst_is_local:
+                # Outbound packet: src is local
+                local_ip, local_port, remote_ip, remote_port = src, sport, dst, dport
+                is_outbound = True
+            elif dst_is_local and not src_is_local:
+                # Inbound packet: dst is local
+                local_ip, local_port, remote_ip, remote_port = dst, dport, src, sport
+                is_outbound = False
+            else:
+                # Both local (loopback) or both non-local (forwarded):
+                # fall back to PID-cache heuristic
+                _, _src_proc = self._lookup_pid(sport, protocol)
+                if _src_proc:
+                    local_ip, local_port, remote_ip, remote_port = src, sport, dst, dport
+                    is_outbound = True
+                else:
+                    local_ip, local_port, remote_ip, remote_port = dst, dport, src, sport
+                    is_outbound = False
+
+            # Canonical key: always (local, lport, remote, rport, proto)
+            key = (local_ip, local_port, remote_ip, remote_port, protocol)
 
             # Correlate with the OS connection table via psutil.
-            # Try the source port first (outbound: local=src), then the
-            # destination port (inbound: local=dst).  Port-only keying
-            # handles wildcard-bound sockets (0.0.0.0 / ::) correctly.
-            pid_str, proc_name = self._lookup_pid(sport, protocol)
+            pid_str, proc_name = self._lookup_pid(local_port, protocol)
             if not pid_str:
-                pid_str, proc_name = self._lookup_pid(dport, protocol)
+                pid_str, proc_name = self._lookup_pid(remote_port, protocol)
             if not proc_name:
                 proc_name = 'capture'
 
             # --- Byte accounting ---------------------------------------------
-            # Determine packet payload size (IP total length is the most
-            # reliable cross-platform metric; fall back to raw packet len).
             try:
                 pkt_bytes = int(ip_layer.len)
             except Exception:
                 pkt_bytes = len(pkt)
 
-            # Direction heuristic: if the source port belongs to a local
-            # process (found in PID cache), this is an *outbound* packet
-            # (bytes sent).  Otherwise treat it as *inbound* (bytes recv).
-            _, _src_proc = self._lookup_pid(sport, protocol)
-            is_outbound = bool(_src_proc)
-
             with self._lock:
                 existing = self._connections.get(key)
                 now = time.monotonic()
                 if existing:
-                    # Update byte counters as before
                     if is_outbound:
                         existing['bytes_sent'] = existing.get('bytes_sent', 0) + pkt_bytes
                     else:
                         existing['bytes_recv'] = existing.get('bytes_recv', 0) + pkt_bytes
                     existing['last_seen'] = now
+                    # Update PID/process if we got a better match
+                    if pid_str and not existing.get('pid'):
+                        existing['pid'] = pid_str
+                        existing['process'] = proc_name
                 else:
                     conn = {
                         'process': proc_name,
                         'pid': pid_str,
                         'protocol': protocol,
-                        'local': src,
-                        'localport': sport,
-                        'remote': dst,
-                        'remoteport': dport,
+                        'local': local_ip,
+                        'localport': local_port,
+                        'remote': remote_ip,
+                        'remoteport': remote_port,
                         'ip_type': ip_type,
                         'hostname': self._hostname,
                         'bytes_sent': pkt_bytes if is_outbound else 0,
