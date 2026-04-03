@@ -25,7 +25,7 @@ from collections import deque
 from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QSize, Qt, QThreadPool
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
-from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
+from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
@@ -37,7 +37,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.5.6" # Current script version
+VERSION = "3.6.1" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -51,12 +51,12 @@ import logging
 from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QSize
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
-from PySide6.QtGui import QIcon, QAction, QPixmap, QColor
+from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
 
-# R001D00rs tcp_geo_map https://github.com/jclauzel/R001D00rs/
+# R001D00rs tcp_geo_map
 
 # pip install psutil, maxminddb PySide6 opencv-python procmon-parser flask scapy
 
@@ -246,19 +246,27 @@ RESOURCES_DIR = "resources"
 LEAFLET_DIR = os.path.join(RESOURCES_DIR, "leaflet")
 LEAFLET_CSS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
 LEAFLET_JS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-LEAFLET_MARKER_RED_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png"
-LEAFLET_MARKER_GREEN_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png"
-LEAFLET_MARKER_BLUE_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png"
+LEAFLET_MARKER_RED_URL    = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png"
+LEAFLET_MARKER_GREEN_URL  = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png"
+LEAFLET_MARKER_BLUE_URL   = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png"
 LEAFLET_MARKER_YELLOW_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-yellow.png"
 LEAFLET_MARKER_ORANGE_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-orange.png"
+LEAFLET_MARKER_VIOLET_URL = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-violet.png"
+LEAFLET_MARKER_BLACK_URL  = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-black.png"
+LEAFLET_MARKER_GREY_URL   = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-grey.png"
+LEAFLET_MARKER_GOLD_URL   = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-gold.png"
 
 LEAFLET_CSS_PATH = os.path.join(LEAFLET_DIR, "leaflet.css")
 LEAFLET_JS_PATH = os.path.join(LEAFLET_DIR, "leaflet.js")
-LEAFLET_MARKER_RED_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-red.png")
-LEAFLET_MARKER_GREEN_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-green.png")
-LEAFLET_MARKER_BLUE_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-blue.png")
+LEAFLET_MARKER_RED_PATH    = os.path.join(LEAFLET_DIR, "marker-icon-2x-red.png")
+LEAFLET_MARKER_GREEN_PATH  = os.path.join(LEAFLET_DIR, "marker-icon-2x-green.png")
+LEAFLET_MARKER_BLUE_PATH   = os.path.join(LEAFLET_DIR, "marker-icon-2x-blue.png")
 LEAFLET_MARKER_YELLOW_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-yellow.png")
 LEAFLET_MARKER_ORANGE_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-orange.png")
+LEAFLET_MARKER_VIOLET_PATH = os.path.join(LEAFLET_DIR, "marker-icon-2x-violet.png")
+LEAFLET_MARKER_BLACK_PATH  = os.path.join(LEAFLET_DIR, "marker-icon-2x-black.png")
+LEAFLET_MARKER_GREY_PATH   = os.path.join(LEAFLET_DIR, "marker-icon-2x-grey.png")
+LEAFLET_MARKER_GOLD_PATH   = os.path.join(LEAFLET_DIR, "marker-icon-2x-gold.png")
 
 LEAFLET_RESOURCES_ABOUT_TITLE = "About Leaflet Resources and pointhi marker icons"
 LEAFLET_RESOURCES_ABOUT_TEXT = """Leaflet is an open-source JavaScript library for interactive maps.\n\nThis application uses:\n- Leaflet library (https://leafletjs.com/)\n- Colored map markers from https://github.com/pointhi/leaflet-color-markers\n\nDownloading these resources locally will:\n- Speed up application startup time\n- Enable offline map functionality\n- Reduce dependency on external CDN availability\n\nBy downloading, you agree to comply with the Leaflet license (BSD 2-Clause) and respective marker icon licenses."""
@@ -291,7 +299,7 @@ STOP_CAPTURE_BUTTON_TEXT = "Stop capturing live connections"
 
 max_connection_list_filo_buffer_size = 1000  # Maximum number of connection snapshots to keep in memory. The larger this value the more memory will be used. When the max size is reached the oldest connection snapshot will be removed from memory.
 show_tooltip = False # Show tooltips on map markers
-map_refresh_interval = 2000  # Map refresh time in milliseconds
+map_refresh_interval = 1000  # Map refresh time in milliseconds
 show_only_new_active_connections = False # Show only new connections in the table
 show_only_remote_connections = False # Hide local connections (ie 127.0.0.1 ::1)
 table_column_sort_index = -1  # Default column index to sort the table by the index
@@ -911,7 +919,7 @@ class TCPConnectionViewer(QMainWindow):
     #   blue   = new connections,   red    = suspect/C2,
     #   yellow = pinned marker,     gold   = too similar to yellow.
     # green is included but reserved as the default for the local server.
-    _AGENT_COLOR_PALETTE = ['green', 'orange', 'violet', 'black']
+    _AGENT_COLOR_PALETTE = ['green', 'gold', 'yellow', 'orange', 'violet', 'black', 'grey']
 
     def __init__(self):
         super().__init__()
@@ -955,8 +963,9 @@ class TCPConnectionViewer(QMainWindow):
         #   hostname, ip_addresses, lat, lng, connections (list of connection dicts)
         self._agent_cache = {}          # protected by _agent_cache_lock
         self._agent_cache_lock = threading.Lock()
-        self._agent_last_seen = {}      # hostname -> time.monotonic() of last POST
-        self._last_agent_count = 0      # number of agents collected in last cycle
+        self._agent_posted_since_last_cycle = set()  # hostnames that POSTed since last timer cycle (protected by _agent_cache_lock)
+        self._agent_inactive_strikes = {}  # hostname -> consecutive cycles without a POST
+        self._last_agent_count = 0
         self._flask_thread = None       # daemon thread running Flask
         self._werkzeug_server = None    # werkzeug BaseServer instance (stoppable)
         # Per-agent color assignment: hostname -> color name (e.g. 'violet')
@@ -1770,7 +1779,9 @@ class TCPConnectionViewer(QMainWindow):
 
                 # Update UI elements with loaded settings
                 map_refresh_interval_val = settings.get('map_refresh_interval', map_refresh_interval)
+                self.refresh_interval_combo_box.blockSignals(True)
                 self.refresh_interval_combo_box.setCurrentText(f"{map_refresh_interval_val}")
+                self.refresh_interval_combo_box.blockSignals(False)
 
                 self.only_show_new_connections.setChecked(show_only_new_active_connections)
                 self.only_show_remote_connections.setChecked(show_only_remote_connections)
@@ -1892,9 +1903,9 @@ class TCPConnectionViewer(QMainWindow):
             known_hosts.add(LOCAL_HOSTNAME)
             known_hosts = sorted(known_hosts)
 
-            # Active threshold: last POST within 2 full refresh cycles
-            active_threshold = (map_refresh_interval / 1000.0) * 2
-            now = time.monotonic()
+            # Threshold for marking an agent inactive (read-only — strikes are
+            # advanced in _collect_and_reset_agent_cache once per timer cycle).
+            AGENT_INACTIVE_PASSES = 4
 
             # --- Decide whether a full rebuild is needed ---
             current_rows = getattr(self, '_agent_mgmt_rows', None)
@@ -1985,11 +1996,8 @@ class TCPConnectionViewer(QMainWindow):
                     self.agent_mgmt_table.setCellWidget(row, 2, hide_btn)
 
                     # Column 3 — Is Active indicator
-                    last_seen = self._agent_last_seen.get(hostname)
-                    if last_seen is not None and (now - last_seen) <= active_threshold:
-                        active_text, active_color = "✔", "green"
-                    else:
-                        active_text, active_color = "✖", "red"
+                    is_active = self._agent_inactive_strikes.get(hostname, 0) < AGENT_INACTIVE_PASSES
+                    active_text, active_color = ("✔", "green") if is_active else ("✖", "red")
                     active_item = QTableWidgetItem(active_text)
                     active_item.setTextAlignment(Qt.AlignCenter)
                     active_item.setForeground(QColor(active_color))
@@ -2004,8 +2012,9 @@ class TCPConnectionViewer(QMainWindow):
                         def _on_clear():
                             self._agent_colors.pop(hn, None)
                             self._agent_hidden.pop(hn, None)
-                            self._agent_last_seen.pop(hn, None)
+                            self._agent_inactive_strikes.pop(hn, None)
                             with self._agent_cache_lock:
+                                self._agent_posted_since_last_cycle.discard(hn)
                                 self._agent_cache.pop(hn, None)
                             self.save_settings()
                             self._refresh_agent_management_table(force_rebuild=True)
@@ -2033,11 +2042,8 @@ class TCPConnectionViewer(QMainWindow):
                             hide_btn.setStyleSheet(new_style)
 
                     # Column 3 — Is Active indicator
-                    last_seen = self._agent_last_seen.get(hostname)
-                    if last_seen is not None and (now - last_seen) <= active_threshold:
-                        active_text, active_color = "✔", "green"
-                    else:
-                        active_text, active_color = "✖", "red"
+                    is_active = self._agent_inactive_strikes.get(hostname, 0) < AGENT_INACTIVE_PASSES
+                    active_text, active_color = ("✔", "green") if is_active else ("✖", "red")
                     active_item = self.agent_mgmt_table.item(row, 3)
                     if active_item is not None:
                         if active_item.text() != active_text:
@@ -2277,10 +2283,6 @@ class TCPConnectionViewer(QMainWindow):
             from werkzeug.serving import make_server as werkzeug_make_server
         except ImportError:
             logging.error("Flask is not installed. Install it with: pip install flask")
-            try:
-                self.status_label.setText("Server mode requires Flask (pip install flask)")
-            except Exception:
-                pass
             return
 
         # --- Pre-check: is the port available? -----------------------------------
@@ -2351,7 +2353,7 @@ class TCPConnectionViewer(QMainWindow):
                         "lng": loc_lng,
                         "connections": conns,
                     }
-                    viewer._agent_last_seen[hostname] = time.monotonic()
+                    viewer._agent_posted_since_last_cycle.add(hostname)
                 return jsonify({"status": "ok", "accepted": len(conns)}), 200
             except Exception as e:
                 logging.error(f"Error processing /submit_connections: {e}")
@@ -2474,7 +2476,20 @@ class TCPConnectionViewer(QMainWindow):
         """
         with self._agent_cache_lock:
             snapshot = dict(self._agent_cache)
+            # Atomically read and clear the posted-since-last-cycle set under the
+            # same lock the Flask POST handler uses, so there is no race.
+            posted_this_cycle = set(self._agent_posted_since_last_cycle)
+            self._agent_posted_since_last_cycle.clear()
         self._last_agent_count = len(snapshot)
+
+        # Advance inactive-strike counters once per timer cycle.
+        all_known = set(self._agent_inactive_strikes.keys()) | posted_this_cycle
+        for hostname in all_known:
+            if hostname in posted_this_cycle:
+                self._agent_inactive_strikes[hostname] = 0
+            else:
+                self._agent_inactive_strikes[hostname] = \
+                    self._agent_inactive_strikes.get(hostname, 0) + 1
 
         # If the agent management table exists, schedule a refresh every cycle
         # so that the "Is Active" column stays current.
@@ -2674,11 +2689,7 @@ class TCPConnectionViewer(QMainWindow):
                     for k, v in data.items():
                         ip_cache[str(k)] = v if v is None or isinstance(v, str) else str(v)
         except Exception:
-            # Fail silently (do not break startup). Optionally log to status_label if available.
-            try:
-                self.status_label.setText("Warning: failed to load ip_cache (continuing).")
-            except Exception:
-                pass
+            pass  # Fail silently — do not break startup
 
     def save_ip_cache(self):
         """
@@ -2711,11 +2722,8 @@ class TCPConnectionViewer(QMainWindow):
                 os.rename(tmp_file, cache_file)
 
         except Exception:
-            try:
-                self.status_label.setText("Warning: failed to save ip_cache.")
-            except Exception:
-                pass
-            
+            pass
+
     def reverse_dns(self, ips):
         """
         Fast, thread-safe reverse DNS with local caching.
@@ -3633,7 +3641,6 @@ class TCPConnectionViewer(QMainWindow):
         self.slider.setMaximum(self.connection_list_counter)
 
         self.timer.stop()
-        self.status_label.setText("Auto-refresh paused. Click 'Start Capture' to resume.")
 
         if value >= self.connection_list_counter:
             value = self.connection_list_counter
@@ -3979,10 +3986,7 @@ class TCPConnectionViewer(QMainWindow):
                         self.stop_capture_btn.setVisible(True)
                         # Start wave animation when capture resumes
                         self._start_stop_button_wave()
-                    if hasattr(self, 'status_label'):
-                        self.status_label.setText("Auto-refreshing connections.")
-
-            self.save_settings()
+                    self.save_settings()
 
         except ValueError as e:
             # Invalid input - show error and revert
@@ -4288,15 +4292,16 @@ class TCPConnectionViewer(QMainWindow):
 
             try:
                 self.toggle_action.setIcon(self._toggle_stop_icon)
+                self.toggle_action.setText("Replaying connections")
             except Exception:
                 pass
-
-            self.status_label.setText("Replaying connections.")
 
             # Start refresh timer or process here
             self.timer_replay_connections.start(map_refresh_interval)
 
-            self.start_capture_btn.setVisible(False)
+            self.start_capture_btn.setText(" ")
+            self.start_capture_btn.setIcon(self._toggle_play_icon)
+            self.start_capture_btn.setEnabled(False)
             self.stop_capture_btn.setVisible(False)
             # Stop wave animation when replay starts
             self._stop_stop_button_wave()
@@ -4306,14 +4311,15 @@ class TCPConnectionViewer(QMainWindow):
         else:
             try:
                 self.toggle_action.setIcon(self._toggle_play_icon)
+                self.toggle_action.setText("Replay connections")
             except Exception:
                 pass
 
-            self.status_label.setText("Connection replay paused.")
-
             # Stop refresh timer or process here
             self.timer_replay_connections.stop()
-            self.start_capture_btn.setVisible(True)
+            self.start_capture_btn.setText(START_CAPTURE_BUTTON_TEXT)
+            self.start_capture_btn.setIcon(QIcon())
+            self.start_capture_btn.setEnabled(True)
             self.stop_capture_btn.setVisible(False)
             # Stop wave animation when replay stops
             self._stop_stop_button_wave()
@@ -4372,7 +4378,6 @@ class TCPConnectionViewer(QMainWindow):
         self.stop_capture_btn.clicked.connect(self.stop_capture_connections)
         self.stop_capture_btn.setVisible(True)
         # Use monospace font to prevent text shifting during wave animation (all chars same width)
-        self.stop_capture_btn.setStyleSheet("font-family: 'Consolas', 'Courier New', monospace;")
         
         # Connection table
         self.connection_table = QTableWidget(0, BYTES_RECV_ROW_INDEX+1)
@@ -4482,6 +4487,7 @@ class TCPConnectionViewer(QMainWindow):
         self.map_objects = 0
         self.map_initialized = False
         self._map_reload_attempts = 0  # Track reload attempts to prevent infinite loops
+        self._map_loading_in_progress = False  # True while setHtml is in flight, prevents re-entry
 
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.setHandleWidth(6)
@@ -4490,7 +4496,7 @@ class TCPConnectionViewer(QMainWindow):
         self.controls_widget = QWidget()
         self.controls_layout = QVBoxLayout(self.controls_widget)
         self.controls_layout.setContentsMargins(0, 0, 0, 0)
-        self.controls_layout.setSpacing(6)
+        self.controls_layout.setSpacing(0)
 
         # Add control widgets to controls_layout (moved from right_layout)
         self.controls_layout.addWidget(self.start_capture_btn)
@@ -4513,21 +4519,17 @@ class TCPConnectionViewer(QMainWindow):
         self.toggle_action.setCheckable(True)
         self.toggle_action.toggled.connect(self.toggle_auto_refresh_replay_connections)
         self.toggle_button.setDefaultAction(self.toggle_action)
-        self.controls_layout.addWidget(self.toggle_button)      
+        # Fix toggle_button width so it doesn't jump when text changes
+        _fm = QFontMetrics(self.toggle_button.font())
+        _longest_text_w = _fm.horizontalAdvance("Replaying connections")
+        _icon_and_padding = self.toggle_button.iconSize().width() + 24
+        self.toggle_button.setMinimumWidth(_longest_text_w + _icon_and_padding)
+        self.controls_layout.addWidget(self.toggle_button)
 
-        self.refresh_interval_combo_box = QComboBox()
-        self.refresh_interval_combo_box.setToolTip("Select map refresh interval in milliseconds")
-        self.refresh_interval_combo_box.addItems(["2000", "5000", "10000", "20000", "30000", "40000", "50000", "120000", "300000", "600000", "1200000", "180000000"])
-        self.refresh_interval_combo_box.currentIndexChanged.connect(self.update_refresh_interval)
-        self.update_refresh_interval()
-        self.controls_layout.addWidget(self.refresh_interval_combo_box)
+        # Push all controls to the top; absorb remaining vertical space at the bottom
+        self.controls_layout.addStretch(1)
 
-        # Status label
-        self.status_label = QLabel("Auto-refreshing connections.")
-        self.status_label.setAlignment(Qt.AlignTop)
-        self.controls_layout.addWidget(self.status_label)
-
-        # Generate video button (shown only when screenshots exist)
+        # Generate video button
         self.generate_video_btn = QPushButton("Generate .mp4 video file")
         self.generate_video_btn.clicked.connect(self.generate_video_from_screenshots)
         self.generate_video_btn.setVisible(False)  # Hidden by default, shown when screenshots exist
@@ -4643,6 +4645,20 @@ class TCPConnectionViewer(QMainWindow):
         settings_title_label = QLabel("Application Settings")
         settings_title_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
         settings_tab_layout.addWidget(settings_title_label)
+
+        # Map refresh interval selector
+        refresh_interval_layout = QHBoxLayout()
+        refresh_interval_label = QLabel("Map refresh interval (ms):")
+        refresh_interval_label.setToolTip("How often the map and connection tables are refreshed")
+        refresh_interval_layout.addWidget(refresh_interval_label)
+
+        self.refresh_interval_combo_box = QComboBox()
+        self.refresh_interval_combo_box.setToolTip("Select map refresh interval in milliseconds")
+        self.refresh_interval_combo_box.addItems(["1000", "2000", "5000", "10000", "20000", "30000", "40000", "50000", "120000", "300000", "600000", "1200000", "180000000"])
+        self.refresh_interval_combo_box.currentIndexChanged.connect(self.update_refresh_interval)
+        refresh_interval_layout.addWidget(self.refresh_interval_combo_box)
+        refresh_interval_layout.addStretch()
+        settings_tab_layout.addLayout(refresh_interval_layout)
 
         # Reverse DNS checkbox
         self.reverse_dns_check = QCheckBox("Perform Reverse DNS Lookup on captured IPs")
@@ -5319,10 +5335,15 @@ class TCPConnectionViewer(QMainWindow):
             resources = [
                 (LEAFLET_CSS_PATH, LEAFLET_CSS_URL, "Leaflet CSS"),
                 (LEAFLET_JS_PATH, LEAFLET_JS_URL, "Leaflet JavaScript"),
-                (LEAFLET_MARKER_RED_PATH, LEAFLET_MARKER_RED_URL, "Red marker icon"),
-                (LEAFLET_MARKER_GREEN_PATH, LEAFLET_MARKER_GREEN_URL, "Green marker icon"),
-                (LEAFLET_MARKER_BLUE_PATH, LEAFLET_MARKER_BLUE_URL, "Blue marker icon"),
+                (LEAFLET_MARKER_RED_PATH,    LEAFLET_MARKER_RED_URL,    "Red marker icon"),
+                (LEAFLET_MARKER_GREEN_PATH,  LEAFLET_MARKER_GREEN_URL,  "Green marker icon"),
+                (LEAFLET_MARKER_BLUE_PATH,   LEAFLET_MARKER_BLUE_URL,   "Blue marker icon"),
                 (LEAFLET_MARKER_YELLOW_PATH, LEAFLET_MARKER_YELLOW_URL, "Yellow marker icon"),
+                (LEAFLET_MARKER_ORANGE_PATH, LEAFLET_MARKER_ORANGE_URL, "Orange marker icon"),
+                (LEAFLET_MARKER_VIOLET_PATH, LEAFLET_MARKER_VIOLET_URL, "Violet marker icon"),
+                (LEAFLET_MARKER_BLACK_PATH,  LEAFLET_MARKER_BLACK_URL,  "Black marker icon"),
+                (LEAFLET_MARKER_GREY_PATH,   LEAFLET_MARKER_GREY_URL,   "Grey marker icon"),
+                (LEAFLET_MARKER_GOLD_PATH,   LEAFLET_MARKER_GOLD_URL,   "Gold marker icon"),
             ]
 
             # Check which resources are missing
@@ -5826,10 +5847,6 @@ class TCPConnectionViewer(QMainWindow):
                     except Exception as e:
                         # Log error but don't reload to prevent infinite loop
                         logging.error(f"Failed to execute map update JS: {e}")
-                        try:
-                            self.status_label.setText("Map update failed. Try refreshing manually.")
-                        except Exception:
-                            pass
                 else:
                     # Decrement retries
                     retries_remaining[0] -= 1
@@ -5837,10 +5854,6 @@ class TCPConnectionViewer(QMainWindow):
                     if retries_remaining[0] <= 0:
                         # Give up - show error instead of reloading
                         logging.warning("Map initialization failed - updateConnections function not found (exhausted retries)")
-                        try:
-                            self.status_label.setText("Map failed to initialize. Check network connection or local resources.")
-                        except Exception:
-                            pass
                         # DON'T reload here - that causes infinite loop
                     else:
                         # schedule another existence check with same closure
@@ -5852,10 +5865,6 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             # Log error but don't reload to prevent infinite loop
             logging.error(f"Exception in _call_update_js: {e}")
-            try:
-                self.status_label.setText("Map error occurred.")
-            except Exception:
-                pass
 
     _PUBLIC_IP_TTL = 60  # seconds between external IP lookups
 
@@ -6094,13 +6103,14 @@ class TCPConnectionViewer(QMainWindow):
 
         # Check reload attempt limit to prevent infinite loops
         if not getattr(self, "map_initialized", False):
+            # If a load is already in flight, skip this call silently —
+            # the pending loadFinished handler will invoke the JS updater.
+            if getattr(self, "_map_loading_in_progress", False):
+                return
+
             # Prevent infinite reload loop
             if getattr(self, "_map_reload_attempts", 0) >= 3:
                 logging.error("Max map reload attempts (3) reached. Stopping to prevent infinite loop.")
-                try:
-                    self.status_label.setText("Map failed to load after 3 attempts. Try restarting the application.")
-                except Exception:
-                    pass
                 return
 
             try:
@@ -6193,7 +6203,7 @@ class TCPConnectionViewer(QMainWindow):
                        #traffic-histogram .th-digits .th-recv { color:#388e3c; }
                        #traffic-histogram .th-bars {
                            display:flex; flex-direction:column; align-items:stretch;
-                           gap:1px;
+                           width:100%; box-sizing:border-box; gap:1px;
                            background:rgba(255,255,255,0.65); border-radius:4px;
                            padding:2px;
                        }
@@ -7224,7 +7234,10 @@ class TCPConnectionViewer(QMainWindow):
                                             // Render horizontal bars (each row = one collection pass, newest first)
                                             var container = document.getElementById('th-bars');
                                             if (!container) return;
-                                            var barW = container.clientWidth || 112;
+                                            // Use the fixed outer wrapper width minus th-bars padding (2px each side)
+                                            // so barW never drifts as bars themselves change size.
+                                            var thWrapper = document.getElementById('traffic-histogram');
+                                            var barW = Math.max((thWrapper ? thWrapper.offsetWidth : 120) - 4, 20);
                                             var html = '';
                                             for (var j = 0; j < _thSentHistory.length; j++) {
                                                 var s = _thSentHistory[j];
@@ -7428,9 +7441,12 @@ class TCPConnectionViewer(QMainWindow):
                 html_with_path = html_with_path.replace('</head>', f'{map_state_js}</head>')
 
             # Use about:blank as base URL (doesn't block HTTPS requests)
+            self._map_loading_in_progress = True
             self.map_view.setHtml(html_with_path, QUrl("about:blank"))
 
             def _on_loaded(ok):
+                # Load is no longer in flight
+                self._map_loading_in_progress = False
                 # run update if the page loaded successfully
                 if ok:
                     try:
@@ -7458,10 +7474,6 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             # Log error but don't reload to prevent infinite loop
             logging.error(f"Exception when calling _call_update_js on initialized map: {e}")
-            try:
-                self.status_label.setText("Map update error occurred.")
-            except Exception:
-                pass
 
     @Slot()
     def replay_connections(self):
@@ -7488,7 +7500,6 @@ class TCPConnectionViewer(QMainWindow):
         if self.timer.isActive():
             self.timer.stop()
             self.start_capture_btn.setVisible(True)
-            self.status_label.setText("Auto-refresh paused. Click 'Start Capture' to resume.")
             self.stop_capture_btn.setVisible(False)
             self.toggle_button.setVisible(True)
             # Stop wave animation when capture stops
@@ -7506,16 +7517,12 @@ class TCPConnectionViewer(QMainWindow):
             if not self.timer.isActive():
                 self.timer.start(map_refresh_interval)
                 self.start_capture_btn.setVisible(False)
-                self.status_label.setText("")
                 self.toggle_button.setVisible(False)
                 self.stop_capture_btn.setVisible(True)
                 # Stop flashing when capture starts
                 self._stop_capture_button_flash()
                 # Start wave animation on stop button
                 self._start_stop_button_wave()
-
-        if self.timer_replay_connections.isActive():
-            self.status_label.setText("Replaying connections.")
 
         number_of_previous_objects = self.map_objects
 
@@ -7614,7 +7621,6 @@ class TCPConnectionViewer(QMainWindow):
                         self.connection_table.item(row, col).setForeground(Qt.red)
 
                     self.setStyleSheet("border: 2px solid red;") # Set window border to red
-                    self.status_label.setText("Warning: Suspect C2 connections detected!")
                 
                 connections_to_show_on_map.append(conn)
 
@@ -7747,7 +7753,6 @@ class TCPConnectionViewer(QMainWindow):
     @Slot(bool)
     def on_map_loaded(self, success):
         if not success:
-            self.status_label.setText("Error loading map")
             logging.error("Map failed to load!")
         else:
             logging.debug("Map page loaded successfully")
@@ -8624,6 +8629,9 @@ class TCPConnectionViewer(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    _app_font = QFont("Consolas")
+    _app_font.setStyleHint(QFont.StyleHint.Monospace)
+    app.setFont(_app_font)
     viewer = TCPConnectionViewer()
 
     # Allow Ctrl-C in the console to close the application.
