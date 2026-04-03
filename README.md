@@ -100,6 +100,7 @@ When --accept_eula is passed the databases will be downloaded automatically when
 Access to tile.openstreetmap.org is required to render the map so internet access is required to that site.
 When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img as well as https://unpkg.com/leaflet and will prompt you to cache them locally into /resources/leaflet/ in order to speed up next startup time.  You can also use the script download_resources.ps1 powershell script located in resources\leaflet directory  to download the below files independently.
 If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the `TILE_OPENSTREETMAP_SERVER` constant in `tcp_geo_map.py` (see the Settings section below for details).
+By default ipfy calls are made to resolve internet exit point. If you wish to turn it off uncheck the "Resolve public internet IP using ipfy.com" in the settings tab.
 
 # Map marker colors
 - Green icon - Connection that is available since the last refresh
