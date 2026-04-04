@@ -187,6 +187,14 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     ip_type = 'IPv4'
                 elif family == _socket.AF_INET6:
                     ip_type = 'IPv6'
+                    # Normalise IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+                    # so that keys match the pure-IPv4 addresses Scapy reports.
+                    if laddr_ip.startswith('::ffff:'):
+                        laddr_ip = laddr_ip[7:]
+                        ip_type = 'IPv4'
+                    if raddr_ip.startswith('::ffff:'):
+                        raddr_ip = raddr_ip[7:]
+                        ip_type = 'IPv4'
                 else:
                     ip_type = ''
 
