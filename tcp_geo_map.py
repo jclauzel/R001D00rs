@@ -37,7 +37,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.6.4" # Current script version
+VERSION = "3.6.5" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -3443,7 +3443,8 @@ class TCPConnectionViewer(QMainWindow):
                 datetime_text = getattr(self, '_last_datetime_text', '')
                 force_tooltip = show_tooltip
                 self.update_map(list(source), force_tooltip,
-                                stats_text=stats_line, datetime_text=datetime_text)
+                                stats_text=stats_line, datetime_text=datetime_text,
+                                skip_histogram=True)
                 return
 
             filtered = []
@@ -3486,7 +3487,8 @@ class TCPConnectionViewer(QMainWindow):
             datetime_text = getattr(self, '_last_datetime_text', '')
             force_tooltip = show_tooltip
             self.update_map(filtered, force_tooltip,
-                            stats_text=stats_line, datetime_text=datetime_text)
+                            stats_text=stats_line, datetime_text=datetime_text,
+                            skip_histogram=True)
         except Exception as e:
             logging.error(f"_update_map_with_filter error: {e}")
 
@@ -5905,7 +5907,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             return self._public_ip_cache or ""
 
-    def update_map(self, connection_data, force_show_tooltip=False, stats_text="", datetime_text=""):
+    def update_map(self, connection_data, force_show_tooltip=False, stats_text="", datetime_text="", skip_histogram=False):
         """
         Load map HTML once and afterwards update markers via injected JavaScript.
         Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
@@ -6100,15 +6102,22 @@ class TCPConnectionViewer(QMainWindow):
         # raw totals grow monotonically.  The histogram needs per-interval *deltas* to show
         # meaningful proportional bars; otherwise all bars converge toward the peak as the
         # cumulative values dwarf the inter-cycle differences.
-        total_bytes_sent = 0
-        total_bytes_recv = 0
-        for c in connection_data:
-            total_bytes_sent += c.get('bytes_sent', 0) or 0
-            total_bytes_recv += c.get('bytes_recv', 0) or 0
-        delta_sent = max(total_bytes_sent - self._prev_histogram_bytes_sent, 0)
-        delta_recv = max(total_bytes_recv - self._prev_histogram_bytes_recv, 0)
-        self._prev_histogram_bytes_sent = total_bytes_sent
-        self._prev_histogram_bytes_recv = total_bytes_recv
+        # skip_histogram is set for secondary calls (e.g. filter re-renders) that must not
+        # reset the prev-counters or push histogram data — only the primary timer-driven
+        # call should advance the histogram.
+        if skip_histogram:
+            delta_sent = 0
+            delta_recv = 0
+        else:
+            total_bytes_sent = 0
+            total_bytes_recv = 0
+            for c in connection_data:
+                total_bytes_sent += c.get('bytes_sent', 0) or 0
+                total_bytes_recv += c.get('bytes_recv', 0) or 0
+            delta_sent = max(total_bytes_sent - self._prev_histogram_bytes_sent, 0)
+            delta_recv = max(total_bytes_recv - self._prev_histogram_bytes_recv, 0)
+            self._prev_histogram_bytes_sent = total_bytes_sent
+            self._prev_histogram_bytes_recv = total_bytes_recv
 
         # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay,
         # agent status, traffic histogram AND pulse to JS in a single runJavaScript call.
@@ -6116,6 +6125,9 @@ class TCPConnectionViewer(QMainWindow):
         # that cause visible blinking between the map update and the overlay updates.
         # Each call is wrapped in its own try/catch so that a failure in one (e.g. updateConnections
         # throwing on bad data) does not prevent the subsequent status/overlay calls from executing.
+        histogram_js = '' if skip_histogram else (
+            f"try{{updateTrafficHistogram({delta_sent},{delta_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}};"
+        )
         js = (
             f"try{{updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}, {str(do_show_traffic_gauge).lower()}, {str(do_pulse_exit_points).lower()})}}catch(e){{console.error('updateConnections error',e)}};"
             f"try{{setStats({json.dumps(stats_text)})}}catch(e){{}};"
@@ -6124,7 +6136,7 @@ class TCPConnectionViewer(QMainWindow):
             f"try{{setModeIndicator({json.dumps(mode_indicator_text)})}}catch(e){{}};"
             f"try{{setRejectedOverlay({show_rejected})}}catch(e){{}};"
             f"try{{setAgentStatus({json.dumps(agent_status_text)})}}catch(e){{}};"
-            f"try{{updateTrafficHistogram({delta_sent},{delta_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}};"
+            f"{histogram_js}"
             f"try{{triggerPulse()}}catch(e){{}}"
         )
 
@@ -8679,7 +8691,7 @@ class TCPConnectionViewer(QMainWindow):
             }]
 
             if lat and lng:
-                self.update_map(focused_data)
+                self.update_map(focused_data, skip_histogram=True)
 
 def main():
     app = QApplication(sys.argv)
