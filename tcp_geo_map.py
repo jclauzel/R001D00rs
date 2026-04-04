@@ -37,7 +37,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.6.3" # Current script version
+VERSION = "3.6.4" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -5854,7 +5854,6 @@ class TCPConnectionViewer(QMainWindow):
                 if result:
                     try:
                         self.map_view.page().runJavaScript(js)
-                        self._pulse_map_indicator()
                         # Reset reload counter on successful call
                         try:
                             self._map_reload_attempts = 0
@@ -6111,7 +6110,10 @@ class TCPConnectionViewer(QMainWindow):
         self._prev_histogram_bytes_sent = total_bytes_sent
         self._prev_histogram_bytes_recv = total_bytes_recv
 
-        # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay, and agent status to JS.
+        # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay,
+        # agent status, traffic histogram AND pulse to JS in a single runJavaScript call.
+        # Batching everything into one evaluation avoids intermediate browser repaints
+        # that cause visible blinking between the map update and the overlay updates.
         # Each call is wrapped in its own try/catch so that a failure in one (e.g. updateConnections
         # throwing on bad data) does not prevent the subsequent status/overlay calls from executing.
         js = (
@@ -6122,7 +6124,8 @@ class TCPConnectionViewer(QMainWindow):
             f"try{{setModeIndicator({json.dumps(mode_indicator_text)})}}catch(e){{}};"
             f"try{{setRejectedOverlay({show_rejected})}}catch(e){{}};"
             f"try{{setAgentStatus({json.dumps(agent_status_text)})}}catch(e){{}};"
-            f"try{{updateTrafficHistogram({delta_sent},{delta_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}}"
+            f"try{{updateTrafficHistogram({delta_sent},{delta_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}};"
+            f"try{{triggerPulse()}}catch(e){{}}"
         )
 
         # Check reload attempt limit to prevent infinite loops
@@ -6672,6 +6675,7 @@ class TCPConnectionViewer(QMainWindow):
                                     var _markerMap = {};
                                     // Separate array for polylines (cheap to rebuild each cycle)
                                     var _liveLines = [];
+                                    var _liveLinesFP = '';  // fingerprint of last polyline set; skip rebuild when unchanged
 
                                     // Helper: format byte count to human-readable string
                                     function _formatBytes(bytes) {
@@ -6743,6 +6747,7 @@ class TCPConnectionViewer(QMainWindow):
                                                 try { map.removeLayer(_liveLines[j]); } catch(e) {}
                                             }
                                             _liveLines = [];
+                                            _liveLinesFP = '';
                                             return;
                                         }
 
@@ -6781,12 +6786,7 @@ class TCPConnectionViewer(QMainWindow):
                                         });
                                         window._removingMarkers = false;
 
-                                        // --- Phase 3: Remove old polylines (cheap, rebuild below) ---
-                                        for (var li = 0; li < _liveLines.length; li++) {
-                                            try { map.removeLayer(_liveLines[li]); } catch(e) {}
-                                        }
-                                        _liveLines = [];
-
+                                        // --- Phase 3: Defer polyline removal (see Phase 5) ---
                                         // Also clear any legacy liveMarkers that were polylines from before the diff upgrade
                                         for (var lmi = 0; lmi < liveMarkers.length; lmi++) {
                                             try { map.removeLayer(liveMarkers[lmi]); } catch(e) {}
@@ -6938,11 +6938,7 @@ class TCPConnectionViewer(QMainWindow):
                                                         try { m.bindPopup(_buildPopupHtml(conn), {autoClose: false, closeOnClick: false}); } catch(e2) {}
                                                     }
 
-                                                    // Update gauge marker
-                                                    if (existing.gaugeMarker) {
-                                                        try { map.removeLayer(existing.gaugeMarker); } catch(e) {}
-                                                        existing.gaugeMarker = null;
-                                                    }
+                                                    // Update gauge marker in-place (setIcon avoids remove+add blink)
                                                     var bSent = conn.bytes_sent || 0;
                                                     var bRecv = conn.bytes_recv || 0;
                                                     if (showGauge && (bSent > 0 || bRecv > 0)) {
@@ -6959,9 +6955,16 @@ class TCPConnectionViewer(QMainWindow):
                                                             className: 'traffic-gauge-icon', html: gaugeHtml,
                                                             iconSize: [12, gaugeHeight + 2], iconAnchor: [-8, gaugeHeight]
                                                         });
-                                                        existing.gaugeMarker = L.marker([conn.lat, conn.lng], {
-                                                            icon: gaugeIcon, interactive: false, pane: 'gaugePane'
-                                                        }).addTo(map);
+                                                        if (existing.gaugeMarker) {
+                                                            existing.gaugeMarker.setIcon(gaugeIcon);
+                                                        } else {
+                                                            existing.gaugeMarker = L.marker([conn.lat, conn.lng], {
+                                                                icon: gaugeIcon, interactive: false, pane: 'gaugePane'
+                                                            }).addTo(map);
+                                                        }
+                                                    } else if (existing.gaugeMarker) {
+                                                        try { map.removeLayer(existing.gaugeMarker); } catch(e) {}
+                                                        existing.gaugeMarker = null;
                                                     }
 
                                                     // Handle autoPopup for pinned connection
@@ -7067,38 +7070,60 @@ class TCPConnectionViewer(QMainWindow):
                                             }
                                         });
 
-                                        // --- Phase 5: Draw lines (always rebuilt — cheap, no visual blink) ---
+                                        // --- Phase 5: Draw lines only when endpoints change ---
+                                        // Build a fingerprint of the line endpoints so we can skip
+                                        // the expensive remove-all / add-all cycle when nothing moved.
+                                        var newFP = '';
                                         if (drawLines) {
-                                            if (publicIpCoords && serverMarkerCoords.length > 0) {
-                                                serverMarkerCoords.forEach(function(markerCoords) {
-                                                    var polyline = L.polyline([publicIpCoords, markerCoords], {
-                                                        color: 'blue', weight: 2, opacity: 0.6, dashArray: '5, 10'
-                                                    }).addTo(map);
-                                                    _liveLines.push(polyline);
-                                                });
-                                            }
-                                            Object.keys(agentOriginCoords).forEach(function(hostname) {
-                                                var originCoords = agentOriginCoords[hostname];
-                                                var lineColor = agentOriginColors[hostname] || 'orange';
-                                                var markers = agentMarkerCoords[hostname] || [];
-                                                markers.forEach(function(markerCoords) {
-                                                    var polyline = L.polyline([originCoords, markerCoords], {
-                                                        color: lineColor, weight: 2, opacity: 0.6, dashArray: '5, 10'
-                                                    }).addTo(map);
-                                                    _liveLines.push(polyline);
-                                                });
+                                            var fpParts = [];
+                                            if (publicIpCoords) fpParts.push('P' + publicIpCoords[0] + ',' + publicIpCoords[1]);
+                                            serverMarkerCoords.forEach(function(c) { fpParts.push('S' + c[0] + ',' + c[1]); });
+                                            Object.keys(agentOriginCoords).sort().forEach(function(h) {
+                                                var o = agentOriginCoords[h];
+                                                fpParts.push('A' + h + ':' + o[0] + ',' + o[1]);
+                                                (agentMarkerCoords[h] || []).forEach(function(c) { fpParts.push('M' + h + ':' + c[0] + ',' + c[1]); });
                                             });
-                                            if (publicIpCoords) {
-                                                Object.keys(agentMarkerCoords).forEach(function(hostname) {
-                                                    if (!agentOriginCoords[hostname]) {
-                                                        agentMarkerCoords[hostname].forEach(function(markerCoords) {
-                                                            var polyline = L.polyline([publicIpCoords, markerCoords], {
-                                                                color: 'gray', weight: 1, opacity: 0.4, dashArray: '3, 8'
-                                                            }).addTo(map);
-                                                            _liveLines.push(polyline);
-                                                        });
-                                                    }
+                                            newFP = fpParts.join('|');
+                                        }
+                                        if (newFP !== _liveLinesFP) {
+                                            // Fingerprint changed — tear down old lines and rebuild
+                                            for (var li = 0; li < _liveLines.length; li++) {
+                                                try { map.removeLayer(_liveLines[li]); } catch(e) {}
+                                            }
+                                            _liveLines = [];
+                                            _liveLinesFP = newFP;
+                                            if (drawLines) {
+                                                if (publicIpCoords && serverMarkerCoords.length > 0) {
+                                                    serverMarkerCoords.forEach(function(markerCoords) {
+                                                        var polyline = L.polyline([publicIpCoords, markerCoords], {
+                                                            color: 'blue', weight: 2, opacity: 0.6, dashArray: '5, 10'
+                                                        }).addTo(map);
+                                                        _liveLines.push(polyline);
+                                                    });
+                                                }
+                                                Object.keys(agentOriginCoords).forEach(function(hostname) {
+                                                    var originCoords = agentOriginCoords[hostname];
+                                                    var lineColor = agentOriginColors[hostname] || 'orange';
+                                                    var markers = agentMarkerCoords[hostname] || [];
+                                                    markers.forEach(function(markerCoords) {
+                                                        var polyline = L.polyline([originCoords, markerCoords], {
+                                                            color: lineColor, weight: 2, opacity: 0.6, dashArray: '5, 10'
+                                                        }).addTo(map);
+                                                        _liveLines.push(polyline);
+                                                    });
                                                 });
+                                                if (publicIpCoords) {
+                                                    Object.keys(agentMarkerCoords).forEach(function(hostname) {
+                                                        if (!agentOriginCoords[hostname]) {
+                                                            agentMarkerCoords[hostname].forEach(function(markerCoords) {
+                                                                var polyline = L.polyline([publicIpCoords, markerCoords], {
+                                                                    color: 'gray', weight: 1, opacity: 0.4, dashArray: '3, 8'
+                                                                }).addTo(map);
+                                                                _liveLines.push(polyline);
+                                                            });
+                                                        }
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -7657,10 +7682,15 @@ class TCPConnectionViewer(QMainWindow):
                     # Only override non-suspect connections (red stays red)
                     if conn['icon'] != 'redIcon':
                         conn['icon'] = 'yellowIcon'
-                    # Re-open popup only if user hasn't manually closed it
+                    # Auto-open popup only once (the first refresh after pinning).
+                    # After the JS side has opened the popup the user owns it:
+                    # closing via X must stay closed until the next explicit pin.
                     if self._pinned_popup_open:
                         conn['autoPopup'] = True
                         conn['popupGeneration'] = self._pinned_popup_generation
+                        # Consume the flag so subsequent timer refreshes do not
+                        # force-reopen the popup the user just closed.
+                        self._pinned_popup_open = False
                     break
 
         # Apply foreground / z-layer icon remapping.
