@@ -90,7 +90,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         self._local_addrs_time: float = 0.0
         self._LOCAL_ADDRS_TTL = 2.0  # seconds – detect VPN/NIC changes quickly
 
-    _PID_CACHE_TTL = 2.0  # seconds between psutil connection-table refreshes
+    _PID_CACHE_TTL = 1.0  # seconds between psutil connection-table refreshes
 
     # ---- public API ---------------------------------------------------------
 
@@ -120,6 +120,9 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
 
         # 2. Overlay traffic byte counters from the sniffer cache
         #    and collect sniffer-only entries for step 4.
+        #    Also back-fill PID/process on OS-table entries that the OS
+        #    reported as "Unknown" — the sniffer may have captured the PID
+        #    while the connection was still alive.
         now = time.monotonic()
         matched = 0
         sniffer_only: dict = {}
@@ -136,6 +139,14 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     conn['bytes_sent'] = traffic.get('bytes_sent', 0)
                     conn['bytes_recv'] = traffic.get('bytes_recv', 0)
                     matched += 1
+                    # Back-fill PID/process from the sniffer cache when
+                    # the OS table couldn't resolve them.
+                    cached_proc = traffic.get('process', '')
+                    if cached_proc and conn.get('process', '') in ('Unknown', ''):
+                        conn['process'] = cached_proc
+                        cached_pid = traffic.get('pid', '')
+                        if cached_pid:
+                            conn['pid'] = cached_pid
 
             # 3. Evict traffic entries for connections no longer in the OS table.
             #    _CONN_TIMEOUT controls how long dead entries linger.
@@ -151,6 +162,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             # 4. Gather sniffer-observed connections NOT in the OS table.
             #    These are short-lived flows that closed before netstat/ss
             #    ran, or connections the OS table snapshot missed.
+            #    Copy the cached PID/process so step 5 can use them.
             for key, t in self._traffic.items():
                 if key in os_conns:
                     continue
@@ -164,13 +176,20 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                 sniffer_only[key] = {
                     'bytes_sent': t.get('bytes_sent', 0),
                     'bytes_recv': t.get('bytes_recv', 0),
+                    'pid': t.get('pid', ''),
+                    'process': t.get('process', ''),
                 }
 
         # 5. Enrich sniffer-only connections (outside the lock to avoid
         #    blocking the sniffer thread during PID lookups).
+        #    Prefer PID/process captured at sniff-time (the connection
+        #    was still alive then); fall back to a live lookup.
         for key, tinfo in sniffer_only.items():
             src, sp, dst, dp, proto = key
-            pid_str, proc_name = self._lookup_pid(sp, proto)
+            pid_str = tinfo.get('pid', '')
+            proc_name = tinfo.get('process', '')
+            if not proc_name:
+                pid_str, proc_name = self._lookup_pid(sp, proto)
             ip_type = 'IPv6' if ':' in src else 'IPv4'
             os_conns[key] = {
                 'process': proc_name or 'Unknown',
@@ -391,6 +410,13 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             src_is_local = src in self._local_addrs
             dst_is_local = dst in self._local_addrs
 
+            # PID/process resolved during direction detection (fallback) or
+            # on-demand for new connections.  Stored in the traffic cache so
+            # that sniffer-only entries keep the info after the connection
+            # leaves the OS table.
+            pid_str = ''
+            proc_name = ''
+
             if src_is_local and not dst_is_local:
                 # Outbound packet: src is local
                 local_ip, local_port, remote_ip, remote_port = src, sport, dst, dport
@@ -402,8 +428,8 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             else:
                 # Both local (loopback) or both non-local (forwarded):
                 # fall back to PID-cache heuristic
-                _, _src_proc = self._lookup_pid(sport, protocol)
-                if _src_proc:
+                pid_str, proc_name = self._lookup_pid(sport, protocol)
+                if proc_name:
                     local_ip, local_port, remote_ip, remote_port = src, sport, dst, dport
                     is_outbound = True
                 else:
@@ -412,6 +438,13 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
 
             # Canonical key: always (local, lport, remote, rport, proto)
             key = (local_ip, local_port, remote_ip, remote_port, protocol)
+
+            # --- PID lookup for new connections --------------------------------
+            # Do this *before* acquiring the traffic lock so the sniffer
+            # thread isn't blocked while psutil runs.  The lock-free
+            # membership test is just a hint — we re-check under the lock.
+            if key not in self._traffic and not proc_name:
+                pid_str, proc_name = self._lookup_pid(local_port, protocol)
 
             # --- Byte accounting ---------------------------------------------
             try:
@@ -428,11 +461,17 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     else:
                         existing['bytes_recv'] = existing.get('bytes_recv', 0) + pkt_bytes
                     existing['last_seen'] = now
+                    # Back-fill PID if we resolved one and the entry lacks it
+                    if proc_name and not existing.get('process'):
+                        existing['pid'] = pid_str
+                        existing['process'] = proc_name
                 else:
                     self._traffic[key] = {
                         'bytes_sent': pkt_bytes if is_outbound else 0,
                         'bytes_recv': pkt_bytes if not is_outbound else 0,
                         'last_seen': now,
+                        'pid': pid_str,
+                        'process': proc_name,
                     }
 
         stop_fn = lambda _pkt: self._stop_event.is_set()
