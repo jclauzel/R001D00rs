@@ -3,18 +3,23 @@ Live packet capture connection collector plugin using Scapy's ``sniff()``.
 
 Cross-platform: works on Windows (with or without Npcap), macOS, and Linux.
 
-This plugin runs a background sniffer thread that captures TCP and UDP
-packets in real time.  Each call to ``collect_raw_connections()`` returns
-the **union** of:
-  * Connections observed by the packet sniffer (with byte-level sent/recv
-    accounting) — these cover any connection with active traffic.
-  * All ESTABLISHED TCP and active UDP connections from the OS connection
-    table (via psutil) — these cover idle connections that have no recent
-    packet flow (keep-alive, database pools, SSH sessions, etc.).
+Architecture (OS-table-first):
+    Every call to ``collect_raw_connections()`` starts from the **live OS
+    connection table** (via ``netstat``/``ss``), exactly like the built-in
+    psutil collector.  A background Scapy sniffer thread accumulates
+    per-connection byte counters (sent/recv) which are overlaid on the
+    OS-table entries when a match is found.
 
-The merge ensures the Scapy collector shows *at least* as many connections
-as the pure psutil collector, while adding byte-accounting for those with
-active packet traffic.
+    Connections that exist in the OS table but have had no captured traffic
+    are still returned — with ``bytes_sent`` / ``bytes_recv`` = 0.  This
+    guarantees the Scapy collector shows *at least* as many connections as
+    the psutil collector while adding real-time traffic accounting.
+
+    The traffic cache (``_traffic``) only holds byte counters and a
+    ``last_seen`` timestamp.  ``_CONN_TIMEOUT`` controls how long byte
+    counters are retained after a connection disappears from the OS table;
+    set to 0 to disable the cache entirely (connections get fresh zero
+    counters every refresh cycle).
 
 Windows without Npcap:
     Scapy automatically falls back to its Layer 3 socket (conf.L3socket)
@@ -44,6 +49,7 @@ except ImportError:
     _psutil = None
 
 from connection_collector_plugin import ConnectionCollectorPlugin
+from plugins.os_conn_table import get_os_connections as _get_os_table
 
 
 class ScapyLiveCollector(ConnectionCollectorPlugin):
@@ -67,8 +73,11 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
     def __init__(self):
         super().__init__()
         self._lock = threading.Lock()
-        # Now each value is a dict with connection info + 'last_seen'
-        self._connections: dict = {}
+        # Traffic cache: key → {bytes_sent, bytes_recv, last_seen}
+        # Only holds byte counters — the *connection list* comes from the
+        # OS table on every call.  Set _CONN_TIMEOUT = 0 to disable
+        # caching entirely (counters are discarded every cycle).
+        self._traffic: dict = {}
         self._sniffer_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._started = False
@@ -76,169 +85,72 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         self._pid_cache: dict = {}
         self._pid_cache_time: float = 0.0
         self._pid_cache_lock = threading.Lock()
-        self._CONN_TIMEOUT = 30  # seconds before checking OS table for liveness
-        self._local_addrs: set = set()  # populated once at start
+        self._CONN_TIMEOUT = 10  # seconds to retain byte counters after a connection leaves the OS table
+        self._local_addrs: set = set()
         self._local_addrs_time: float = 0.0
+        self._LOCAL_ADDRS_TTL = 2.0  # seconds – detect VPN/NIC changes quickly
 
     _PID_CACHE_TTL = 2.0  # seconds between psutil connection-table refreshes
 
     # ---- public API ---------------------------------------------------------
 
     def collect_raw_connections(self) -> list:
-        """Return the union of Scapy-captured connections and the OS table.
+        """Return the live OS connection table supplemented with traffic bytes.
 
-        Scapy captures provide byte accounting (sent/recv) for connections
-        with active packet flow.  The OS connection table (via psutil)
-        provides the full set of established connections including idle ones.
+        The connection *list* is always driven by the OS table (``netstat``
+        / ``ss``).  The background Scapy sniffer provides byte-level
+        sent/recv counters that are overlaid on matching entries.
 
-        The merge strategy:
-        1. Scapy-captured entries are kept as long as they remain in the OS
-           table *or* have had recent packet activity.
-        2. Any OS-table connection that Scapy has not (yet) captured is
-           included as a baseline entry with zero byte counters — this
-           ensures the Scapy collector shows at least as many connections
-           as the pure psutil collector.
-        3. Scapy entries that have timed out AND are gone from the OS table
-           are evicted.
+        Connections with no captured traffic still appear — with
+        ``bytes_sent`` / ``bytes_recv`` = 0 — exactly like the psutil
+        collector but with traffic accounting when available.
         """
         if not self._started:
             self._start_sniffer()
 
-        # Fetch the full OS connection table: keyed dict + flat set for lookups
-        os_conns, os_alive = self._get_os_connections()
+        # 1. Authoritative connection list from the OS table
+        os_conns, os_alive = _get_os_table(self._hostname)
 
+        # 2. Overlay traffic byte counters from the sniffer cache
         now = time.monotonic()
+        matched = 0
         with self._lock:
-            # Evict stale Scapy entries no longer in the OS table
-            to_remove = []
-            for key, conn in self._connections.items():
-                if now - conn.get('last_seen', 0) > self._CONN_TIMEOUT:
-                    if not self._is_alive_in_os(key, os_alive):
-                        to_remove.append(key)
-            for key in to_remove:
-                del self._connections[key]
+            traffic_count = len(self._traffic)
 
-            # Build the snapshot: start with all Scapy-tracked connections
-            snapshot_keys = set(self._connections.keys())
-            snapshot = [dict(conn) for conn in self._connections.values()]
+            for key, conn in os_conns.items():
+                traffic = self._traffic.get(key)
+                if not traffic:
+                    # Try reverse key (sniffer might have stored it flipped)
+                    src, sp, dst, dp, proto = key
+                    traffic = self._traffic.get((dst, dp, src, sp, proto))
+                if traffic:
+                    conn['bytes_sent'] = traffic.get('bytes_sent', 0)
+                    conn['bytes_recv'] = traffic.get('bytes_recv', 0)
+                    matched += 1
 
-        # Supplement with OS-table connections that Scapy hasn't captured.
-        # These are idle/established connections with no recent packet flow.
-        for os_key, os_conn in os_conns.items():
-            if os_key not in snapshot_keys:
-                snapshot.append(os_conn)
+            # 3. Evict traffic entries for connections no longer in the OS table.
+            #    _CONN_TIMEOUT controls how long dead entries linger.
+            #    Live connections always keep their byte counters.
+            to_remove = [
+                k for k, t in self._traffic.items()
+                if not self._is_alive_in_os(k, os_alive)
+                and (now - t.get('last_seen', 0)) > self._CONN_TIMEOUT
+            ]
+            for k in to_remove:
+                del self._traffic[k]
 
-        return snapshot
+        logging.debug(
+            f"ScapyLiveCollector: os_conns={len(os_conns)}, "
+            f"traffic={traffic_count}, matched={matched}"
+        )
 
-    # ---- OS connection table helpers ----------------------------------------
+        return list(os_conns.values())
 
-    def _refresh_local_addrs(self):
-        """Cache the set of local IP addresses for direction detection."""
-        if _psutil is None:
-            return
-        now = time.monotonic()
-        if now - self._local_addrs_time < 30.0 and self._local_addrs:
-            return  # still fresh
-        addrs = set()
-        try:
-            for _iface, snics in _psutil.net_if_addrs().items():
-                for snic in snics:
-                    if snic.address:
-                        addrs.add(snic.address)
-        except Exception:
-            pass
-        addrs.update(('127.0.0.1', '::1', '0.0.0.0', '::'))
-        self._local_addrs = addrs
-        self._local_addrs_time = now
+    # ---- OS table liveness check --------------------------------------------
 
-    def _get_os_connections(self) -> tuple:
-        """Return ``(os_conns_dict, os_alive_set)`` from the OS connection table.
-
-        ``os_conns_dict`` maps canonical keys to full connection dicts (same
-        schema as Scapy-captured entries but with zero byte counters).
-        ``os_alive_set`` is the flat set of keys for fast membership tests.
-        """
-        if _psutil is None:
-            return {}, set()
-        os_conns: dict = {}
-        os_alive: set = set()
-        try:
-            for c in _psutil.net_connections(kind='inet'):
-                if c.type == _socket.SOCK_STREAM:
-                    if c.status != 'ESTABLISHED':
-                        continue
-                    proto = 'TCP'
-                elif c.type == _socket.SOCK_DGRAM:
-                    proto = 'UDP'
-                else:
-                    continue
-                if not c.laddr:
-                    continue
-                laddr_ip = c.laddr.ip
-                laddr_port = str(c.laddr.port)
-                if c.raddr and c.raddr.ip and c.raddr.ip not in ('0.0.0.0', '::', '*', ''):
-                    raddr_ip = c.raddr.ip
-                    raddr_port = str(c.raddr.port)
-                else:
-                    continue  # no remote — skip
-
-                family = getattr(c, 'family', None)
-                if family == _socket.AF_INET:
-                    ip_type = 'IPv4'
-                elif family == _socket.AF_INET6:
-                    ip_type = 'IPv6'
-                    # Normalise IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
-                    # so that keys match the pure-IPv4 addresses Scapy reports.
-                    if laddr_ip.startswith('::ffff:'):
-                        laddr_ip = laddr_ip[7:]
-                        ip_type = 'IPv4'
-                    if raddr_ip.startswith('::ffff:'):
-                        raddr_ip = raddr_ip[7:]
-                        ip_type = 'IPv4'
-                else:
-                    ip_type = ''
-
-                key = (laddr_ip, laddr_port, raddr_ip, raddr_port, proto)
-                os_alive.add(key)
-
-                # Build a full connection dict for supplementation
-                if key not in os_conns:
-                    pid = c.pid
-                    pid_str = str(pid) if pid else ''
-                    proc_name = ''
-                    if pid:
-                        try:
-                            proc_name = _psutil.Process(pid).name()
-                        except (_psutil.NoSuchProcess, _psutil.AccessDenied):
-                            proc_name = ''
-                    if not proc_name:
-                        proc_name = 'Unknown'
-
-                    os_conns[key] = {
-                        'process': proc_name,
-                        'pid': pid_str,
-                        'protocol': proto,
-                        'local': laddr_ip,
-                        'localport': laddr_port,
-                        'remote': raddr_ip,
-                        'remoteport': raddr_port,
-                        'ip_type': ip_type,
-                        'hostname': self._hostname,
-                        'bytes_sent': 0,
-                        'bytes_recv': 0,
-                    }
-        except Exception as e:
-            logging.debug(f"ScapyLiveCollector: OS connections error: {e}")
-        return os_conns, os_alive
-
-    def _is_alive_in_os(self, key: tuple, os_alive: set) -> bool:
-        """Check whether the Scapy-tracked connection *key* still appears in
-        the OS connection table.
-
-        Keys are canonical ``(local, lport, remote, rport, proto)`` but the
-        OS may report the local address differently (e.g. ``0.0.0.0`` vs the
-        specific NIC IP), so we check both orientations.
-        """
+    @staticmethod
+    def _is_alive_in_os(key: tuple, os_alive: set) -> bool:
+        """Check whether *key* (either orientation) is in *os_alive*."""
         src, sport, dst, dport, proto = key
         if (src, sport, dst, dport, proto) in os_alive:
             return True
@@ -307,6 +219,41 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             return str(pid), name or str(pid)
         return '', ''
 
+    # ---- local address detection --------------------------------------------
+
+    def _refresh_local_addrs(self):
+        """Cache the set of local IP addresses for direction detection.
+
+        When the address set changes (e.g. VPN on/off), the traffic cache
+        is flushed because cached entries had direction (local vs remote)
+        decided with the old address set and byte counters may be on the
+        wrong side.
+        """
+        if _psutil is None:
+            return
+        now = time.monotonic()
+        if now - self._local_addrs_time < self._LOCAL_ADDRS_TTL and self._local_addrs:
+            return  # still fresh
+        addrs = set()
+        try:
+            for _iface, snics in _psutil.net_if_addrs().items():
+                for snic in snics:
+                    if snic.address:
+                        addrs.add(snic.address)
+        except Exception:
+            pass
+        addrs.update(('127.0.0.1', '::1', '0.0.0.0', '::'))
+        old_addrs = self._local_addrs
+        self._local_addrs = addrs
+        self._local_addrs_time = now
+        if old_addrs and addrs != old_addrs:
+            logging.info(
+                "ScapyLiveCollector: local addresses changed "
+                "(VPN/NIC toggle detected) — flushing traffic cache"
+            )
+            with self._lock:
+                self._traffic.clear()
+
     # ---- background sniffer -------------------------------------------------
 
     def _start_sniffer(self):
@@ -337,8 +284,12 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             )
             return
 
+        _pkt_count = [0]  # mutable counter for closure
+
         def _process_packet(pkt):
             """Callback invoked for every captured packet."""
+            _pkt_count[0] += 1
+
             if self._stop_event.is_set():
                 return
 
@@ -414,13 +365,6 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             # Canonical key: always (local, lport, remote, rport, proto)
             key = (local_ip, local_port, remote_ip, remote_port, protocol)
 
-            # Correlate with the OS connection table via psutil.
-            pid_str, proc_name = self._lookup_pid(local_port, protocol)
-            if not pid_str:
-                pid_str, proc_name = self._lookup_pid(remote_port, protocol)
-            if not proc_name:
-                proc_name = 'capture'
-
             # --- Byte accounting ---------------------------------------------
             try:
                 pkt_bytes = int(ip_layer.len)
@@ -428,7 +372,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                 pkt_bytes = len(pkt)
 
             with self._lock:
-                existing = self._connections.get(key)
+                existing = self._traffic.get(key)
                 now = time.monotonic()
                 if existing:
                     if is_outbound:
@@ -436,36 +380,46 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     else:
                         existing['bytes_recv'] = existing.get('bytes_recv', 0) + pkt_bytes
                     existing['last_seen'] = now
-                    # Update PID/process if we got a better match
-                    if pid_str and not existing.get('pid'):
-                        existing['pid'] = pid_str
-                        existing['process'] = proc_name
                 else:
-                    conn = {
-                        'process': proc_name,
-                        'pid': pid_str,
-                        'protocol': protocol,
-                        'local': local_ip,
-                        'localport': local_port,
-                        'remote': remote_ip,
-                        'remoteport': remote_port,
-                        'ip_type': ip_type,
-                        'hostname': self._hostname,
+                    self._traffic[key] = {
                         'bytes_sent': pkt_bytes if is_outbound else 0,
                         'bytes_recv': pkt_bytes if not is_outbound else 0,
                         'last_seen': now,
                     }
-                    self._connections[key] = conn
 
         stop_fn = lambda _pkt: self._stop_event.is_set()
 
+        def _get_all_ifaces():
+            """Return a list of all available Scapy interfaces.
+
+            On Windows, Scapy's default ``conf.iface`` may point to a
+            disconnected adapter (e.g. Wi-Fi with an APIPA address) while
+            the real traffic flows over Ethernet or another NIC.  Passing
+            ``iface=get_if_list()`` to ``sniff()`` makes it listen on
+            **every** interface simultaneously, guaranteeing we capture
+            traffic regardless of which adapter is active.
+            """
+            try:
+                from scapy.all import get_if_list as _gif
+                ifaces = _gif()
+                if ifaces:
+                    return ifaces
+            except Exception:
+                pass
+            return None  # let sniff() use its default
+
         def _run_sniff(l2socket=None):
+            ifaces = _get_all_ifaces()
             kwargs = dict(
                 prn=_process_packet,
                 store=0,
                 stop_filter=stop_fn,
             )
-            kwargs.pop('type', None)   # ignore if present
+            if ifaces is not None:
+                kwargs['iface'] = ifaces
+                logging.debug(
+                    f"ScapyLiveCollector: sniffing on {len(ifaces)} interfaces"
+                )
 
             if l2socket is not None:
                 kwargs['L2socket'] = l2socket
@@ -473,27 +427,42 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
 
         try:
             # --- Attempt 1: default (Layer 2, requires Npcap on Windows) ----
+            logging.info("ScapyLiveCollector: attempting L2 sniff...")
             _run_sniff()
+            logging.info(
+                f"ScapyLiveCollector: L2 sniff() returned normally "
+                f"(captured {_pkt_count[0]} packets)"
+            )
 
         except (OSError, ImportError) as e:
             msg = str(e).lower()
+            logging.warning(
+                f"ScapyLiveCollector: L2 sniff raised {type(e).__name__}: {e}"
+            )
             if "winpcap" in msg or "layer 2" in msg or "not available" in msg or "npcap" in msg:
                 # --- Attempt 2: Layer 3 fallback (no Npcap needed) -----------
-                logging.warning(
-                    "Scapy Layer 2 unavailable (Npcap not installed). "
-                    "Falling back to Layer 3 socket — install Npcap for full capture."
+                logging.info(
+                    "ScapyLiveCollector: falling back to L3 socket "
+                    f"({conf.L3socket})..."
                 )
                 try:
                     _run_sniff(l2socket=conf.L3socket)
+                    logging.info(
+                        f"ScapyLiveCollector: L3 sniff() returned normally "
+                        f"(captured {_pkt_count[0]} packets)"
+                    )
                 except PermissionError:
                     logging.error(
                         "Scapy live capture requires elevated privileges "
                         "(run as Administrator / root)"
                     )
                 except Exception as e2:
-                    logging.error(f"Scapy L3 fallback sniffer error: {e2}")
+                    logging.error(
+                        f"ScapyLiveCollector: L3 fallback error: "
+                        f"{type(e2).__name__}: {e2}"
+                    )
             else:
-                logging.error(f"Scapy live sniffer error: {e}")
+                logging.error(f"ScapyLiveCollector: L2 sniffer error: {e}")
 
         except PermissionError:
             logging.error(
@@ -502,25 +471,38 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             )
         except Exception as e:
             msg = str(e).lower()
+            logging.warning(
+                f"ScapyLiveCollector: L2 sniff raised {type(e).__name__}: {e}"
+            )
             if "winpcap" in msg or "layer 2" in msg or "not available" in msg or "npcap" in msg:
-                logging.warning(
-                    "Scapy Layer 2 unavailable (Npcap not installed). "
-                    "Falling back to Layer 3 socket — install Npcap for full capture."
+                logging.info(
+                    "ScapyLiveCollector: falling back to L3 socket "
+                    f"({conf.L3socket})..."
                 )
                 try:
                     _run_sniff(l2socket=conf.L3socket)
+                    logging.info(
+                        f"ScapyLiveCollector: L3 sniff() returned normally "
+                        f"(captured {_pkt_count[0]} packets)"
+                    )
                 except PermissionError:
                     logging.error(
                         "Scapy live capture requires elevated privileges "
                         "(run as Administrator / root)"
                     )
                 except Exception as e2:
-                    logging.error(f"Scapy L3 fallback sniffer error: {e2}")
+                    logging.error(
+                        f"ScapyLiveCollector: L3 fallback error: "
+                        f"{type(e2).__name__}: {e2}"
+                    )
             else:
-                logging.error(f"Scapy live sniffer error: {e}")
+                logging.error(f"ScapyLiveCollector: sniffer error: {e}")
         finally:
             self._started = False
-            logging.info("Scapy live sniffer stopped")
+            logging.info(
+                f"ScapyLiveCollector: sniffer stopped "
+                f"(total packets processed: {_pkt_count[0]})"
+            )
 
     # ---- cleanup ------------------------------------------------------------
 

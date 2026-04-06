@@ -37,7 +37,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.6.5" # Current script version
+VERSION = "3.6.6" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -313,7 +313,7 @@ do_drawlines_between_local_and_remote = True  # Set to True to draw lines betwee
 do_c2_check = False
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
 do_pause_table_sorting = False  # Set to True to pause table sorting without stopping updates
-do_show_traffic_gauge = False   # Set to True to show sent/recv traffic gauges next to markers (requires Scapy/PCAP collector)
+do_show_traffic_gauge = True   # Set to True to show sent/recv traffic gauges next to markers (requires Scapy/PCAP collector)
 do_show_traffic_histogram = True  # Set to True to show the network traffic histogram overlay on the map
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
@@ -945,6 +945,7 @@ class TCPConnectionViewer(QMainWindow):
         self._pinned_connection = None
         self._pinned_popup_open = False  # True while the pinned popup should stay open
         self._pinned_popup_generation = 0  # Monotonic counter — stale JS close events are ignored
+        self._click_focus_conn = None  # Single-click focus — dict identifying the connection to auto-open popup for
 
         # Deferred single-click timer — allows double-click to cancel the single-click action
         self._click_timer = QTimer()
@@ -6063,7 +6064,73 @@ class TCPConnectionViewer(QMainWindow):
                             'pane_z': pane_z,
                         })
 
+        # --- Apply visual overrides (pinned connection, click focus, foreground remap) ---
+        # Work on shallow copies of the dicts we mutate so the caller's originals
+        # (and the _last_map_connections cache) are never contaminated.
+        # We only copy dicts that actually need changes to keep the cost minimal.
+
+        # Yellow icon override for the pinned (double-clicked) connection
+        if self._pinned_connection is not None:
+            for i, conn in enumerate(connection_data):
+                if self._is_pinned_connection(conn):
+                    conn = dict(conn)
+                    connection_data[i] = conn
+                    # Only override non-suspect connections (red stays red)
+                    if conn.get('icon') != 'redIcon':
+                        conn['icon'] = 'yellowIcon'
+                    # Auto-open popup only once (the first refresh after pinning).
+                    if self._pinned_popup_open:
+                        conn['autoPopup'] = True
+                        conn['popupGeneration'] = self._pinned_popup_generation
+                        # Consume the flag so subsequent timer refreshes do not
+                        # force-reopen the popup the user just closed.
+                        self._pinned_popup_open = False
+                    break
+
+        # Single-click focus: auto-open popup for the clicked connection (one-shot)
+        focus = getattr(self, '_click_focus_conn', None)
+        if focus is not None:
+            self._click_focus_conn = None  # consume immediately
+            for i, conn in enumerate(connection_data):
+                if (conn.get('process') == focus.get('process') and
+                    conn.get('remote') == focus.get('remote') and
+                    conn.get('remoteport') == focus.get('remoteport') and
+                    conn.get('local') == focus.get('local') and
+                    conn.get('localport') == focus.get('localport') and
+                    conn.get('protocol') == focus.get('protocol')):
+                    conn = dict(conn)
+                    connection_data[i] = conn
+                    conn['autoPopup'] = True
+                    conn.setdefault('popupGeneration', 0)
+                    break
+
+        # Foreground / z-layer icon remapping.
+        foreground = getattr(self, '_foreground_hostname', LOCAL_HOSTNAME)
+        if foreground != LOCAL_HOSTNAME:
+            for i, conn in enumerate(connection_data):
+                hostname = conn.get('hostname', '')
+                icon = conn.get('icon', '')
+                if icon in ('redIcon', 'yellowIcon', 'agentCircle', 'redCircle', ''):
+                    continue  # never remap suspect/pinned/circle markers
+                if hostname == LOCAL_HOSTNAME:
+                    conn = dict(conn)
+                    connection_data[i] = conn
+                    conn['icon'] = 'greyIcon'
+                elif hostname == foreground:
+                    agent_color = conn.get('agent_color', '')
+                    if icon == agent_color + 'Icon':
+                        conn = dict(conn)
+                        connection_data[i] = conn
+                        conn['icon'] = 'greenIcon'
+                elif hostname:
+                    pass  # other agents keep their assigned palette colour
+
         data_json = json.dumps(connection_data)
+        # DEBUG: Log gauge-relevant data flow
+        _n_total = len(connection_data)
+        _n_with_bytes = sum(1 for c in connection_data if (c.get('bytes_sent') or 0) > 0 or (c.get('bytes_recv') or 0) > 0)
+        _n_with_coords = sum(1 for c in connection_data if c.get('lat') and c.get('lng'))
+        logging.debug(f"update_map: total={_n_total}, with_bytes={_n_with_bytes}, with_coords={_n_with_coords}, show_gauge={do_show_traffic_gauge}, skip_hist={skip_histogram}")
         # Determine if we should draw lines from public IP to markers
 
         draw_lines = do_resolve_public_ip and do_drawlines_between_local_and_remote
@@ -6838,7 +6905,16 @@ class TCPConnectionViewer(QMainWindow):
                                                         radius: 100000, pane: 'publicIpPane'
                                                     }).addTo(map);
                                                     circle.bindTooltip(conn.remote || 'Public IP', { permanent: !!showTooltip, opacity: 0.9, direction: 'auto' });
-                                                    circle.bindPopup("<b>Server Public IP</b><br>IP: " + (conn.remote || '') + "<br>");
+                                                    circle.bindPopup("<b>Server Public IP</b><br>IP: " + (conn.remote || '') + "<br>", {autoClose: false, closeOnClick: false});
+                                                    try { circle.off('click', circle._openPopup); } catch(e) {}
+                                                    (function(c) {
+                                                        c.on('click', function(e) {
+                                                            try {
+                                                                if (c.isPopupOpen()) { c.closePopup(); }
+                                                                else { c.openPopup(); }
+                                                            } catch(ex) {}
+                                                        });
+                                                    })(circle);
                                                      var rPulse = pulseExitPoints ? _applyExitPulse(circle, 'red', 'publicIpPane', null) : null;
                                                      _markerMap[key] = { marker: circle, gaugeMarker: null, conn: conn, iconName: iconName, pulseMarker: rPulse };
                                                 }
@@ -6890,16 +6966,19 @@ class TCPConnectionViewer(QMainWindow):
                                                                       (conn.remote || '') + "<br>" +
                                                                       "Hostname: " + (conn.name || '') + "<br>" +
                                                                       "<i style='font-size:11px;color:#555'>Click to bring to foreground</i>";
-                                                    agentCircle.bindPopup(agPopupHtml);
-                                                    (function(hostName) {
-                                                        agentCircle.on('click', function(e) {
+                                                    agentCircle.bindPopup(agPopupHtml, {autoClose: false, closeOnClick: false});
+                                                    try { agentCircle.off('click', agentCircle._openPopup); } catch(e) {}
+                                                    (function(hostName, ac) {
+                                                        ac.on('click', function(e) {
                                                             try {
+                                                                if (ac.isPopupOpen()) { ac.closePopup(); }
+                                                                else { ac.openPopup(); }
                                                                 if (mapBridge && typeof mapBridge.setForegroundHost === 'function') {
                                                                     mapBridge.setForegroundHost(hostName);
                                                                 }
                                                             } catch(ex) {}
                                                         });
-                                                    })(agentHostname);
+                                                    })(agentHostname, agentCircle);
                                                     _markerMap[key] = { marker: agentCircle, gaugeMarker: null, conn: conn, iconName: iconName, pulseMarker: agPulse };
                                                 }
 
@@ -7687,47 +7766,9 @@ class TCPConnectionViewer(QMainWindow):
 
         self.connection_table.setUpdatesEnabled(True)
 
-        # Apply yellow icon override for the pinned (double-clicked) connection
-        if self._pinned_connection is not None:
-            for conn in connections_to_show_on_map:
-                if self._is_pinned_connection(conn):
-                    # Only override non-suspect connections (red stays red)
-                    if conn['icon'] != 'redIcon':
-                        conn['icon'] = 'yellowIcon'
-                    # Auto-open popup only once (the first refresh after pinning).
-                    # After the JS side has opened the popup the user owns it:
-                    # closing via X must stay closed until the next explicit pin.
-                    if self._pinned_popup_open:
-                        conn['autoPopup'] = True
-                        conn['popupGeneration'] = self._pinned_popup_generation
-                        # Consume the flag so subsequent timer refreshes do not
-                        # force-reopen the popup the user just closed.
-                        self._pinned_popup_open = False
-                    break
-
-        # Apply foreground / z-layer icon remapping.
-        # The foreground agent uses the standard localhost colour scheme
-        # (green=normal / blue=new / red=C2 / yellow=pinned).
-        # Localhost, when demoted, uses grey.  Other agents keep their palette
-        # colour regardless of layer position.
-        foreground = getattr(self, '_foreground_hostname', LOCAL_HOSTNAME)
-        if foreground != LOCAL_HOSTNAME:
-            for conn in connections_to_show_on_map:
-                hostname = conn.get('hostname', '')
-                icon = conn.get('icon', '')
-                if icon in ('redIcon', 'yellowIcon', 'agentCircle', 'redCircle', ''):
-                    continue  # never remap suspect/pinned/circle markers
-                if hostname == LOCAL_HOSTNAME:
-                    # Demote localhost to grey
-                    conn['icon'] = 'greyIcon'
-                elif hostname == foreground:
-                    # Promote foreground agent to standard colour scheme
-                    agent_color = conn.get('agent_color', '')
-                    if icon == agent_color + 'Icon':
-                        # Was agent-coloured; switch to green (normal) or blue (new)
-                        conn['icon'] = 'greenIcon'
-                elif hostname:
-                    pass  # other agents keep their assigned palette colour
+        # NOTE: Pinned-connection (yellow icon) and foreground-remap overrides are now
+        # applied inside update_map() so every render path (timer refresh, filter
+        # re-render, single-click focus) gets consistent visual treatment.
 
         # Get datetime for the current view (live or timeline)
         datetime_text = ""
@@ -8620,78 +8661,38 @@ class TCPConnectionViewer(QMainWindow):
         self.on_table_cell_clicked(row, column, auto_popup=True)
 
     def on_table_cell_clicked(self, row, column, auto_popup=False):
-        # Get the connection data for the clicked row
-        lat, lng = None, None
+        """Handle single-click on a table row.
 
-        if row < self.connection_table.rowCount():
-            ip_hostnames = {}
-            name = ""
+        Instead of building a one-element connection list (which would destroy
+        all other markers/gauges), we set a lightweight focus state and ask
+        _update_map_with_filter to re-render the full cached connection list.
+        update_map() then applies the focus popup automatically.
+        """
+        if row >= self.connection_table.rowCount():
+            return
 
-            # Extract data from table cells based on predefined columns
-            remote_address = self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX).text()
-            process_name = self.connection_table.item(row, PROCESS_ROW_INDEX).text()
-            pid = self.connection_table.item(row, PID_ROW_INDEX).text()
-            local_address = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX).text()
+        try:
+            process_name = self.connection_table.item(row, PROCESS_ROW_INDEX).text() if self.connection_table.item(row, PROCESS_ROW_INDEX) else ''
+            remote_address = self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX).text() if self.connection_table.item(row, REMOTE_ADDRESS_ROW_INDEX) else ''
+            local_address = self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX).text() if self.connection_table.item(row, LOCAL_ADDRESS_ROW_INDEX) else ''
             protocol = self.connection_table.item(row, PROTOCOL_ROW_INDEX).text() if self.connection_table.item(row, PROTOCOL_ROW_INDEX) else 'TCP'
             local_port = self.connection_table.item(row, LOCAL_PORT_ROW_INDEX).text() if self.connection_table.item(row, LOCAL_PORT_ROW_INDEX) else ''
             remote_port = self.connection_table.item(row, REMOTE_PORT_ROW_INDEX).text() if self.connection_table.item(row, REMOTE_PORT_ROW_INDEX) else ''
-            ip_type = self.connection_table.item(row, IP_TYPE_ROW_INDEX).text() if self.connection_table.item(row, IP_TYPE_ROW_INDEX) else ''
 
-            # Process IP and hostname
-            ip = remote_address
-            ip = ip.split(' (')[0]  # Remove any appended hostname
-            if ip not in ('127.0.0.1','::1'):
-
-                lat = self.connection_table.item(row, LOCATION_LAT_ROW_INDEX).text()
-                lng = self.connection_table.item(row, LOCATION_LON_ROW_INDEX).text()                
-
-                # If table cells are empty, try a live geolocation lookup
-                if not lat or not lng:
-                    ip_for_geo = remote_address.split(' ')[0].split('(')[0].strip()
-                    if ip_for_geo and ip_for_geo not in ('*', '0.0.0.0', '::', 'N/A'):
-                        geo_lat, geo_lng = self.get_coordinates(ip_for_geo, ip_type)
-                        if geo_lat is not None and geo_lng is not None:
-                            lat = str(geo_lat)
-                            lng = str(geo_lng)
-
-                if do_reverse_dns:
-                    name = self.connection_table.item(row, NAME_ROW_INDEX).text() if self.connection_table.item(row, NAME_ROW_INDEX) else ''
-
-            # Check if the connection is marked as suspect
-            suspect = (self.connection_table.item(row, SUSPECT_ROW_INDEX).text() == 'Yes')
-
-            if suspect:
-                icon = 'redIcon'
-            elif self._pinned_connection is not None and self._is_pinned_connection(
-                    {'process': process_name, 'pid': pid, 'protocol': protocol,
-                     'local': local_address, 'localport': local_port,
-                     'remote': remote_address, 'remoteport': remote_port,
-                     'ip_type': ip_type}):
-                icon = 'yellowIcon'
-            else:
-                icon = 'greenIcon'
-
-            # Prepare focused data for map update
-            focused_data = [{
+            # Set focus state so update_map opens the popup for this connection
+            self._click_focus_conn = {
                 'process': process_name,
-                'pid': pid,
-                'suspect': suspect,
                 'protocol': protocol,
                 'local': local_address,
                 'localport': local_port,
                 'remote': remote_address,
                 'remoteport': remote_port,
-                'name': name,
-                'ip_type': ip_type,
-                'lat': lat,
-                'lng': lng,
-                'icon': icon,  # default icon; change as needed based on conditions
-                'autoPopup': auto_popup,
-                'popupGeneration': self._pinned_popup_generation if auto_popup else 0
-            }]
+            }
 
-            if lat and lng:
-                self.update_map(focused_data, skip_histogram=True)
+            # Re-render the full map using the cached connection list
+            self._update_map_with_filter()
+        except Exception as e:
+            logging.error(f"on_table_cell_clicked error: {e}")
 
 def main():
     app = QApplication(sys.argv)

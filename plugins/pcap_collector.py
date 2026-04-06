@@ -1,6 +1,15 @@
 """
 Connection collector plugin that reads connections from a pcap file.
 
+Architecture (OS-table-first):
+    Every call to ``collect_raw_connections()`` starts from the **live OS
+    connection table** (via ``netstat``/``ss``), exactly like the built-in
+    psutil collector.  Traffic byte counters parsed from the pcap file are
+    overlaid on matching OS-table entries.
+
+    Connections that exist in the OS table but have no matching pcap
+    traffic are still returned — with ``bytes_sent`` / ``bytes_recv`` = 0.
+
 Requires the ``scapy`` library (``pip install scapy``).
 
 To use it:
@@ -12,9 +21,12 @@ To use it:
 """
 
 import json
+import logging
 import os
+import platform as _platform
 
 from connection_collector_plugin import ConnectionCollectorPlugin
+from plugins.os_conn_table import get_os_connections as _get_os_table
 
 # Path to the global settings file (one directory above this plugin)
 _SETTINGS_FILE = os.path.join(
@@ -33,7 +45,7 @@ def _read_pcap_path() -> str:
 
 
 class PcapCollector(ConnectionCollectorPlugin):
-    """Read TCP/UDP connections from a pcap capture file instead of live psutil."""
+    """Read TCP/UDP connections from a pcap capture file, overlaid on the live OS table."""
 
     @property
     def name(self) -> str:
@@ -41,44 +53,76 @@ class PcapCollector(ConnectionCollectorPlugin):
 
     @property
     def description(self) -> str:
-        return "Reads connections from a pcap/pcapng file using Scapy (requires: pip install scapy)"
+        return (
+            "OS connection table (netstat/ss) supplemented with traffic "
+            "bytes from a pcap/pcapng file (requires: pip install scapy)"
+        )
 
     def collect_raw_connections(self) -> list:
-        """Parse the pcap and return a list of connection dicts.
+        """Return the live OS connection table supplemented with pcap traffic.
 
-        Each dict must contain at minimum:
-            process, pid, protocol, local, localport, remote, remoteport,
-            ip_type, hostname
+        The connection *list* is always driven by the OS table.  Traffic
+        bytes parsed from the pcap file are overlaid on matching entries.
+        Connections with no pcap traffic still appear with 0 bytes.
+        """
+        hostname = _platform.node()
+
+        # 1. Authoritative connection list from the OS table
+        os_conns, _os_alive = _get_os_table(hostname)
+
+        # 2. Parse traffic bytes from the pcap (if configured)
+        traffic = self._parse_pcap_traffic()
+
+        # 3. Overlay traffic on OS-table entries
+        for key, conn in os_conns.items():
+            t = traffic.get(key)
+            if not t:
+                # Try reverse key
+                src, sp, dst, dp, proto = key
+                t = traffic.get((dst, dp, src, sp, proto))
+                if t:
+                    # Swap sent/recv for reverse direction
+                    t = {'bytes_sent': t.get('bytes_recv', 0),
+                         'bytes_recv': t.get('bytes_sent', 0)}
+            if t:
+                conn['bytes_sent'] = t.get('bytes_sent', 0)
+                conn['bytes_recv'] = t.get('bytes_recv', 0)
+
+        return list(os_conns.values())
+
+    # ---- pcap parsing -------------------------------------------------------
+
+    @staticmethod
+    def _parse_pcap_traffic() -> dict:
+        """Parse the pcap file and return traffic byte counters.
+
+        Returns ``{(src, sport, dst, dport, proto): {bytes_sent, bytes_recv}}``
+        keyed on the first-seen direction.
         """
         pcap_file_path = _read_pcap_path()
         if not pcap_file_path:
-            return []
+            return {}
 
         try:
             from scapy.all import rdpcap, IP, IPv6, TCP, UDP
         except ImportError:
-            return []
-
-        connections = []
-        conn_map = {}   # key -> index in connections list (for byte accumulation)
+            return {}
 
         try:
             packets = rdpcap(pcap_file_path)
-        except Exception:
-            return []
+        except Exception as e:
+            logging.debug(f"PcapCollector: failed to read pcap: {e}")
+            return {}
 
-        import platform as _platform
-        local_hostname = _platform.node()
+        traffic: dict = {}
+        seen_keys: dict = {}   # maps both orientations to the canonical key
 
         for pkt in packets:
             ip_layer = None
-            ip_type = ""
             if IP in pkt:
                 ip_layer = pkt[IP]
-                ip_type = "IPv4"
             elif IPv6 in pkt:
                 ip_layer = pkt[IPv6]
-                ip_type = "IPv6"
             else:
                 continue
 
@@ -99,35 +143,33 @@ class PcapCollector(ConnectionCollectorPlugin):
             src = ip_layer.src
             dst = ip_layer.dst
 
-            # Packet byte size (IP total length or raw length)
             try:
                 pkt_bytes = int(ip_layer.len)
             except Exception:
                 pkt_bytes = len(pkt)
 
-            key = (src, sport, dst, dport, protocol)
+            fwd_key = (src, sport, dst, dport, protocol)
             rev_key = (dst, dport, src, sport, protocol)
 
-            if key in conn_map:
-                # Same direction as the first packet — accumulate as sent
-                connections[conn_map[key]]['bytes_sent'] = connections[conn_map[key]].get('bytes_sent', 0) + pkt_bytes
-            elif rev_key in conn_map:
-                # Reverse direction — accumulate as received on the original entry
-                connections[conn_map[rev_key]]['bytes_recv'] = connections[conn_map[rev_key]].get('bytes_recv', 0) + pkt_bytes
+            if fwd_key in seen_keys:
+                canon = seen_keys[fwd_key]
+                if canon == fwd_key:
+                    traffic[canon]['bytes_sent'] += pkt_bytes
+                else:
+                    traffic[canon]['bytes_recv'] += pkt_bytes
+            elif rev_key in seen_keys:
+                canon = seen_keys[rev_key]
+                if canon == fwd_key:
+                    traffic[canon]['bytes_sent'] += pkt_bytes
+                else:
+                    traffic[canon]['bytes_recv'] += pkt_bytes
             else:
-                conn_map[key] = len(connections)
-                connections.append({
-                    'process': 'pcap',
-                    'pid': '',
-                    'protocol': protocol,
-                    'local': src,
-                    'localport': sport,
-                    'remote': dst,
-                    'remoteport': dport,
-                    'ip_type': ip_type,
-                    'hostname': local_hostname,
+                # First time seeing this flow — canonical key is fwd
+                seen_keys[fwd_key] = fwd_key
+                seen_keys[rev_key] = fwd_key
+                traffic[fwd_key] = {
                     'bytes_sent': pkt_bytes,
                     'bytes_recv': 0,
-                })
+                }
 
-        return connections
+        return traffic
