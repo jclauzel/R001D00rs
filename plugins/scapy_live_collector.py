@@ -95,15 +95,22 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
     # ---- public API ---------------------------------------------------------
 
     def collect_raw_connections(self) -> list:
-        """Return the live OS connection table supplemented with traffic bytes.
+        """Return the live OS connection table *plus* sniffer-only connections.
 
-        The connection *list* is always driven by the OS table (``netstat``
-        / ``ss``).  The background Scapy sniffer provides byte-level
-        sent/recv counters that are overlaid on matching entries.
+        The connection list starts from the **live OS connection table**
+        (via ``netstat``/``ss``).  The background Scapy sniffer provides
+        byte-level sent/recv counters that are overlaid on matching entries.
 
-        Connections with no captured traffic still appear — with
-        ``bytes_sent`` / ``bytes_recv`` = 0 — exactly like the psutil
-        collector but with traffic accounting when available.
+        Connections that exist in the OS table but have had no captured
+        traffic are still returned — with ``bytes_sent`` / ``bytes_recv``
+        = 0 — exactly like the psutil collector.
+
+        Additionally, connections observed by the sniffer that are **not**
+        present in the current OS table snapshot (e.g. short-lived flows
+        that closed before ``netstat``/``ss`` ran) are included for as
+        long as their traffic cache entry survives (controlled by
+        ``_CONN_TIMEOUT``).  This guarantees the Scapy collector returns
+        *at least* as many connections as the OS table alone.
         """
         if not self._started:
             self._start_sniffer()
@@ -112,8 +119,10 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         os_conns, os_alive = _get_os_table(self._hostname)
 
         # 2. Overlay traffic byte counters from the sniffer cache
+        #    and collect sniffer-only entries for step 4.
         now = time.monotonic()
         matched = 0
+        sniffer_only: dict = {}
         with self._lock:
             traffic_count = len(self._traffic)
 
@@ -139,9 +148,48 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             for k in to_remove:
                 del self._traffic[k]
 
+            # 4. Gather sniffer-observed connections NOT in the OS table.
+            #    These are short-lived flows that closed before netstat/ss
+            #    ran, or connections the OS table snapshot missed.
+            for key, t in self._traffic.items():
+                if key in os_conns:
+                    continue
+                src, sp, dst, dp, proto = key
+                rev_key = (dst, dp, src, sp, proto)
+                if rev_key in os_conns:
+                    continue
+                # Skip wildcard / unroutable remotes
+                if dst in ('0.0.0.0', '::', '*', ''):
+                    continue
+                sniffer_only[key] = {
+                    'bytes_sent': t.get('bytes_sent', 0),
+                    'bytes_recv': t.get('bytes_recv', 0),
+                }
+
+        # 5. Enrich sniffer-only connections (outside the lock to avoid
+        #    blocking the sniffer thread during PID lookups).
+        for key, tinfo in sniffer_only.items():
+            src, sp, dst, dp, proto = key
+            pid_str, proc_name = self._lookup_pid(sp, proto)
+            ip_type = 'IPv6' if ':' in src else 'IPv4'
+            os_conns[key] = {
+                'process': proc_name or 'Unknown',
+                'pid': pid_str,
+                'protocol': proto,
+                'local': src,
+                'localport': sp,
+                'remote': dst,
+                'remoteport': dp,
+                'ip_type': ip_type,
+                'hostname': self._hostname,
+                'bytes_sent': tinfo['bytes_sent'],
+                'bytes_recv': tinfo['bytes_recv'],
+            }
+
         logging.debug(
-            f"ScapyLiveCollector: os_conns={len(os_conns)}, "
-            f"traffic={traffic_count}, matched={matched}"
+            f"ScapyLiveCollector: os_conns={len(os_conns) - len(sniffer_only)}, "
+            f"traffic={traffic_count}, matched={matched}, "
+            f"sniffer_only={len(sniffer_only)}, total={len(os_conns)}"
         )
 
         return list(os_conns.values())

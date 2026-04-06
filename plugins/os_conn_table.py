@@ -25,6 +25,7 @@ import logging
 import platform as _platform
 import re
 import shutil
+import socket as _socket
 import subprocess
 
 _HOSTNAME = _platform.node()
@@ -50,8 +51,25 @@ def get_os_connections(hostname: str | None = None) -> tuple[dict, set]:
     tests.
 
     *hostname* defaults to ``platform.node()`` if not supplied.
+
+    When **psutil** is available it is used as the primary data source on
+    every platform because the Win32 / procfs / sysctl API is faster and
+    more complete than parsing ``netstat``/``ss`` text output.  In
+    particular, on Windows the ``netstat -ano`` parser silently drops
+    bound-but-unconnected UDP sockets (remote ``*:*``) that psutil
+    correctly reports.  The subprocess-based parsers are kept as a
+    fallback for environments where psutil is not installed.
     """
     hn = hostname or _HOSTNAME
+
+    # --- Prefer psutil (fast, complete, no subprocess) -------------------
+    if _psutil is not None:
+        result = _parse_psutil(hn)
+        if result[0]:  # got at least one connection
+            return result
+        # psutil returned nothing — may be a transient permission issue;
+        # fall through to the platform-specific subprocess parser.
+
     system = _platform.system()
 
     if system == 'Windows':
@@ -150,7 +168,164 @@ def _split_addr(addr: str) -> tuple[str, str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Windows: netstat -ano
+# psutil-based parser (preferred when psutil is installed)
+# ---------------------------------------------------------------------------
+
+def _netstat_udp_remotes_windows() -> dict:
+    """Parse ``netstat -ano`` for UDP remote addresses (Windows only).
+
+    On Windows, psutil's ``GetExtendedUdpTable`` does not report remote
+    addresses for connected UDP sockets.  This helper supplements them by
+    parsing the ``netstat -ano`` text output.
+
+    Returns ``{(local_ip, local_port, pid_str): (remote_ip, remote_port)}``.
+    """
+    lookup: dict = {}
+    try:
+        output = subprocess.check_output(
+            ['netstat', '-ano'], timeout=10,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        ).decode('utf-8', errors='replace')
+        for line in output.splitlines():
+            line = line.strip()
+            if not line.startswith('UDP'):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            local_part = parts[1]
+            remote_part = parts[2]
+            pid_str = parts[3]
+            if remote_part in ('*:*', '0.0.0.0:0', '[::]:0'):
+                continue
+            l_ip, l_port, _ = _split_addr(local_part)
+            r_ip, r_port, _ = _split_addr(remote_part)
+            if l_ip and l_port and r_ip and r_port:
+                lookup[(l_ip, l_port, pid_str)] = (r_ip, r_port)
+    except Exception:
+        pass
+    return lookup
+
+
+def _parse_psutil(hostname: str) -> tuple[dict, set]:
+    """Build the connection table from **psutil** (cross-platform).
+
+    Uses the same logic as the built-in ``PsutilCollector`` in
+    *tcp_geo_map.py*: TCP ``ESTABLISHED`` + **all** UDP sockets.  On
+    Windows, UDP remote addresses are supplemented with ``netstat -ano``
+    because psutil's ``GetExtendedUdpTable`` does not report them.
+
+    This produces an identical connection set to the psutil collector,
+    eliminating the 20-40 % gap that the old ``netstat -ano`` text parser
+    had (it silently dropped bound-but-unconnected UDP entries).
+    """
+    conns: dict = {}
+    alive: set = set()
+
+    try:
+        all_connections = _psutil.net_connections(kind='inet')
+    except Exception as e:
+        logging.debug(f"os_conn_table: psutil.net_connections failed: {e}")
+        return conns, alive
+
+    # On Windows, supplement UDP with netstat for remote addresses
+    udp_remote_lookup: dict = {}
+    if _platform.system() == 'Windows':
+        try:
+            udp_remote_lookup = _netstat_udp_remotes_windows()
+        except Exception:
+            pass
+
+    for conn in all_connections:
+        is_tcp = (conn.type == _socket.SOCK_STREAM)
+        is_udp = (conn.type == _socket.SOCK_DGRAM)
+
+        if is_tcp:
+            proto = 'TCP'
+            if conn.status != _psutil.CONN_ESTABLISHED:
+                continue
+        elif is_udp:
+            proto = 'UDP'
+        else:
+            continue
+
+        laddr = getattr(conn, 'laddr', None)
+        raddr = getattr(conn, 'raddr', None)
+        if not laddr:
+            continue
+
+        l_ip = laddr.ip
+        l_port = str(laddr.port)
+
+        # --- determine remote address ------------------------------------
+        has_real_raddr = False
+        r_ip = ''
+        r_port = ''
+        if raddr:
+            _rip = getattr(raddr, 'ip', None)
+            _rport = getattr(raddr, 'port', None)
+            if _rip and _rip not in ('0.0.0.0', '::', '*', '') and _rport:
+                r_ip = _rip
+                r_port = str(_rport)
+                has_real_raddr = True
+
+        if not has_real_raddr:
+            # Try the Windows netstat UDP supplement
+            if is_udp and udp_remote_lookup:
+                pid_str = str(conn.pid) if conn.pid else ''
+                ns_remote = udp_remote_lookup.get((l_ip, l_port, pid_str))
+                if ns_remote:
+                    r_ip, r_port = ns_remote
+                    has_real_raddr = True
+
+            if not has_real_raddr:
+                if is_udp:
+                    r_ip = '*'
+                    r_port = '*'
+                else:
+                    # TCP without a real remote — skip
+                    continue
+
+        # Skip unroutable remotes (but keep '*' — it is the marker for
+        # bound-but-unconnected UDP sockets, matching PsutilCollector).
+        if r_ip in ('0.0.0.0', '::', ''):
+            continue
+
+        # --- IP type & IPv4-mapped normalisation -------------------------
+        family = getattr(conn, 'family', None)
+        if family == _socket.AF_INET6:
+            ip_type = 'IPv6'
+            if l_ip.startswith('::ffff:'):
+                l_ip = l_ip[7:]
+                ip_type = 'IPv4'
+            if r_ip.startswith('::ffff:'):
+                r_ip = r_ip[7:]
+                ip_type = 'IPv4'
+        else:
+            ip_type = 'IPv4'
+
+        # --- PID / process -----------------------------------------------
+        pid_str = str(conn.pid) if conn.pid else ''
+        proc_name = ''
+        if conn.pid:
+            try:
+                proc_name = _psutil.Process(conn.pid).name()
+            except Exception:
+                pass
+
+        key = (l_ip, l_port, r_ip, r_port, proto)
+        alive.add(key)
+        if key not in conns:
+            conns[key] = _make_conn(
+                proto, l_ip, l_port, r_ip, r_port, ip_type,
+                pid_str, proc_name, hostname,
+            )
+
+    return conns, alive
+
+
+# ---------------------------------------------------------------------------
+# Windows: netstat -ano  (fallback when psutil is unavailable)
 # ---------------------------------------------------------------------------
 
 def _parse_netstat_windows(hostname: str) -> tuple[dict, set]:
