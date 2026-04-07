@@ -315,6 +315,7 @@ do_capture_screenshots = False  # Set to True to capture screenshots of the map 
 do_pause_table_sorting = False  # Set to True to pause table sorting without stopping updates
 do_show_traffic_gauge = True   # Set to True to show sent/recv traffic gauges next to markers (requires Scapy/PCAP collector)
 do_show_traffic_histogram = True  # Set to True to show the network traffic histogram overlay on the map
+do_collect_connections_asynchronously = True  # Set to True to collect connections on a background thread (prevents UI hangs)
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
 # Database persistence layer globals
@@ -585,6 +586,29 @@ class VideoGeneratorWorker(QRunnable):
             error_msg = f"Failed to generate video:\n{str(e)}\n\nCheck the logs for more details."
             self.signals.error.emit(error_msg)
             logging.error(f"Error generating video: {e}")
+
+class ConnectionCollectorSignals(QObject):
+    """Signals for the async connection collector worker."""
+    finished = Signal(object, object)  # connections (list), slider_position (int | None)
+
+class ConnectionCollectorWorker(QRunnable):
+    """
+    Runs get_active_tcp_connections() on a QThreadPool thread so the UI
+    thread stays responsive while connections are being enumerated / enriched.
+    """
+    def __init__(self, collect_fn, slider_position):
+        super().__init__()
+        self.collect_fn = collect_fn
+        self.slider_position = slider_position
+        self.signals = ConnectionCollectorSignals()
+
+    def run(self):
+        try:
+            connections = self.collect_fn(self.slider_position)
+        except Exception as e:
+            logging.error(f"ConnectionCollectorWorker error: {e}")
+            connections = []
+        self.signals.finished.emit(connections, self.slider_position)
 
 class DNSWorker:
     """
@@ -940,6 +964,7 @@ class TCPConnectionViewer(QMainWindow):
         self.reader_c2_tracker_set = None  # Fast O(1) lookup set
         self.connections = []
         self._last_map_connections = []  # fully-processed connections for map re-renders
+        self._async_collection_in_progress = False  # guard: only one background collection at a time
 
         # Pinned (double-clicked) connection — persists across refreshes, shown as yellow marker
         self._pinned_connection = None
@@ -1466,7 +1491,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size
+        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1480,6 +1505,7 @@ class TCPConnectionViewer(QMainWindow):
             'do_pause_table_sorting': do_pause_table_sorting,
             'do_show_traffic_gauge': do_show_traffic_gauge,
             'do_show_traffic_histogram': do_show_traffic_histogram,
+            'do_collect_connections_asynchronously': do_collect_connections_asynchronously,
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
@@ -1571,7 +1597,7 @@ class TCPConnectionViewer(QMainWindow):
                 global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections
                 global show_only_remote_connections, do_reverse_dns, map_refresh_interval
                 global table_column_sort_index, table_column_sort_reverse
-                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram
+                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously
                 global db_provider_name, max_connection_list_database_size
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
@@ -1586,6 +1612,7 @@ class TCPConnectionViewer(QMainWindow):
                 do_pause_table_sorting = settings.get('do_pause_table_sorting', do_pause_table_sorting)
                 do_show_traffic_gauge = settings.get('do_show_traffic_gauge', do_show_traffic_gauge)
                 do_show_traffic_histogram = settings.get('do_show_traffic_histogram', do_show_traffic_histogram)
+                do_collect_connections_asynchronously = settings.get('do_collect_connections_asynchronously', do_collect_connections_asynchronously)
                 map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
                 table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                 table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
@@ -1795,6 +1822,7 @@ class TCPConnectionViewer(QMainWindow):
                 self.pause_table_sorting_check.setChecked(do_pause_table_sorting)
                 self.show_traffic_gauge_check.setChecked(do_show_traffic_gauge)
                 self.show_traffic_histogram_check.setChecked(do_show_traffic_histogram)
+                self.collect_connections_async_check.setChecked(do_collect_connections_asynchronously)
 
                 # Update buffer size input field
                 if hasattr(self, 'buffer_size_input'):
@@ -4107,6 +4135,12 @@ class TCPConnectionViewer(QMainWindow):
         self.save_settings()
 
     @Slot()
+    def update_collect_connections_asynchronously(self):
+        global do_collect_connections_asynchronously
+        do_collect_connections_asynchronously = self.collect_connections_async_check.isChecked()
+        self.save_settings()
+
+    @Slot()
     def update_show_traffic_gauge(self):
         global do_show_traffic_gauge
         do_show_traffic_gauge = self.show_traffic_gauge_check.isChecked()
@@ -4795,6 +4829,12 @@ class TCPConnectionViewer(QMainWindow):
         self.pause_table_sorting_check.setChecked(False)
         self.pause_table_sorting_check.stateChanged.connect(self.update_pause_table_sorrting)
         settings_tab_layout.addWidget(self.pause_table_sorting_check)
+
+        # Async connection collection checkbox
+        self.collect_connections_async_check = QCheckBox("Collect connections asynchronously (prevents UI hangs during VPN switches etc.)")
+        self.collect_connections_async_check.setChecked(do_collect_connections_asynchronously)
+        self.collect_connections_async_check.stateChanged.connect(self.update_collect_connections_asynchronously)
+        settings_tab_layout.addWidget(self.collect_connections_async_check)
 
         # Show traffic gauge on markers checkbox
         self.show_traffic_gauge_check = QCheckBox("Show traffic gauge on map markers (sent/recv — requires Scapy or PCAP collector)")
@@ -7664,10 +7704,38 @@ class TCPConnectionViewer(QMainWindow):
                 # Start wave animation on stop button
                 self._start_stop_button_wave()
 
-        number_of_previous_objects = self.map_objects
+        self._refresh_force_tooltip = force_tooltip
+        self._refresh_number_of_previous_objects = self.map_objects
 
-        self.connections = self.get_active_tcp_connections(slider_position)
+        if do_collect_connections_asynchronously:
+            if self._async_collection_in_progress:
+                # Previous collection still running — skip this tick
+                logging.debug("refresh_connections: async collection already in progress, skipping tick")
+                return
+            self._async_collection_in_progress = True
+            worker = ConnectionCollectorWorker(self.get_active_tcp_connections, slider_position)
+            worker.signals.finished.connect(self._on_connections_ready)
+            QThreadPool.globalInstance().start(worker)
+        else:
+            connections = self.get_active_tcp_connections(slider_position)
+            self._apply_connections(connections, slider_position)
 
+    @Slot(object, object)
+    def _on_connections_ready(self, connections, slider_position):
+        """Called on the UI thread when the async connection worker finishes."""
+        self._async_collection_in_progress = False
+        self._apply_connections(connections, slider_position)
+
+    def _apply_connections(self, connections, slider_position):
+        """Update the table and map with a freshly collected connection list.
+
+        This method always executes on the UI thread, whether the connections
+        were collected synchronously or by the background worker.
+        """
+        force_tooltip = self._refresh_force_tooltip
+        number_of_previous_objects = self._refresh_number_of_previous_objects
+
+        self.connections = connections
 
         if len(self.connections) != number_of_previous_objects:
             self.map_objects = len(self.connections)
