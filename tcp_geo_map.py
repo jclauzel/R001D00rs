@@ -37,7 +37,7 @@ from connection_collector_plugin import ConnectionCollectorPlugin
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.6.7" # Current script version
+VERSION = "3.6.8" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -73,6 +73,7 @@ import asyncio
 import aiodns
 import threading
 import queue
+import weakref
 
 class AsyncDNSWorker:
     """
@@ -459,6 +460,7 @@ class VideoGeneratorWorker(QRunnable):
     """
     def __init__(self, screenshots_dir):
         super().__init__()
+        self.setAutoDelete(False)  # caller holds ref; signals object must outlive the pool thread
         self.screenshots_dir = screenshots_dir
         self.signals = VideoGeneratorSignals()
 
@@ -598,6 +600,7 @@ class ConnectionCollectorWorker(QRunnable):
     """
     def __init__(self, collect_fn, slider_position):
         super().__init__()
+        self.setAutoDelete(False)  # caller holds ref; signals object must outlive the pool thread
         self.collect_fn = collect_fn
         self.slider_position = slider_position
         self.signals = ConnectionCollectorSignals()
@@ -982,6 +985,7 @@ class TCPConnectionViewer(QMainWindow):
         self._http_session = requests.Session()
         self._public_ip_cache = ""
         self._public_ip_cache_time = 0.0
+        self._public_ip_cache_lock = threading.Lock()  # guards _public_ip_cache/_public_ip_cache_time
 
         # --- Server / Agent mode runtime state ---
         # Server mode: cache of latest submissions from each agent
@@ -1019,7 +1023,9 @@ class TCPConnectionViewer(QMainWindow):
         self._agent_post_stop = threading.Event()
         self._agent_post_thread = threading.Thread(
             target=self._agent_post_worker, daemon=True, name="AgentPostWorker")
-        self._agent_post_thread.start()
+        # NOTE: thread is started after init_ui() to avoid a heap-corruption race
+        # (STATUS_HEAP_CORRUPTION / 0xC0000374) where background threads allocate
+        # while QWebEngineView is initialising Chromium's PartitionAlloc on startup.
         self._agent_rejected_429 = False  # True when server returned HTTP 429 (agent limit reached)
         self._agent_server_unreachable = False  # True when agent cannot reach the server
 
@@ -1039,17 +1045,25 @@ class TCPConnectionViewer(QMainWindow):
         self._dns_update_scheduled = False
         self._dns_update_lock = threading.Lock()
 
+        _viewer_ref = weakref.ref(self)
+
         def _dns_notify(ip, hostname):
-            # worker thread -> schedule debounced UI update on main thread
+            # worker thread -> schedule debounced UI update on main thread.
+            # Use a weakref so the lambda cannot keep the viewer alive after
+            # closeEvent, preventing slots from firing on a destroyed object.
+            def _deferred_dns():
+                viewer = _viewer_ref()
+                if viewer is not None:
+                    viewer._on_dns_resolved(ip, hostname)
             try:
-                QTimer.singleShot(0, lambda: self._on_dns_resolved(ip, hostname))
+                QTimer.singleShot(0, _deferred_dns)
             except Exception:
                 # fallback: no UI notification available
                 pass
 
         # Use AsyncDNSWorker instead of DNSWorker for non-blocking DNS
         self.dns_worker = AsyncDNSWorker(ip_cache, cache_lock, on_resolve=_dns_notify)
-        self.dns_worker.start()
+        # NOTE: started after init_ui() — see _agent_post_thread note above.
 
         # Initialize thread pool for async operations (video generation, etc.)
         self.thread_pool = QThreadPool()
@@ -1094,6 +1108,12 @@ class TCPConnectionViewer(QMainWindow):
 
         # Apply UI-dependent settings after UI is created
         self._apply_settings_to_ui()
+
+        # Start background threads now that QWebEngineView / Chromium heap is
+        # fully initialised.  Starting them earlier races with PartitionAlloc
+        # and causes intermittent STATUS_HEAP_CORRUPTION (0xC0000374) crashes.
+        self._agent_post_thread.start()
+        self.dns_worker.start()
 
         # Start Flask server if server mode was enabled (via CLI or settings)
         if enable_server_mode:
@@ -2103,7 +2123,6 @@ class TCPConnectionViewer(QMainWindow):
         logging.info(f"Agent mode {'enabled' if enable_agent_mode else 'disabled'} -> {agent_server_host}:{FLASK_AGENT_PORT}")
 
     @Slot(int)
-    @Slot(int)
     def _on_collector_changed(self, index):
         """Switch the active connection collector plugin."""
         if 0 <= index < len(self._collector_plugins):
@@ -2143,6 +2162,7 @@ class TCPConnectionViewer(QMainWindow):
             self._pcap_file_path = path
             self.save_settings()
 
+    @Slot(int)
     def _on_no_ui_changed(self, state):
         global agent_no_ui
         agent_no_ui = bool(state)
@@ -2227,9 +2247,12 @@ class TCPConnectionViewer(QMainWindow):
             failure = Signal(str)
 
         class _ConnCheckWorker(QRunnable):
-            def __init__(self):
+            def __init__(self, parent_obj):
                 super().__init__()
-                self.signals = _ConnCheckSignals()
+                # Parent the signals object to the viewer so its lifetime is
+                # tied to the viewer and it is deleted on the main thread.
+                self.signals = _ConnCheckSignals(parent_obj)
+                self.setAutoDelete(False)  # caller controls lifetime
 
             def run(self):
                 try:
@@ -2251,7 +2274,7 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception as exc:
                     self.signals.failure.emit(str(exc))
 
-        worker = _ConnCheckWorker()
+        worker = _ConnCheckWorker(viewer)
         worker.signals.success.connect(viewer._on_conn_check_success)
         worker.signals.failure.connect(viewer._on_conn_check_failure)
         self.thread_pool.start(worker)
@@ -2263,7 +2286,6 @@ class TCPConnectionViewer(QMainWindow):
         logging.info("_on_conn_check_success: Setting label to ✔ Reachable")
         self.agent_conn_status_label.setText("✔ Reachable")
         self.agent_conn_status_label.setStyleSheet("color: green; font-weight: bold;")
-        QApplication.processEvents()
 
     @Slot(str)
     def _on_conn_check_failure(self, error_msg: str):
@@ -2272,7 +2294,6 @@ class TCPConnectionViewer(QMainWindow):
         logging.info(f"_on_conn_check_failure: Setting label to ✖ Unreachable, error: {error_msg}")
         self.agent_conn_status_label.setText("✖ Unreachable")
         self.agent_conn_status_label.setStyleSheet("color: red; font-weight: bold;")
-        QApplication.processEvents()
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Connection check failed")
@@ -2536,7 +2557,12 @@ class TCPConnectionViewer(QMainWindow):
         # If the agent management table exists, schedule a refresh every cycle
         # so that the "Is Active" column stays current.
         if hasattr(self, 'agent_mgmt_table'):
-            QTimer.singleShot(0, self._refresh_agent_management_table)
+            _self_ref = weakref.ref(self)
+            def _deferred_refresh():
+                v = _self_ref()
+                if v is not None:
+                    v._refresh_agent_management_table()
+            QTimer.singleShot(0, _deferred_refresh)
 
         return snapshot
 
@@ -2834,6 +2860,7 @@ class TCPConnectionViewer(QMainWindow):
 
         return results
 
+    @Slot(str, str)
     def _on_dns_resolved(self, ip, hostname):
         """
         Called on the main thread when DNSWorker resolves a hostname.
@@ -2847,6 +2874,7 @@ class TCPConnectionViewer(QMainWindow):
         # schedule a single refresh after short delay to batch multiple resolutions
         QTimer.singleShot(500, self._dns_updates_flush)
 
+    @Slot()
     def _dns_updates_flush(self):
         """
         Called on the main thread to apply DNS updates (refresh UI once).
@@ -5931,22 +5959,28 @@ class TCPConnectionViewer(QMainWindow):
 
         The result is cached for ``_PUBLIC_IP_TTL`` seconds so that the
         blocking HTTP call is not repeated on every 2-second refresh cycle.
+        Thread-safe: may be called from both the main thread and background
+        workers (e.g. _agent_post_worker).
         Returns empty string on error.
         """
         now = time.time()
-        if self._public_ip_cache and (now - self._public_ip_cache_time) < self._PUBLIC_IP_TTL:
-            return self._public_ip_cache
+        with self._public_ip_cache_lock:
+            if self._public_ip_cache and (now - self._public_ip_cache_time) < self._PUBLIC_IP_TTL:
+                return self._public_ip_cache
         try:
             response = self._http_session.get('https://api.ipify.org', timeout=5)
             if response.status_code == 200:
                 result = response.text.strip()
-                self._public_ip_cache = result
-                self._public_ip_cache_time = now
+                with self._public_ip_cache_lock:
+                    self._public_ip_cache = result
+                    self._public_ip_cache_time = now
                 return result
             else:
-                return self._public_ip_cache or ""
+                with self._public_ip_cache_lock:
+                    return self._public_ip_cache or ""
         except Exception:
-            return self._public_ip_cache or ""
+            with self._public_ip_cache_lock:
+                return self._public_ip_cache or ""
 
     def update_map(self, connection_data, force_show_tooltip=False, stats_text="", datetime_text="", skip_histogram=False):
         """
@@ -7726,6 +7760,7 @@ class TCPConnectionViewer(QMainWindow):
         self._async_collection_in_progress = False
         self._apply_connections(connections, slider_position)
 
+    @Slot(object, object)
     def _apply_connections(self, connections, slider_position):
         """Update the table and map with a freshly collected connection list.
 
