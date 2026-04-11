@@ -41,7 +41,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.7.2" # Current script version
+VERSION = "3.7.3" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -4685,9 +4685,6 @@ class TCPConnectionViewer(QMainWindow):
         self.map_initialized = False
         self._map_reload_attempts = 0  # Track reload attempts to prevent infinite loops
         self._map_loading_in_progress = False  # True while setHtml is in flight, prevents re-entry
-        # Previous cycle cumulative byte totals for computing histogram deltas
-        self._prev_histogram_bytes_sent = 0
-        self._prev_histogram_bytes_recv = 0
 
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.setHandleWidth(6)
@@ -6364,26 +6361,21 @@ class TCPConnectionViewer(QMainWindow):
             agent_status_text = f'\u26a0 Server unreachable: {agent_server_host}:{FLASK_AGENT_PORT}'
 
         # Compute total bytes sent/received across all connections for the traffic histogram.
-        # The per-connection bytes_sent/bytes_recv values are cumulative counters, so the
-        # raw totals grow monotonically.  The histogram needs per-interval *deltas* to show
-        # meaningful proportional bars; otherwise all bars converge toward the peak as the
-        # cumulative values dwarf the inter-cycle differences.
+        # The per-connection bytes_sent/bytes_recv values represent traffic observed during
+        # the most recent collection interval (reset to 0 between cycles by the Scapy
+        # collector, or re-parsed from a static pcap file).  The histogram receives these
+        # per-interval totals directly.
         # skip_histogram is set for secondary calls (e.g. filter re-renders) that must not
-        # reset the prev-counters or push histogram data — only the primary timer-driven
-        # call should advance the histogram.
+        # push histogram data — only the primary timer-driven call should advance it.
         if skip_histogram:
             delta_sent = 0
             delta_recv = 0
         else:
-            total_bytes_sent = 0
-            total_bytes_recv = 0
+            delta_sent = 0
+            delta_recv = 0
             for c in connection_data:
-                total_bytes_sent += c.get('bytes_sent', 0) or 0
-                total_bytes_recv += c.get('bytes_recv', 0) or 0
-            delta_sent = max(total_bytes_sent - self._prev_histogram_bytes_sent, 0)
-            delta_recv = max(total_bytes_recv - self._prev_histogram_bytes_recv, 0)
-            self._prev_histogram_bytes_sent = total_bytes_sent
-            self._prev_histogram_bytes_recv = total_bytes_recv
+                delta_sent += c.get('bytes_sent', 0) or 0
+                delta_recv += c.get('bytes_recv', 0) or 0
 
         # Send stats_text, datetime_text, recording indicator, mode indicator, rejected overlay,
         # agent status, traffic histogram AND pulse to JS in a single runJavaScript call.
