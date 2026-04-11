@@ -42,19 +42,40 @@ except ImportError:
 # proxy services) that would otherwise be missed because they never linger
 # in ESTABLISHED long enough for a periodic OS-table snapshot to see them.
 _ACTIVE_TCP_STATES_PSUTIL = frozenset()
+_DYING_TCP_STATES_PSUTIL = frozenset()
 if _psutil is not None:
     _ACTIVE_TCP_STATES_PSUTIL = frozenset({
         _psutil.CONN_ESTABLISHED,
         _psutil.CONN_SYN_SENT,
         _psutil.CONN_SYN_RECV,
     })
+    # Closing/dying states: not shown to the user but still tracked in the
+    # ``alive`` set so that sniffer-based collectors (Scapy) do not
+    # resurface them as "Unknown" sniffer-only entries.
+    _DYING_TCP_STATES_PSUTIL = frozenset({
+        _psutil.CONN_TIME_WAIT,
+        _psutil.CONN_CLOSE_WAIT,
+        _psutil.CONN_FIN_WAIT1,
+        _psutil.CONN_FIN_WAIT2,
+        _psutil.CONN_LAST_ACK,
+        _psutil.CONN_CLOSING,
+        _psutil.CONN_CLOSE,
+    })
 
 # Equivalent state names used by platform CLI tools (netstat / ss).
 _ACTIVE_TCP_STATES_NETSTAT = frozenset({
     'ESTABLISHED', 'SYN_SENT', 'SYN_RECV', 'SYN_RECEIVED',
 })
+_DYING_TCP_STATES_NETSTAT = frozenset({
+    'TIME_WAIT', 'TIME_WAIT2', 'CLOSE_WAIT',
+    'FIN_WAIT_1', 'FIN_WAIT_2', 'LAST_ACK', 'CLOSING',
+})
 _ACTIVE_TCP_STATES_SS = frozenset({
     'ESTAB', 'SYN-SENT', 'SYN-RECV',
+})
+_DYING_TCP_STATES_SS = frozenset({
+    'TIME-WAIT', 'CLOSE-WAIT',
+    'FIN-WAIT-1', 'FIN-WAIT-2', 'LAST-ACK', 'CLOSING',
 })
 
 # When True, psutil results are always supplemented with the platform netstat
@@ -466,10 +487,14 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
         is_tcp = (conn.type == _socket.SOCK_STREAM)
         is_udp = (conn.type == _socket.SOCK_DGRAM)
 
+        dying = False          # True for closing/TIME_WAIT TCP states
         if is_tcp:
             proto = 'TCP'
             if conn.status not in _ACTIVE_TCP_STATES_PSUTIL:
-                continue
+                if conn.status in _DYING_TCP_STATES_PSUTIL:
+                    dying = True   # track in alive but don't add to conns
+                else:
+                    continue
         elif is_udp:
             proto = 'UDP'
         else:
@@ -531,6 +556,15 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
             ip_type = 'IPv4'
 
         # --- PID / process -----------------------------------------------
+        key = (l_ip, l_port, r_ip, r_port, proto)
+        alive.add(key)
+
+        # Dying (TIME_WAIT, CLOSE_WAIT …) connections are tracked in alive
+        # so sniffer-based collectors know the OS still owns them, but they
+        # are not added to the visible connection list.
+        if dying:
+            continue
+
         pid_str = str(conn.pid) if conn.pid else ''
         proc_name = ''
         if conn.pid:
@@ -546,8 +580,6 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
             if not proc_name:
                 proc_name = _resolve_process(pid_str)
 
-        key = (l_ip, l_port, r_ip, r_port, proto)
-        alive.add(key)
         if key not in conns:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
@@ -581,14 +613,16 @@ def _parse_netstat_windows(hostname: str) -> tuple[dict, set]:
         parts = line.split()
         # Expected: Proto  LocalAddress  ForeignAddress  State  PID
         # TCP lines have 5 cols, UDP lines have 4 cols (no State)
+        dying = False
         if parts[0] == 'TCP':
             if len(parts) < 5:
                 continue
             state = parts[3]
-            if state in ('TIME_WAIT', 'TIME_WAIT2'):
-                continue
             if state not in _ACTIVE_TCP_STATES_NETSTAT:
-                continue
+                if state in _DYING_TCP_STATES_NETSTAT:
+                    dying = True   # track in alive but don't add to conns
+                else:
+                    continue
             proto = 'TCP'
             local_addr = parts[1]
             remote_addr = parts[2]
@@ -618,6 +652,8 @@ def _parse_netstat_windows(hostname: str) -> tuple[dict, set]:
         ip_type = l_type or r_type or 'IPv4'
         key = (l_ip, l_port, r_ip, r_port, proto)
         alive.add(key)
+        if dying:
+            continue
         if key not in conns:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
@@ -684,8 +720,12 @@ def _parse_ss(hostname: str) -> tuple[dict, set]:
             continue
 
         state = parts[1]
+        dying = False
         if proto == 'TCP' and state not in _ACTIVE_TCP_STATES_SS:
-            continue
+            if state in _DYING_TCP_STATES_SS:
+                dying = True
+            else:
+                continue
 
         local_addr = parts[4]
         remote_addr = parts[5] if len(parts) > 5 else ''
@@ -701,6 +741,11 @@ def _parse_ss(hostname: str) -> tuple[dict, set]:
 
         ip_type = l_type or r_type or 'IPv4'
 
+        key = (l_ip, l_port, r_ip, r_port, proto)
+        alive.add(key)
+        if dying:
+            continue
+
         # Extract PID and process from the process info column
         pid_str = ''
         proc_name = ''
@@ -712,8 +757,6 @@ def _parse_ss(hostname: str) -> tuple[dict, set]:
             if m2:
                 proc_name = m2.group(1)
 
-        key = (l_ip, l_port, r_ip, r_port, proto)
-        alive.add(key)
         if key not in conns:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
@@ -811,12 +854,16 @@ def _parse_netstat_linux(hostname: str) -> tuple[dict, set]:
         remote_addr = parts[4]
 
         # TCP needs ESTABLISHED
+        dying = False
         if proto == 'TCP':
             if len(parts) < 7:
                 continue
             state = parts[5]
             if state not in _ACTIVE_TCP_STATES_NETSTAT:
-                continue
+                if state in _DYING_TCP_STATES_NETSTAT:
+                    dying = True
+                else:
+                    continue
             pid_proc = parts[8] if len(parts) > 8 else ''
         else:
             # UDP has no state column
@@ -831,6 +878,11 @@ def _parse_netstat_linux(hostname: str) -> tuple[dict, set]:
 
         ip_type = l_type or r_type or 'IPv4'
 
+        key = (l_ip, l_port, r_ip, r_port, proto)
+        alive.add(key)
+        if dying:
+            continue
+
         # pid_proc is like "1234/sshd" or "-"
         pid_str = ''
         proc_name = ''
@@ -839,8 +891,6 @@ def _parse_netstat_linux(hostname: str) -> tuple[dict, set]:
             pid_str = pp[0]
             proc_name = pp[1] if len(pp) > 1 else ''
 
-        key = (l_ip, l_port, r_ip, r_port, proto)
-        alive.add(key)
         if key not in conns:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
@@ -880,10 +930,14 @@ def _parse_netstat_macos(hostname: str) -> tuple[dict, set]:
             local_addr = parts[3]
             remote_addr = parts[4]
 
+            dying = False
             if proto_name == 'TCP':
                 state = parts[5] if len(parts) > 5 else ''
                 if state not in _ACTIVE_TCP_STATES_NETSTAT:
-                    continue
+                    if state in _DYING_TCP_STATES_NETSTAT:
+                        dying = True
+                    else:
+                        continue
 
             l_ip, l_port = _split_macos(local_addr)
             r_ip, r_port = _split_macos(remote_addr)
@@ -902,6 +956,8 @@ def _parse_netstat_macos(hostname: str) -> tuple[dict, set]:
 
             key = (l_ip, l_port, r_ip, r_port, proto_name)
             alive.add(key)
+            if dying:
+                continue
             if key not in conns:
                 conns[key] = _make_conn(
                     proto_name, l_ip, l_port, r_ip, r_port, ip_type,
@@ -960,6 +1016,13 @@ def _parse_netstat_generic(hostname: str) -> tuple[dict, set]:
         local_addr = parts[3]
         remote_addr = parts[4] if len(parts) > 4 else ''
 
+        # Best-effort state detection for TCP (state column varies by OS)
+        dying = False
+        if proto == 'TCP' and len(parts) > 5:
+            state = parts[5]
+            if state in _DYING_TCP_STATES_NETSTAT:
+                dying = True
+
         l_ip, l_port, l_type = _split_addr(local_addr)
         r_ip, r_port, r_type = _split_addr(remote_addr)
         if not l_ip or not r_ip or not l_port or not r_port:
@@ -970,6 +1033,8 @@ def _parse_netstat_generic(hostname: str) -> tuple[dict, set]:
         ip_type = l_type or r_type or 'IPv4'
         key = (l_ip, l_port, r_ip, r_port, proto)
         alive.add(key)
+        if dying:
+            continue
         if key not in conns:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
