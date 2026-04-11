@@ -194,12 +194,18 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             #    These are short-lived flows that closed before netstat/ss
             #    ran, or connections the OS table snapshot missed.
             #    Copy the cached PID/process so step 5 can use them.
+            #    Also skip connections that the OS still tracks in a dying
+            #    state (TIME_WAIT, CLOSE_WAIT …) — those are in os_alive
+            #    but not in os_conns and should not be resurfaced.
             for key, t in self._traffic.items():
                 if key in os_conns:
                     continue
                 src, sp, dst, dp, proto = key
                 rev_key = (dst, dp, src, sp, proto)
                 if rev_key in os_conns:
+                    continue
+                # Skip connections the OS still knows about (dying states)
+                if self._is_alive_in_os(key, os_alive):
                     continue
                 # Skip wildcard / unroutable remotes
                 if dst in ('0.0.0.0', '::', '*', ''):
@@ -215,22 +221,24 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         #    blocking the sniffer thread during PID lookups).
         #    Prefer PID/process captured at sniff-time (the connection
         #    was still alive then); fall back to a live lookup.
+        #    If after all enrichment attempts we still have no process name
+        #    the connection most likely just closed (TIME_WAIT race) — drop
+        #    it rather than showing "Unknown".
         for key, tinfo in sniffer_only.items():
             src, sp, dst, dp, proto = key
             pid_str = tinfo.get('pid', '')
             proc_name = tinfo.get('process', '')
             if not proc_name:
                 pid_str, proc_name = self._lookup_pid(sp, proto)
-            # if not proc_name:
-            #     logging.debug(
-            #         f"ScapyLiveCollector: no proc_name for pid: {sp} proto: {proto}"
-            #     )
             if not proc_name and str(dp) == '53':
                 proc_name = 'DNS (System)'
 
+            if not proc_name:
+                continue  # unresolvable — almost certainly a dying connection
+
             ip_type = 'IPv6' if ':' in src else 'IPv4'
             os_conns[key] = {
-                'process': proc_name or 'Unknown',
+                'process': proc_name,
                 'pid': pid_str,
                 'protocol': proto,
                 'local': src,
