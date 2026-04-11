@@ -36,6 +36,87 @@ try:
 except ImportError:
     _psutil = None
 
+# TCP states considered "active" — connections in these states have a known
+# remote endpoint and are worth displaying.  ESTABLISHED is the main one;
+# SYN_SENT / SYN_RECV catch transient connections (e.g. VPN reconnects,
+# proxy services) that would otherwise be missed because they never linger
+# in ESTABLISHED long enough for a periodic OS-table snapshot to see them.
+_ACTIVE_TCP_STATES_PSUTIL = frozenset()
+if _psutil is not None:
+    _ACTIVE_TCP_STATES_PSUTIL = frozenset({
+        _psutil.CONN_ESTABLISHED,
+        _psutil.CONN_SYN_SENT,
+        _psutil.CONN_SYN_RECV,
+    })
+
+# Equivalent state names used by platform CLI tools (netstat / ss).
+_ACTIVE_TCP_STATES_NETSTAT = frozenset({
+    'ESTABLISHED', 'SYN_SENT', 'SYN_RECV', 'SYN_RECEIVED',
+})
+_ACTIVE_TCP_STATES_SS = frozenset({
+    'ESTAB', 'SYN-SENT', 'SYN-RECV',
+})
+
+# When True, psutil results are always supplemented with the platform netstat
+# parser so that connections visible to netstat but missed by psutil are included.
+_supplement_psutil_with_netstat: bool = True
+
+# Last netstat-derived (lport, proto) -> (pid_str, proc_name) mapping.
+# Populated during get_os_connections() when supplement mode is active so that
+# callers (e.g. ScapyLiveCollector._refresh_pid_cache) can enrich their own
+# PID caches with process names that netstat reported but psutil missed.
+_netstat_pid_supplement: dict = {}
+
+
+def set_supplement_psutil_with_netstat(enabled: bool) -> None:
+    """Configure whether the netstat supplement is applied on top of psutil."""
+    global _supplement_psutil_with_netstat
+    _supplement_psutil_with_netstat = bool(enabled)
+
+
+def get_netstat_pid_supplement() -> dict:
+    """Return the most recent ``(lport_str, proto) -> (pid_str, proc_name)``
+    mapping extracted from the netstat collection pass.
+
+    Only populated when supplement mode is active.  The dict is replaced
+    atomically on every ``get_os_connections()`` call so callers always see
+    a consistent snapshot.
+    """
+    return _netstat_pid_supplement
+
+
+def flush_all_caches() -> None:
+    """Clear every module-level process/PID cache.
+
+    Call this after a system sleep/resume cycle so that stale PID→name
+    mappings (where the PID may have been recycled by a different process)
+    are discarded and rebuilt from scratch on the next collection pass.
+    """
+    import time as _time
+    global _proc_cache, _tasklist_cache, _tasklist_cache_time
+    global _proc_negative_cache, _proc_negative_cache_time
+    _proc_cache.clear()
+    _tasklist_cache.clear()
+    _tasklist_cache_time = 0.0
+    _proc_negative_cache = set()
+    _proc_negative_cache_time = 0.0
+    logging.debug("os_conn_table: all caches flushed (sleep/resume)")
+
+
+def get_tasklist_snapshot() -> dict[str, str]:
+    """Return the current ``tasklist`` PID→name cache (Windows only).
+
+    Calls ``_refresh_tasklist_cache()`` to ensure the data is fresh (respects
+    the 2-second TTL) and returns the module-level ``_tasklist_cache`` dict
+    mapping PID strings to process names.
+
+    On non-Windows platforms the returned dict is always empty.
+    """
+    if _platform.system() == 'Windows':
+        _refresh_tasklist_cache()
+    return _tasklist_cache
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -64,11 +145,57 @@ def get_os_connections(hostname: str | None = None) -> tuple[dict, set]:
 
     # --- Prefer psutil (fast, complete, no subprocess) -------------------
     if _psutil is not None:
-        result = _parse_psutil(hn)
-        if result[0]:  # got at least one connection
-            return result
-        # psutil returned nothing — may be a transient permission issue;
-        # fall through to the platform-specific subprocess parser.
+        psutil_conns, psutil_alive = _parse_psutil(hn)
+        if psutil_conns and not _supplement_psutil_with_netstat:
+            return psutil_conns, psutil_alive
+        # Either psutil returned nothing (possible permission issue) or
+        # supplementing is enabled — run the platform netstat parser too.
+        system = _platform.system()
+        if system == 'Windows':
+            ns_conns, ns_alive = _parse_netstat_windows(hn)
+        elif system == 'Linux':
+            ns_conns, ns_alive = _parse_linux(hn)
+        elif system == 'Darwin':
+            ns_conns, ns_alive = _parse_netstat_macos(hn)
+        else:
+            ns_conns, ns_alive = _parse_netstat_generic(hn)
+        # Build a (lport, proto) -> (pid_str, proc_name) map from netstat
+        # entries that carry a real process name.  This lets callers such as
+        # ScapyLiveCollector._refresh_pid_cache enrich their PID caches with
+        # names that netstat reported but psutil may have missed.
+        global _netstat_pid_supplement
+        supplement: dict = {}
+        for conn in ns_conns.values():
+            lport = conn.get('localport', '')
+            proto = conn.get('protocol', '')
+            pid_str = conn.get('pid', '')
+            proc_name = conn.get('process', '')
+            if lport and proto and proc_name and proc_name != 'Unknown':
+                key = (lport, proto)
+                if key not in supplement:
+                    supplement[key] = (pid_str, proc_name)
+        _netstat_pid_supplement = supplement
+
+        # Merge: psutil entries take precedence (richer process info); netstat
+        # entries fill in any keys that psutil did not report.
+        # Exception: if the psutil entry has "Unknown" as the process name but
+        # the netstat entry has a real name, keep the netstat name/pid.
+        merged_conns = dict(ns_conns)
+        for key, ps_conn in psutil_conns.items():
+            ns_conn = merged_conns.get(key)
+            if ns_conn is not None:
+                ps_proc = ps_conn.get('process', '')
+                ns_proc = ns_conn.get('process', '')
+                if ps_proc in ('Unknown', '') and ns_proc and ns_proc != 'Unknown':
+                    # Keep the netstat entry's process/pid but take everything
+                    # else from psutil (it has richer metadata overall).
+                    ps_conn = dict(ps_conn)
+                    ps_conn['process'] = ns_proc
+                    if ns_conn.get('pid'):
+                        ps_conn['pid'] = ns_conn['pid']
+            merged_conns[key] = ps_conn
+        merged_alive = ns_alive | psutil_alive
+        return merged_conns, merged_alive
 
     system = _platform.system()
 
@@ -89,21 +216,101 @@ def get_os_connections(hostname: str | None = None) -> tuple[dict, set]:
 
 _proc_cache: dict[str, str] = {}
 
+# Windows tasklist fallback — maps PID string to process name.
+# Used when psutil.Process(pid).name() throws AccessDenied for
+# protected/system processes.  tasklist does not require elevation.
+_tasklist_cache: dict[str, str] = {}
+_tasklist_cache_time: float = 0.0
+_TASKLIST_CACHE_TTL: float = 2.0  # seconds
+
+# Negative cache — PIDs that failed all resolution attempts.
+# Cleared every _NEGATIVE_CACHE_TTL seconds so transient failures are retried.
+_proc_negative_cache: set = set()
+_proc_negative_cache_time: float = 0.0
+_NEGATIVE_CACHE_TTL: float = 5.0  # seconds
+
+
+def _refresh_tasklist_cache() -> None:
+    """Rebuild ``_tasklist_cache`` from ``tasklist /fo csv /nh`` (Windows).
+
+    Non-elevated — lists every process visible to the current user,
+    including System (PID 4) and services that psutil may not be able to
+    query by PID due to access restrictions.
+    """
+    global _tasklist_cache, _tasklist_cache_time
+    import time as _time
+    now = _time.monotonic()
+    if now - _tasklist_cache_time < _TASKLIST_CACHE_TTL and _tasklist_cache:
+        return  # still fresh
+    new_cache: dict[str, str] = {}
+    try:
+        import csv as _csv
+        import io as _io
+        output = subprocess.check_output(
+            ['tasklist', '/fo', 'csv', '/nh'], timeout=10,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        ).decode('utf-8', errors='replace')
+        for row in _csv.reader(_io.StringIO(output)):
+            if len(row) >= 2:
+                name = row[0].strip()
+                pid = row[1].strip()
+                if pid.isdigit() and name:
+                    new_cache[pid] = name
+    except Exception:
+        pass
+    _tasklist_cache = new_cache
+    _tasklist_cache_time = now
+
 
 def _resolve_process(pid_str: str) -> str:
-    """Return process name for *pid_str*, or ``''``."""
+    """Return process name for *pid_str*, or ``''``.
+
+    Resolution order:
+    1. Positive cache hit.
+    2. ``psutil.Process(pid).name()``.
+    3. Windows ``tasklist`` cache (handles AccessDenied PIDs).
+    4. Negative-cache the PID for ``_NEGATIVE_CACHE_TTL`` seconds.
+    """
+    import time as _time
+    global _proc_negative_cache, _proc_negative_cache_time
+
     if not pid_str or pid_str == '-' or pid_str == '0':
         return ''
-    if pid_str in _proc_cache:
-        return _proc_cache[pid_str]
+
+    # 1. Positive cache
+    cached = _proc_cache.get(pid_str)
+    if cached:
+        return cached
+
+    # Clear stale negative cache
+    now = _time.monotonic()
+    if now - _proc_negative_cache_time >= _NEGATIVE_CACHE_TTL:
+        _proc_negative_cache = set()
+        _proc_negative_cache_time = now
+
+    if pid_str in _proc_negative_cache:
+        return ''
+
+    # 2. psutil
     if _psutil is not None:
         try:
             name = _psutil.Process(int(pid_str)).name()
-            _proc_cache[pid_str] = name
-            return name
+            if name:
+                _proc_cache[pid_str] = name
+                return name
         except Exception:
             pass
-    _proc_cache[pid_str] = ''
+
+    # 3. Windows tasklist fallback
+    if _platform.system() == 'Windows':
+        _refresh_tasklist_cache()
+        name = _tasklist_cache.get(pid_str, '')
+        if name:
+            _proc_cache[pid_str] = name
+            return name
+
+    # 4. Negative-cache — will be retried after TTL expires
+    _proc_negative_cache.add(pid_str)
     return ''
 
 
@@ -111,8 +318,11 @@ def _make_conn(proto: str, local_ip: str, local_port: str,
                remote_ip: str, remote_port: str, ip_type: str,
                pid_str: str, proc_name: str, hostname: str) -> dict:
     """Build a connection dict matching the plugin schema."""
+    name = proc_name or _resolve_process(pid_str)
+    if not name and remote_port == '53':
+        name = 'DNS (System)'
     return {
-        'process': proc_name or _resolve_process(pid_str) or 'Unknown',
+        'process': name or 'Unknown',
         'pid': pid_str,
         'protocol': proto,
         'local': local_ip,
@@ -222,6 +432,22 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
     conns: dict = {}
     alive: set = set()
 
+    # Snapshot PID → process name mapping *before* iterating connections.
+    # This eliminates the race condition where a short-lived process exits
+    # between psutil.net_connections() and psutil.Process(pid).name(),
+    # which would otherwise leave the connection as "Unknown".
+    pid_name_snapshot: dict[int, str] = {}
+    try:
+        for proc in _psutil.process_iter(['pid', 'name']):
+            try:
+                info = proc.info
+                if info['pid'] and info['name']:
+                    pid_name_snapshot[info['pid']] = info['name']
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     try:
         all_connections = _psutil.net_connections(kind='inet')
     except Exception as e:
@@ -242,7 +468,7 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
 
         if is_tcp:
             proto = 'TCP'
-            if conn.status != _psutil.CONN_ESTABLISHED:
+            if conn.status not in _ACTIVE_TCP_STATES_PSUTIL:
                 continue
         elif is_udp:
             proto = 'UDP'
@@ -308,10 +534,17 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
         pid_str = str(conn.pid) if conn.pid else ''
         proc_name = ''
         if conn.pid:
-            try:
-                proc_name = _psutil.Process(conn.pid).name()
-            except Exception:
-                pass
+            # 1. Pre-snapshotted name (immune to race conditions)
+            proc_name = pid_name_snapshot.get(conn.pid, '')
+            # 2. Live psutil lookup (may succeed for long-lived processes)
+            if not proc_name:
+                try:
+                    proc_name = _psutil.Process(conn.pid).name()
+                except Exception:
+                    pass
+            # 3. Multi-tier fallback (tasklist, negative-cache with TTL)
+            if not proc_name:
+                proc_name = _resolve_process(pid_str)
 
         key = (l_ip, l_port, r_ip, r_port, proto)
         alive.add(key)
@@ -352,7 +585,9 @@ def _parse_netstat_windows(hostname: str) -> tuple[dict, set]:
             if len(parts) < 5:
                 continue
             state = parts[3]
-            if state != 'ESTABLISHED':
+            if state in ('TIME_WAIT', 'TIME_WAIT2'):
+                continue
+            if state not in _ACTIVE_TCP_STATES_NETSTAT:
                 continue
             proto = 'TCP'
             local_addr = parts[1]
@@ -449,7 +684,7 @@ def _parse_ss(hostname: str) -> tuple[dict, set]:
             continue
 
         state = parts[1]
-        if proto == 'TCP' and state != 'ESTAB':
+        if proto == 'TCP' and state not in _ACTIVE_TCP_STATES_SS:
             continue
 
         local_addr = parts[4]
@@ -580,7 +815,7 @@ def _parse_netstat_linux(hostname: str) -> tuple[dict, set]:
             if len(parts) < 7:
                 continue
             state = parts[5]
-            if state != 'ESTABLISHED':
+            if state not in _ACTIVE_TCP_STATES_NETSTAT:
                 continue
             pid_proc = parts[8] if len(parts) > 8 else ''
         else:
@@ -647,7 +882,7 @@ def _parse_netstat_macos(hostname: str) -> tuple[dict, set]:
 
             if proto_name == 'TCP':
                 state = parts[5] if len(parts) > 5 else ''
-                if state != 'ESTABLISHED':
+                if state not in _ACTIVE_TCP_STATES_NETSTAT:
                     continue
 
             l_ip, l_port = _split_macos(local_addr)
