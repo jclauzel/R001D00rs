@@ -41,7 +41,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.6.9" # Current script version
+VERSION = "3.7.1" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -660,7 +660,10 @@ class ConnectionCollectorWorker(QRunnable):
         except Exception as e:
             logging.error(f"ConnectionCollectorWorker error: {e}")
             connections = []
-        self.signals.finished.emit(connections, self.slider_position)
+        try:
+            self.signals.finished.emit(connections, self.slider_position)
+        except RuntimeError:
+            logging.debug("ConnectionCollectorWorker: signal emit skipped (source deleted)")
 
 class DNSWorker:
     """
@@ -3068,7 +3071,7 @@ class TCPConnectionViewer(QMainWindow):
         # Only offer local-process tools when the row comes from this machine
         _is_remote_agent = bool(row_hostname) and row_hostname != LOCAL_HOSTNAME
         action_open = action_memory = action_procmon = None
-        if not _is_remote_agent:
+        if not _is_remote_agent and process_name != "" and process_name != "Unknown":
             if platform.system() == "Windows":
                 action_open = menu.addAction(f"Open {process_name} pid:{pid} in Process Explorer")
                 action_memory = menu.addAction(f"Capture {process_name} pid:{pid} ProcDump full memory")
@@ -3165,56 +3168,58 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", str(e))
             elif chosen == action_procmon:
-                try:
+
+                if process_name != "" and process_name != "Unknown":
                     try:
-                        from procmon_parser import dump_configuration, Rule
-                    except ImportError as e:
-                        QMessageBox.warning(self, "procmon-parser not found",
-                                            "procmon-parser is required to generate Process Monitor configurations.\n\n"
-                                            "Install it using:\npip install procmon-parser\n\n"
-                                            "See: https://github.com/eronnen/procmon-parser")
-                        return
-
-                    procmon_dir = "procmon"
-                    os.makedirs(procmon_dir, exist_ok=True)
-
-                    timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-                    safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in process_name)
-                    pmc_filename = f"tcp_geo_map_{timestamp}_{safe_name}_{pid}.pmc"
-                    pmc_path = os.path.join(procmon_dir, pmc_filename)
-
-                    config = {
-                        "DestructiveFilter": 0,
-                        "FilterRules": [
-                            Rule('PID', 'is', pid, 'include'),
-                            Rule('Process_Name', 'is', process_name, 'include'),
-                        ],
-                    }
-
-                    with open(pmc_path, "wb") as f:
-                        dump_configuration(config, f)
-
-                    abs_pmc = os.path.abspath(pmc_path)
-                    CREATE_NEW_PROCESS_GROUP = 0x00000200
-                    CREATE_NEW_CONSOLE = 0x00000010
-                    procmon_launched = False
-                    for procmon_exe in ("Procmon64.exe", "Procmon.exe"):
                         try:
-                            subprocess.Popen(
-                                [procmon_exe, "/LoadConfig", abs_pmc, "/Quiet"],
-                                creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
-                                close_fds=True,
-                            )
-                            procmon_launched = True
-                            break
-                        except FileNotFoundError:
-                            continue
-                    if not procmon_launched:
-                        QMessageBox.warning(self, "Process Monitor not found",
-                                            "Process Monitor (Procmon64.exe / Procmon.exe) was not found on PATH.\n"
-                                            "Download it from https://learn.microsoft.com/en-us/sysinternals/downloads/process-monitor")
-                except Exception as e:
-                    QMessageBox.critical(self, "Error", str(e))
+                            from procmon_parser import dump_configuration, Rule
+                        except ImportError as e:
+                            QMessageBox.warning(self, "procmon-parser not found",
+                                                "procmon-parser is required to generate Process Monitor configurations.\n\n"
+                                                "Install it using:\npip install procmon-parser\n\n"
+                                                "See: https://github.com/eronnen/procmon-parser")
+                            return
+
+                        procmon_dir = "procmon"
+                        os.makedirs(procmon_dir, exist_ok=True)
+
+                        timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+                        safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in process_name)
+                        pmc_filename = f"tcp_geo_map_{timestamp}_{safe_name}_{pid}.pmc"
+                        pmc_path = os.path.join(procmon_dir, pmc_filename)
+
+                        config = {
+                            "DestructiveFilter": 0,
+                            "FilterRules": [
+                                Rule('PID', 'is', pid, 'include'),
+                                Rule('Process_Name', 'is', process_name, 'include'),
+                            ],
+                        }
+
+                        with open(pmc_path, "wb") as f:
+                            dump_configuration(config, f)
+
+                        abs_pmc = os.path.abspath(pmc_path)
+                        CREATE_NEW_PROCESS_GROUP = 0x00000200
+                        CREATE_NEW_CONSOLE = 0x00000010
+                        procmon_launched = False
+                        for procmon_exe in ("Procmon64.exe", "Procmon.exe"):
+                            try:
+                                subprocess.Popen(
+                                    [procmon_exe, "/LoadConfig", abs_pmc, "/Quiet"],
+                                    creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                                    close_fds=True,
+                                )
+                                procmon_launched = True
+                                break
+                            except FileNotFoundError:
+                                continue
+                        if not procmon_launched:
+                            QMessageBox.warning(self, "Process Monitor not found",
+                                                "Process Monitor (Procmon64.exe / Procmon.exe) was not found on PATH.\n"
+                                                "Download it from https://learn.microsoft.com/en-us/sysinternals/downloads/process-monitor")
+                    except Exception as e:
+                        QMessageBox.critical(self, "Error", str(e))
         else:
             if chosen == action_open:
                 try:
@@ -3485,7 +3490,7 @@ class TCPConnectionViewer(QMainWindow):
         return True
 
     @Slot()
-    def apply_connection_table_filter(self):
+    def apply_connection_table_filter(self, update_map=True):
         """Show/hide connection table rows based on the active per-column filter inputs,
         then re-render the map so it reflects the same filtered view."""
         try:
@@ -3507,11 +3512,12 @@ class TCPConnectionViewer(QMainWindow):
             pass
 
         # Re-render the map to match the filtered table view
-        try:
-            if hasattr(self, 'connections') and self.connections is not None:
-                self._update_map_with_filter()
-        except Exception:
-            pass
+        if update_map:
+            try:
+                if hasattr(self, 'connections') and self.connections is not None:
+                    self._update_map_with_filter()
+            except Exception:
+                pass
 
     def _sync_summary_filter_widths(self):
         """Resize summary filter bar inputs to match the current summary table column widths."""
@@ -6028,7 +6034,9 @@ class TCPConnectionViewer(QMainWindow):
             # Log error but don't reload to prevent infinite loop
             logging.error(f"Exception in _call_update_js: {e}")
 
-    _PUBLIC_IP_TTL = 5  # seconds between external IP lookups
+    @property
+    def _PUBLIC_IP_TTL(self):
+        return map_refresh_interval / 1000  # seconds between external IP lookups
 
     def _check_network_changed(self) -> bool:
         """Return True (and reset caches) if the local NIC addresses changed.
@@ -7866,6 +7874,7 @@ class TCPConnectionViewer(QMainWindow):
             self._async_collection_in_progress = True
             worker = ConnectionCollectorWorker(self.get_active_tcp_connections, slider_position)
             worker.signals.finished.connect(self._on_connections_ready)
+            self._collector_worker = worker  # keep alive until slot fires
             QThreadPool.globalInstance().start(worker)
         else:
             connections = self.get_active_tcp_connections(slider_position)
@@ -7875,6 +7884,7 @@ class TCPConnectionViewer(QMainWindow):
     def _on_connections_ready(self, connections, slider_position):
         """Called on the UI thread when the async connection worker finishes."""
         self._async_collection_in_progress = False
+        self._collector_worker = None  # release the worker reference
         self._apply_connections(connections, slider_position)
 
     @Slot(object, object)
@@ -8075,7 +8085,7 @@ class TCPConnectionViewer(QMainWindow):
                         break
             except Exception as e:
                 logging.debug(f"Could not restore selection: {e}")
-        self.apply_connection_table_filter()
+        self.apply_connection_table_filter(update_map=False)
 
     @Slot(bool)
     def on_map_loaded(self, success):
