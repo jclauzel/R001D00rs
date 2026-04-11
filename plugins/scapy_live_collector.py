@@ -169,6 +169,10 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                 if traffic:
                     conn['bytes_sent'] = traffic.get('bytes_sent', 0)
                     conn['bytes_recv'] = traffic.get('bytes_recv', 0)
+                    # Reset counters so the next cycle reports only new
+                    # traffic.  Idle connections will naturally show 0.
+                    traffic['bytes_sent'] = 0
+                    traffic['bytes_recv'] = 0
                     matched += 1
                     # Back-fill PID/process from the sniffer cache when
                     # the OS table couldn't resolve them.
@@ -216,6 +220,9 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     'pid': t.get('pid', ''),
                     'process': t.get('process', ''),
                 }
+                # Reset so the next cycle reports only new traffic.
+                t['bytes_sent'] = 0
+                t['bytes_recv'] = 0
 
         # 5. Enrich sniffer-only connections (outside the lock to avoid
         #    blocking the sniffer thread during PID lookups).
