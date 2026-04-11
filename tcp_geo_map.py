@@ -32,12 +32,16 @@ from PySide6.QtWebChannel import QWebChannel
 
 # Import ConnectionCollectorPlugin for plugin system
 from connection_collector_plugin import ConnectionCollectorPlugin
+from plugins.os_conn_table import set_supplement_psutil_with_netstat as _set_supplement_psutil
+from plugins.os_conn_table import _resolve_process as _resolve_process_fallback
+from plugins.os_conn_table import get_os_connections as _get_os_connections
+from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 
 # --- Constants that must be defined early ---
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.6.8" # Current script version
+VERSION = "3.6.9" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -163,6 +167,49 @@ IPV4_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv4.mmdb")
 IPV6_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv6.mmdb")
 C2_TRACKER_DB_PATH = os.path.join(DB_DIR, "all.txt")
 SETTINGS_FILE_NAME = "settings.json"
+
+# Default logging level — overridden at startup by loggingLevel in settings.json
+logging_level = "WARNING"  # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Mapping of level name strings to logging module constants
+_LOGGING_LEVEL_MAP = {
+    "DEBUG":    logging.DEBUG,
+    "INFO":     logging.INFO,
+    "WARNING":  logging.WARNING,
+    "ERROR":    logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+# Configure logging early with a sensible default.
+# The level is refreshed from settings.json by _load_logging_level_from_settings()
+# which is called immediately after its definition below.
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s %(levelname)s %(message)s',
+)
+
+
+def _load_logging_level_from_settings():
+    """Read loggingLevel from settings.json and apply it to the root logger.
+
+    Called once at module startup so the configured level takes effect before
+    the UI or any background threads are created.
+    """
+    global logging_level
+    try:
+        if os.path.exists(SETTINGS_FILE_NAME):
+            with open(SETTINGS_FILE_NAME, 'r') as _f:
+                _s = json.load(_f)
+            _level_str = str(_s.get('loggingLevel', 'WARNING')).upper()
+            if _level_str in _LOGGING_LEVEL_MAP:
+                logging_level = _level_str
+                logging.getLogger().setLevel(_LOGGING_LEVEL_MAP[_level_str])
+    except Exception:
+        pass
+
+
+# Apply logging level from settings.json as early as possible
+_load_logging_level_from_settings()
 
 """ 
     You can pass --accept_eula as a startup parametter to the script to automate download and refresh 
@@ -312,6 +359,8 @@ do_resolve_public_ip = True  # Set to True to resolve public IP addresses to hos
 do_pulse_exit_points = True  # Set to True to animate a pulsing ring on agent/server exit-point circles
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
 do_c2_check = False
+do_always_supplement_psutil_with_netstat_when_available = True  # When True, psutil connection data is always supplemented with netstat to catch any connections psutil may miss
+_set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
 do_pause_table_sorting = False  # Set to True to pause table sorting without stopping updates
 do_show_traffic_gauge = True   # Set to True to show sent/recv traffic gauges next to markers (requires Scapy/PCAP collector)
@@ -728,6 +777,12 @@ class TileRequestInterceptor(QWebEngineUrlRequestInterceptor):
 class PsutilCollector(ConnectionCollectorPlugin):
     """Default collector — enumerates live TCP/UDP connections via psutil."""
 
+    _SLEEP_GAP_THRESHOLD = 30.0  # seconds – same as ScapyLiveCollector
+
+    def __init__(self):
+        super().__init__()
+        self._last_collect_time: float = 0.0
+
     @property
     def name(self) -> str:
         return "psutil (live connections)"
@@ -741,7 +796,35 @@ class PsutilCollector(ConnectionCollectorPlugin):
 
         Each dict contains: process, pid, protocol, local, localport,
         remote, remoteport, ip_type, hostname.
+
+        When ``do_always_supplement_psutil_with_netstat_when_available`` is
+        True, delegates to ``get_os_connections()`` from ``os_conn_table``
+        which merges psutil with the platform netstat parser and has a
+        multi-tier process name resolver (psutil → tasklist → netstat).
+        This eliminates "Unknown" process names for connections where
+        psutil alone can't resolve the PID (race conditions on short-lived
+        connections, AccessDenied on protected processes, etc.).
         """
+
+        # ---- Sleep / resume detection ----------------------------------------
+        import time as _time
+        now = _time.monotonic()
+        if self._last_collect_time:
+            gap = now - self._last_collect_time
+            if gap > self._SLEEP_GAP_THRESHOLD:
+                logging.info(
+                    f"PsutilCollector: detected sleep/resume "
+                    f"(gap={gap:.1f}s) — flushing process caches"
+                )
+                _flush_os_caches()
+        self._last_collect_time = now
+
+        # --- Fast path: supplement enabled → use os_conn_table merge -----
+        if do_always_supplement_psutil_with_netstat_when_available:
+            merged_conns, _ = _get_os_connections(LOCAL_HOSTNAME)
+            return list(merged_conns.values())
+
+        # --- Original psutil-only path -----------------------------------
         raw = []
 
         # Get all connections once (both TCP and UDP)
@@ -761,8 +844,13 @@ class PsutilCollector(ConnectionCollectorPlugin):
             is_udp = (conn.type == socket.SOCK_DGRAM)
             protocol = "TCP" if is_tcp else ("UDP" if is_udp else "Unknown")
 
-            # For TCP, only ESTABLISHED; for UDP, all
-            if is_tcp and conn.status != psutil.CONN_ESTABLISHED:
+            # For TCP, only active states (ESTABLISHED, SYN_SENT, SYN_RECV);
+            # for UDP, all
+            if is_tcp and conn.status not in (
+                psutil.CONN_ESTABLISHED,
+                psutil.CONN_SYN_SENT,
+                psutil.CONN_SYN_RECV,
+            ):
                 continue
 
             try:
@@ -777,8 +865,15 @@ class PsutilCollector(ConnectionCollectorPlugin):
                             try:
                                 p = psutil.Process(pid)
                                 process_name = p.name()
-                                process_cache[pid] = process_name
                             except Exception:
+                                process_name = ''
+                            # Fallback: tasklist / os_conn_table resolver
+                            # (handles AccessDenied for system/protected PIDs)
+                            if not process_name:
+                                process_name = _resolve_process_fallback(str(pid))
+                            if process_name:
+                                process_cache[pid] = process_name
+                            else:
                                 process_name = "Unknown"
                 else:
                     process_name = "Unknown"
@@ -819,6 +914,10 @@ class PsutilCollector(ConnectionCollectorPlugin):
                 # Determine IP type
                 family = getattr(conn, "family", None)
                 ip_type = "IPv4" if family == socket.AF_INET else ("IPv6" if family == socket.AF_INET6 else "")
+
+                # Label unresolved port-53 connections as DNS
+                if ( process_name == "" or process_name == "Unknown") and remote_port == "53":
+                    process_name = "DNS (System)"
 
                 raw.append({
                     'process': process_name,
@@ -986,6 +1085,7 @@ class TCPConnectionViewer(QMainWindow):
         self._public_ip_cache = ""
         self._public_ip_cache_time = 0.0
         self._public_ip_cache_lock = threading.Lock()  # guards _public_ip_cache/_public_ip_cache_time
+        self._last_local_addrs: frozenset = frozenset()  # for VPN/network-change detection
 
         # --- Server / Agent mode runtime state ---
         # Server mode: cache of latest submissions from each agent
@@ -1511,11 +1611,12 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size
+        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
             'do_c2_check' : do_c2_check,
+            'do_always_supplement_psutil_with_netstat_when_available': do_always_supplement_psutil_with_netstat_when_available,
             'show_only_new_active_connections': show_only_new_active_connections,
             'show_only_remote_connections': show_only_remote_connections,
             'do_reverse_dns': do_reverse_dns,
@@ -1544,6 +1645,7 @@ class TCPConnectionViewer(QMainWindow):
             'pcap_file_path': getattr(self, '_pcap_file_path', ''),
             'db_provider_name': db_provider_name,
             'max_connection_list_database_size': max_connection_list_database_size,
+            'loggingLevel': logging_level,
         }
 
         # Save current map position and zoom
@@ -1619,10 +1721,14 @@ class TCPConnectionViewer(QMainWindow):
                 global table_column_sort_index, table_column_sort_reverse
                 global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously
                 global db_provider_name, max_connection_list_database_size
+                global logging_level
+                global do_always_supplement_psutil_with_netstat_when_available
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
                 do_c2_check = settings.get('do_c2_check', do_c2_check)
+                do_always_supplement_psutil_with_netstat_when_available = settings.get('do_always_supplement_psutil_with_netstat_when_available', do_always_supplement_psutil_with_netstat_when_available)
+                _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
                 show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
                 show_only_remote_connections = settings.get('show_only_remote_connections', show_only_remote_connections)
                 do_reverse_dns = settings.get('do_reverse_dns', do_reverse_dns)
@@ -1647,6 +1753,13 @@ class TCPConnectionViewer(QMainWindow):
                         max_connection_list_database_size = _saved_db_size
                 except (ValueError, TypeError):
                     pass
+
+                # Apply logging level from settings
+                _level_str = str(settings.get('loggingLevel', 'WARNING')).upper()
+                if _level_str in _LOGGING_LEVEL_MAP:
+                    logging_level = _level_str
+                    logging.getLogger().setLevel(_LOGGING_LEVEL_MAP[_level_str])
+                    logging.info(f"Logging level set to: {logging_level}")
 
                 # Restore server/agent mode settings (CLI args take precedence)
                 global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
@@ -3088,7 +3201,7 @@ class TCPConnectionViewer(QMainWindow):
                     for procmon_exe in ("Procmon64.exe", "Procmon.exe"):
                         try:
                             subprocess.Popen(
-                                [procmon_exe, "/LoadConfig", abs_pmc],
+                                [procmon_exe, "/LoadConfig", abs_pmc, "/Quiet"],
                                 creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
                                 close_fds=True,
                             )
@@ -3280,7 +3393,7 @@ class TCPConnectionViewer(QMainWindow):
                     for procmon_exe in ("Procmon64.exe", "Procmon.exe"):
                         try:
                             subprocess.Popen(
-                                [procmon_exe, "/LoadConfig", abs_pmc],
+                                [procmon_exe, "/LoadConfig", abs_pmc, "/Quiet"],
                                 creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
                                 close_fds=True,
                             )
@@ -5510,43 +5623,6 @@ class TCPConnectionViewer(QMainWindow):
                     f"{error_msg}\n\nThe application will use CDN resources instead."
                 )
 
-            connections = []
-            
-            for conn in psutil.net_connections(kind='inet4'):
-                if conn.status == psutil.CONN_ESTABLISHED:
-                    try:
-                        # Get process information
-                        process = psutil.Process(conn.pid) if conn.pid else None
-                        process_name = process.name() if process else "Unknown"
-                        
-                        # Get local and remote addresses
-                        local_addr = f"{conn.laddr.ip}:{conn.laddr.port}"
-                        remote_addr = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else ""
-                        
-                        # Determine IP type
-                        ip_type = ""
-                        if conn.family == socket.AF_INET:
-                            ip_type = "IPv4"
-                        elif conn.family == socket.AF_INET6:
-                            ip_type = "IPv6"
-                        
-                        connections.append({
-                            'process': process_name,
-                            'pid': str(conn.pid) if conn.pid else "",
-                            'suspect': '',
-                            'local': local_addr,
-                            'remote': remote_addr,
-                            'name': 'N/A',
-                            'ip_type': ip_type,
-                            'connection': conn,
-                            'icon': 'greenIcon'
-                        })
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        # Skip connections that can't be accessed
-                        continue
-                        
-            return connections
-        
     def _is_pinned_connection(self, conn):
         """Check if *conn* matches the pinned (double-clicked) connection.
 
@@ -5952,7 +6028,45 @@ class TCPConnectionViewer(QMainWindow):
             # Log error but don't reload to prevent infinite loop
             logging.error(f"Exception in _call_update_js: {e}")
 
-    _PUBLIC_IP_TTL = 60  # seconds between external IP lookups
+    _PUBLIC_IP_TTL = 5  # seconds between external IP lookups
+
+    def _check_network_changed(self) -> bool:
+        """Return True (and reset caches) if the local NIC addresses changed.
+
+        Detects VPN connect/disconnect, Wi-Fi roaming, or NIC up/down events
+        by comparing the current set of local IP addresses against the
+        previous snapshot.  When a change is detected:
+
+        * The ``_public_ip_cache`` is invalidated so the next
+          ``get_public_ip()`` call queries ipify immediately.
+        * The HTTP session is closed and recreated so stale keep-alive
+          connections through the old network path are discarded.
+        """
+        try:
+            current = frozenset(self._get_local_ip_addresses())
+        except Exception:
+            return False
+        if not self._last_local_addrs:
+            self._last_local_addrs = current
+            return False
+        if current != self._last_local_addrs:
+            logging.info(
+                "Network change detected (local addresses changed) "
+                "— flushing public IP cache and HTTP session"
+            )
+            self._last_local_addrs = current
+            with self._public_ip_cache_lock:
+                self._public_ip_cache = ""
+                self._public_ip_cache_time = 0.0
+            # Close the old session (drops stale keep-alive connections that
+            # may route through the previous VPN tunnel) and open a fresh one.
+            try:
+                self._http_session.close()
+            except Exception:
+                pass
+            self._http_session = requests.Session()
+            return True
+        return False
 
     def get_public_ip(self):
         """Get public IP address using ipify API with connection pooling and TTL cache.
@@ -5963,6 +6077,9 @@ class TCPConnectionViewer(QMainWindow):
         workers (e.g. _agent_post_worker).
         Returns empty string on error.
         """
+        # Check for VPN / network change and invalidate cache if needed.
+        self._check_network_changed()
+
         now = time.time()
         with self._public_ip_cache_lock:
             if self._public_ip_cache and (now - self._public_ip_cache_time) < self._PUBLIC_IP_TTL:

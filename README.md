@@ -275,6 +275,14 @@ The table below documents every key stored in `settings.json`.
 
 ---
 
+### Logging
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `loggingLevel` | string | `"WARNING"` | Controls the verbosity of the application log. Accepted values (case-insensitive): `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`. Set to `"DEBUG"` to enable full diagnostic output useful for troubleshooting. The level is applied at startup before the UI is created, and again when settings are loaded, so it takes effect as early as possible. Persisted automatically by **Save Settings**. |
+
+---
+
 ### Database persistence
 
 Connection snapshots can optionally be persisted to a database so that history survives application restarts. The database layer is an abstraction — four back-ends are provided out of the box (SQLite, MongoDB, SQL Server, Oracle) and new providers can be added by dropping a `*_provider.py` file into the `db_providers/` package. Only the selected provider's dependencies are imported; the application continues to work normally when the feature is set to **Disabled** (the default).
@@ -315,17 +323,16 @@ The following constants are not exposed in the UI and must be changed directly i
 | `CONNECTION_DATABASES_DIR` | `"connection_databases"` | Subfolder (relative to the script) where file-based database providers (e.g. SQLite) store their database files. Created automatically when a provider is activated. |
 
 # Troubleshooting
-The script can spew additional information by changing in the tcp_geo_map.py:
+To enable verbose diagnostic output, set `loggingLevel` in `settings.json` to `"DEBUG"`:
 
-logging.basicConfig(
+```json
+{
+    "loggingLevel": "DEBUG"
+}
+```
 
-    level=logging.WARNING,
-    
-by
-
-logging.basicConfig(
-
-    level=logging.DEBUG,
+Accepted values (case-insensitive): `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`. The default is `"WARNING"`.
+The level is applied at the next application start. You can also change it at runtime via **Settings → Logging Level** and save with **Save Settings**.
 
 # Known limitations
 - Proxies since this is where the remote IP address is.

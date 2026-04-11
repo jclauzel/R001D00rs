@@ -50,6 +50,9 @@ except ImportError:
 
 from connection_collector_plugin import ConnectionCollectorPlugin
 from plugins.os_conn_table import get_os_connections as _get_os_table
+from plugins.os_conn_table import get_netstat_pid_supplement as _get_netstat_pid_supplement
+from plugins.os_conn_table import flush_all_caches as _flush_os_caches
+from plugins.os_conn_table import get_tasklist_snapshot as _get_tasklist_snapshot
 
 
 class ScapyLiveCollector(ConnectionCollectorPlugin):
@@ -88,9 +91,13 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         self._CONN_TIMEOUT = 10  # seconds to retain byte counters after a connection leaves the OS table
         self._local_addrs: set = set()
         self._local_addrs_time: float = 0.0
-        self._LOCAL_ADDRS_TTL = 2.0  # seconds – detect VPN/NIC changes quickly
+        self._LOCAL_ADDRS_TTL = 1.0  # seconds – detect VPN/NIC changes quickly
+        self._last_collect_time: float = 0.0  # monotonic – for sleep/resume detection
 
     _PID_CACHE_TTL = 1.0  # seconds between psutil connection-table refreshes
+    _SLEEP_GAP_THRESHOLD = 30.0  # seconds – if more than this elapses between
+                                  # collect_raw_connections() calls, assume the
+                                  # system slept and flush all stale caches
 
     # ---- public API ---------------------------------------------------------
 
@@ -114,6 +121,30 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         """
         if not self._started:
             self._start_sniffer()
+
+        # ---- Sleep / resume detection ----------------------------------------
+        # If the gap between consecutive collect_raw_connections() calls exceeds
+        # _SLEEP_GAP_THRESHOLD, the system likely slept.  All caches contain
+        # stale PID→name mappings (PIDs may have been recycled) and the traffic
+        # cache holds pre-sleep connections that no longer exist.  Flush
+        # everything so the first post-resume cycle starts clean.
+        now = time.monotonic()
+        if self._last_collect_time:
+            gap = now - self._last_collect_time
+            if gap > self._SLEEP_GAP_THRESHOLD:
+                logging.info(
+                    f"ScapyLiveCollector: detected sleep/resume "
+                    f"(gap={gap:.1f}s > threshold={self._SLEEP_GAP_THRESHOLD}s) "
+                    f"— flushing all caches"
+                )
+                with self._lock:
+                    self._traffic.clear()
+                with self._pid_cache_lock:
+                    self._pid_cache.clear()
+                    self._pid_cache_time = 0.0
+                self._local_addrs_time = 0.0
+                _flush_os_caches()
+        self._last_collect_time = now
 
         # 1. Authoritative connection list from the OS table
         os_conns, os_alive = _get_os_table(self._hostname)
@@ -190,6 +221,13 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             proc_name = tinfo.get('process', '')
             if not proc_name:
                 pid_str, proc_name = self._lookup_pid(sp, proto)
+            # if not proc_name:
+            #     logging.debug(
+            #         f"ScapyLiveCollector: no proc_name for pid: {sp} proto: {proto}"
+            #     )
+            if not proc_name and str(dp) == '53':
+                proc_name = 'DNS (System)'
+
             ip_type = 'IPv6' if ':' in src else 'IPv4'
             os_conns[key] = {
                 'process': proc_name or 'Unknown',
@@ -263,21 +301,45 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                 new_cache[key] = (c.pid, proc_name)
         except Exception as e:
             logging.debug(f"ScapyLiveCollector: PID cache refresh error: {e}")
+
+        # Enrich with process names that netstat reported but psutil missed.
+        # Only fill gaps: skip keys that psutil already resolved with a name.
+        for key, (ns_pid, ns_name) in _get_netstat_pid_supplement().items():
+            if not ns_name:
+                continue
+            existing = new_cache.get(key)
+            if existing is None or not existing[1]:
+                new_cache[key] = (ns_pid, ns_name)
+
+        # Enrich with process names from Windows tasklist for entries where
+        # psutil.Process(pid).name() threw AccessDenied (proc_name is '').
+        # tasklist runs non-elevated and can resolve system/service PIDs.
+        tl_snap = _get_tasklist_snapshot()
+        if tl_snap:
+            for key, (pid, name) in new_cache.items():
+                if not name:
+                    tl_name = tl_snap.get(str(pid), '')
+                    if tl_name:
+                        new_cache[key] = (pid, tl_name)
+
         with self._pid_cache_lock:
             self._pid_cache = new_cache
             self._pid_cache_time = time.monotonic()
 
-    def _lookup_pid(self, port: str, proto: str):
+    def _lookup_pid(self, port: str, proto: str, force_refresh: bool = False):
         """Return ``(pid_str, process_name)`` for *port*/*proto*, or ``('', '')``.
 
-        Refreshes the cache when stale before the lookup.
+        Refreshes the cache when stale before the lookup.  When
+        *force_refresh* is True the cache is rebuilt unconditionally —
+        use this for brand-new connections that appeared after the last
+        scheduled refresh.
         """
         if _psutil is None:
             return '', ''
         now = time.monotonic()
         with self._pid_cache_lock:
             stale = (now - self._pid_cache_time) >= self._PID_CACHE_TTL
-        if stale:
+        if stale or force_refresh:
             self._refresh_pid_cache()
         with self._pid_cache_lock:
             entry = self._pid_cache.get((port, proto))
@@ -443,8 +505,20 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             # Do this *before* acquiring the traffic lock so the sniffer
             # thread isn't blocked while psutil runs.  The lock-free
             # membership test is just a hint — we re-check under the lock.
-            if key not in self._traffic and not proc_name:
+            need_pid = not proc_name
+            existing_hint = self._traffic.get(key)  # lock-free hint
+            if need_pid and (existing_hint is None or not existing_hint.get('process')):
+                # New connection OR existing entry still unresolved — (re)try.
+                # For brand-new connections force a cache rebuild so that
+                # sockets created after the last scheduled refresh are found.
+                is_new = existing_hint is None
                 pid_str, proc_name = self._lookup_pid(local_port, protocol)
+                if not proc_name and is_new:
+                    # Cache was "fresh" but didn't contain the port — force
+                    # a rebuild in case the socket just appeared.
+                    pid_str, proc_name = self._lookup_pid(
+                        local_port, protocol, force_refresh=True
+                    )
 
             # --- Byte accounting ---------------------------------------------
             try:
