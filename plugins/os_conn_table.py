@@ -78,6 +78,17 @@ _DYING_TCP_STATES_SS = frozenset({
     'FIN-WAIT-1', 'FIN-WAIT-2', 'LAST-ACK', 'CLOSING',
 })
 
+# When True, LISTEN sockets are included in the connection list returned by
+# get_os_connections().  Controlled at runtime via set_include_listening().
+_include_listening: bool = False
+
+
+def set_include_listening(enabled: bool) -> None:
+    """Enable or disable inclusion of LISTEN sockets in the OS table."""
+    global _include_listening
+    _include_listening = bool(enabled)
+
+
 # When True, psutil results are always supplemented with the platform netstat
 # parser so that connections visible to netstat but missed by psutil are included.
 _supplement_psutil_with_netstat: bool = True
@@ -337,12 +348,13 @@ def _resolve_process(pid_str: str) -> str:
 
 def _make_conn(proto: str, local_ip: str, local_port: str,
                remote_ip: str, remote_port: str, ip_type: str,
-               pid_str: str, proc_name: str, hostname: str) -> dict:
+               pid_str: str, proc_name: str, hostname: str,
+               state: str = '') -> dict:
     """Build a connection dict matching the plugin schema."""
     name = proc_name or _resolve_process(pid_str)
     if not name and remote_port == '53':
         name = 'DNS (System)'
-    return {
+    d = {
         'process': name or 'Unknown',
         'pid': pid_str,
         'protocol': proto,
@@ -355,6 +367,9 @@ def _make_conn(proto: str, local_ip: str, local_port: str,
         'bytes_sent': 0,
         'bytes_recv': 0,
     }
+    if state:
+        d['state'] = state
+    return d
 
 
 def _normalize_ipv6(ip: str) -> tuple[str, str]:
@@ -488,10 +503,13 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
         is_udp = (conn.type == _socket.SOCK_DGRAM)
 
         dying = False          # True for closing/TIME_WAIT TCP states
+        is_listen = False
         if is_tcp:
             proto = 'TCP'
             if conn.status not in _ACTIVE_TCP_STATES_PSUTIL:
-                if conn.status in _DYING_TCP_STATES_PSUTIL:
+                if _include_listening and _psutil is not None and conn.status == _psutil.CONN_LISTEN:
+                    is_listen = True
+                elif conn.status in _DYING_TCP_STATES_PSUTIL:
                     dying = True   # track in alive but don't add to conns
                 else:
                     continue
@@ -531,6 +549,9 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
 
             if not has_real_raddr:
                 if is_udp:
+                    r_ip = '*'
+                    r_port = '*'
+                elif is_listen:
                     r_ip = '*'
                     r_port = '*'
                 else:
@@ -584,6 +605,7 @@ def _parse_psutil(hostname: str) -> tuple[dict, set]:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
                 pid_str, proc_name, hostname,
+                state='LISTEN' if is_listen else '',
             )
 
     return conns, alive
@@ -614,12 +636,15 @@ def _parse_netstat_windows(hostname: str) -> tuple[dict, set]:
         # Expected: Proto  LocalAddress  ForeignAddress  State  PID
         # TCP lines have 5 cols, UDP lines have 4 cols (no State)
         dying = False
+        is_listen = False
         if parts[0] == 'TCP':
             if len(parts) < 5:
                 continue
             state = parts[3]
             if state not in _ACTIVE_TCP_STATES_NETSTAT:
-                if state in _DYING_TCP_STATES_NETSTAT:
+                if _include_listening and state == 'LISTENING':
+                    is_listen = True
+                elif state in _DYING_TCP_STATES_NETSTAT:
                     dying = True   # track in alive but don't add to conns
                 else:
                     continue
@@ -637,17 +662,30 @@ def _parse_netstat_windows(hostname: str) -> tuple[dict, set]:
         else:
             continue
 
-        # Skip wildcard / no remote
+        # Skip wildcard / no remote (but allow through for LISTEN sockets)
         if remote_addr in ('*:*', '0.0.0.0:0', '[::]:0', '*'):
-            continue
+            if is_listen:
+                pass  # allow through
+            else:
+                continue
 
         l_ip, l_port, l_type = _split_addr(local_addr)
         r_ip, r_port, r_type = _split_addr(remote_addr)
-        if not l_ip or not r_ip or not l_port or not r_port:
+        if not l_ip or not l_port:
             continue
-        # Skip if remote is 0.0.0.0 or ::
+        # For LISTEN sockets remote is wildcard — normalise
+        if is_listen:
+            r_ip = r_ip or '*'
+            r_port = r_port or '*'
+        elif not r_ip or not r_port:
+            continue
+        # Skip if remote is 0.0.0.0 or :: (but allow through for LISTEN)
         if r_ip in ('0.0.0.0', '::', '*', ''):
-            continue
+            if is_listen:
+                r_ip = '*'
+                r_port = '*'
+            else:
+                continue
 
         ip_type = l_type or r_type or 'IPv4'
         key = (l_ip, l_port, r_ip, r_port, proto)
@@ -658,6 +696,7 @@ def _parse_netstat_windows(hostname: str) -> tuple[dict, set]:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
                 pid_str, '', hostname,
+                state='LISTEN' if is_listen else '',
             )
 
     return conns, alive
@@ -721,8 +760,11 @@ def _parse_ss(hostname: str) -> tuple[dict, set]:
 
         state = parts[1]
         dying = False
+        is_listen = False
         if proto == 'TCP' and state not in _ACTIVE_TCP_STATES_SS:
-            if state in _DYING_TCP_STATES_SS:
+            if _include_listening and state == 'LISTEN':
+                is_listen = True
+            elif state in _DYING_TCP_STATES_SS:
                 dying = True
             else:
                 continue
@@ -734,10 +776,19 @@ def _parse_ss(hostname: str) -> tuple[dict, set]:
         # Parse local and remote
         l_ip, l_port, l_type = _split_addr_ss(local_addr)
         r_ip, r_port, r_type = _split_addr_ss(remote_addr)
-        if not l_ip or not r_ip or not l_port or not r_port:
+        if not l_ip or not l_port:
+            continue
+        if is_listen:
+            r_ip = r_ip or '*'
+            r_port = r_port or '*'
+        elif not r_ip or not r_port:
             continue
         if r_ip in ('0.0.0.0', '::', '*', ''):
-            continue
+            if is_listen:
+                r_ip = '*'
+                r_port = '*'
+            else:
+                continue
 
         ip_type = l_type or r_type or 'IPv4'
 
@@ -761,6 +812,7 @@ def _parse_ss(hostname: str) -> tuple[dict, set]:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
                 pid_str, proc_name, hostname,
+                state='LISTEN' if is_listen else '',
             )
 
     return conns, alive
@@ -855,12 +907,15 @@ def _parse_netstat_linux(hostname: str) -> tuple[dict, set]:
 
         # TCP needs ESTABLISHED
         dying = False
+        is_listen = False
         if proto == 'TCP':
             if len(parts) < 7:
                 continue
             state = parts[5]
             if state not in _ACTIVE_TCP_STATES_NETSTAT:
-                if state in _DYING_TCP_STATES_NETSTAT:
+                if _include_listening and state in ('LISTEN', 'LISTENING'):
+                    is_listen = True
+                elif state in _DYING_TCP_STATES_NETSTAT:
                     dying = True
                 else:
                     continue
@@ -871,10 +926,19 @@ def _parse_netstat_linux(hostname: str) -> tuple[dict, set]:
 
         l_ip, l_port, l_type = _split_addr(local_addr)
         r_ip, r_port, r_type = _split_addr(remote_addr)
-        if not l_ip or not r_ip or not l_port or not r_port:
+        if not l_ip or not l_port:
+            continue
+        if is_listen:
+            r_ip = r_ip or '*'
+            r_port = r_port or '*'
+        elif not r_ip or not r_port:
             continue
         if r_ip in ('0.0.0.0', '::', '*', ''):
-            continue
+            if is_listen:
+                r_ip = '*'
+                r_port = '*'
+            else:
+                continue
 
         ip_type = l_type or r_type or 'IPv4'
 
@@ -895,6 +959,7 @@ def _parse_netstat_linux(hostname: str) -> tuple[dict, set]:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
                 pid_str, proc_name, hostname,
+                state='LISTEN' if is_listen else '',
             )
 
     return conns, alive
@@ -931,20 +996,32 @@ def _parse_netstat_macos(hostname: str) -> tuple[dict, set]:
             remote_addr = parts[4]
 
             dying = False
+            is_listen = False
             if proto_name == 'TCP':
                 state = parts[5] if len(parts) > 5 else ''
                 if state not in _ACTIVE_TCP_STATES_NETSTAT:
-                    if state in _DYING_TCP_STATES_NETSTAT:
+                    if _include_listening and state in ('LISTEN', 'LISTENING'):
+                        is_listen = True
+                    elif state in _DYING_TCP_STATES_NETSTAT:
                         dying = True
                     else:
                         continue
 
             l_ip, l_port = _split_macos(local_addr)
             r_ip, r_port = _split_macos(remote_addr)
-            if not l_ip or not r_ip or not l_port or not r_port:
+            if not l_ip or not l_port:
+                continue
+            if is_listen:
+                r_ip = r_ip or '*'
+                r_port = r_port or '*'
+            elif not r_ip or not r_port:
                 continue
             if r_ip in ('*', '0.0.0.0', '::'):
-                continue
+                if is_listen:
+                    r_ip = '*'
+                    r_port = '*'
+                else:
+                    continue
 
             ip_type = 'IPv6' if ':' in l_ip else 'IPv4'
             if l_ip.startswith('::ffff:'):
@@ -962,6 +1039,7 @@ def _parse_netstat_macos(hostname: str) -> tuple[dict, set]:
                 conns[key] = _make_conn(
                     proto_name, l_ip, l_port, r_ip, r_port, ip_type,
                     '', '', hostname,
+                    state='LISTEN' if is_listen else '',
                 )
 
     return conns, alive
@@ -1018,17 +1096,29 @@ def _parse_netstat_generic(hostname: str) -> tuple[dict, set]:
 
         # Best-effort state detection for TCP (state column varies by OS)
         dying = False
+        is_listen = False
         if proto == 'TCP' and len(parts) > 5:
             state = parts[5]
-            if state in _DYING_TCP_STATES_NETSTAT:
+            if _include_listening and state in ('LISTEN', 'LISTENING'):
+                is_listen = True
+            elif state in _DYING_TCP_STATES_NETSTAT:
                 dying = True
 
         l_ip, l_port, l_type = _split_addr(local_addr)
         r_ip, r_port, r_type = _split_addr(remote_addr)
-        if not l_ip or not r_ip or not l_port or not r_port:
+        if not l_ip or not l_port:
+            continue
+        if is_listen:
+            r_ip = r_ip or '*'
+            r_port = r_port or '*'
+        elif not r_ip or not r_port:
             continue
         if r_ip in ('0.0.0.0', '::', '*', ''):
-            continue
+            if is_listen:
+                r_ip = '*'
+                r_port = '*'
+            else:
+                continue
 
         ip_type = l_type or r_type or 'IPv4'
         key = (l_ip, l_port, r_ip, r_port, proto)
@@ -1039,6 +1129,7 @@ def _parse_netstat_generic(hostname: str) -> tuple[dict, set]:
             conns[key] = _make_conn(
                 proto, l_ip, l_port, r_ip, r_port, ip_type,
                 '', '', hostname,
+                state='LISTEN' if is_listen else '',
             )
 
     return conns, alive

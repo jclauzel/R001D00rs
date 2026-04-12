@@ -41,7 +41,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.7.3" # Current script version
+VERSION = "3.7.4" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -330,10 +330,11 @@ REMOTE_ADDRESS_ROW_INDEX = 7  # Index of the 'Remote Address' column in the tabl
 REMOTE_PORT_ROW_INDEX = 8     # Index of the 'Remote Port' column in the table
 NAME_ROW_INDEX = 9        # Index of the 'Name' column in the table
 IP_TYPE_ROW_INDEX = 10     # Index of the 'IP Type' column in the table
-LOCATION_LAT_ROW_INDEX = 11   # Index of the 'Location' column in the table
-LOCATION_LON_ROW_INDEX = 12  # Index of the 'Location' column in the table
-BYTES_SENT_ROW_INDEX = 13    # Index of the 'Sent' column in the table
-BYTES_RECV_ROW_INDEX = 14    # Index of the 'Recv' column in the table
+WAY_ROW_INDEX = 11         # Index of the 'Way' column in the table (IN/OUT)
+LOCATION_LAT_ROW_INDEX = 12   # Index of the 'Location' column in the table
+LOCATION_LON_ROW_INDEX = 13  # Index of the 'Location' column in the table
+BYTES_SENT_ROW_INDEX = 14    # Index of the 'Sent' column in the table
+BYTES_RECV_ROW_INDEX = 15    # Index of the 'Recv' column in the table
 PID_COLUMN_SIZE = 60
 SUSPECT_COLUMN_SIZE = 30
 PROTOCOL_COLUMN_SIZE = 55
@@ -366,6 +367,9 @@ do_pause_table_sorting = False  # Set to True to pause table sorting without sto
 do_show_traffic_gauge = True   # Set to True to show sent/recv traffic gauges next to markers (requires Scapy/PCAP collector)
 do_show_traffic_histogram = True  # Set to True to show the network traffic histogram overlay on the map
 do_collect_connections_asynchronously = True  # Set to True to collect connections on a background thread (prevents UI hangs)
+do_show_listening_connections = False  # Set to True to include LISTEN sockets in the connection list
+conn_table_column_order: list = []        # Visual column order for the main connection table (logical indices)
+summary_table_column_order: list = []     # Visual column order for the summary table (logical indices)
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
 # Database persistence layer globals
@@ -848,13 +852,17 @@ class PsutilCollector(ConnectionCollectorPlugin):
             protocol = "TCP" if is_tcp else ("UDP" if is_udp else "Unknown")
 
             # For TCP, only active states (ESTABLISHED, SYN_SENT, SYN_RECV);
-            # for UDP, all
+            # for UDP, all.  Optionally include LISTEN when setting is on.
+            is_listen = False
             if is_tcp and conn.status not in (
                 psutil.CONN_ESTABLISHED,
                 psutil.CONN_SYN_SENT,
                 psutil.CONN_SYN_RECV,
             ):
-                continue
+                if do_show_listening_connections and conn.status == psutil.CONN_LISTEN:
+                    is_listen = True
+                else:
+                    continue
 
             try:
                 pid = conn.pid
@@ -910,6 +918,9 @@ class PsutilCollector(ConnectionCollectorPlugin):
                     elif is_udp:
                         remote_addr = "*"
                         remote_port = "*"
+                    elif is_listen:
+                        remote_addr = "*"
+                        remote_port = "*"
                     else:
                         remote_addr = ""
                         remote_port = ""
@@ -932,6 +943,7 @@ class PsutilCollector(ConnectionCollectorPlugin):
                     'remoteport': remote_port,
                     'ip_type': ip_type,
                     'hostname': LOCAL_HOSTNAME,
+                    'state': 'LISTEN' if is_listen else '',
                 })
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -1614,7 +1626,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level
+        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1630,6 +1642,9 @@ class TCPConnectionViewer(QMainWindow):
             'do_show_traffic_gauge': do_show_traffic_gauge,
             'do_show_traffic_histogram': do_show_traffic_histogram,
             'do_collect_connections_asynchronously': do_collect_connections_asynchronously,
+            'do_show_listening_connections': do_show_listening_connections,
+            'conn_table_column_order': self._get_conn_table_column_order(),
+            'summary_table_column_order': self._get_summary_table_column_order(),
             'map_refresh_interval': map_refresh_interval,
             'table_column_sort_index': table_column_sort_index,
             'table_column_sort_reverse' : table_column_sort_reverse,
@@ -1726,6 +1741,8 @@ class TCPConnectionViewer(QMainWindow):
                 global db_provider_name, max_connection_list_database_size
                 global logging_level
                 global do_always_supplement_psutil_with_netstat_when_available
+                global do_show_listening_connections
+                global conn_table_column_order, summary_table_column_order
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
@@ -1742,6 +1759,18 @@ class TCPConnectionViewer(QMainWindow):
                 do_show_traffic_gauge = settings.get('do_show_traffic_gauge', do_show_traffic_gauge)
                 do_show_traffic_histogram = settings.get('do_show_traffic_histogram', do_show_traffic_histogram)
                 do_collect_connections_asynchronously = settings.get('do_collect_connections_asynchronously', do_collect_connections_asynchronously)
+                do_show_listening_connections = settings.get('do_show_listening_connections', do_show_listening_connections)
+                try:
+                    from plugins.os_conn_table import set_include_listening as _set_listening
+                    _set_listening(do_show_listening_connections)
+                except Exception:
+                    pass
+                _saved_conn_order = settings.get('conn_table_column_order', [])
+                if isinstance(_saved_conn_order, list):
+                    conn_table_column_order = [int(x) for x in _saved_conn_order]
+                _saved_summary_order = settings.get('summary_table_column_order', [])
+                if isinstance(_saved_summary_order, list):
+                    summary_table_column_order = [int(x) for x in _saved_summary_order]
                 map_refresh_interval = settings.get('map_refresh_interval', map_refresh_interval)
                 table_column_sort_index = settings.get('table_column_sort_index', table_column_sort_index)
                 table_column_sort_reverse = settings.get('table_column_sort_reverse', table_column_sort_reverse)
@@ -1959,6 +1988,11 @@ class TCPConnectionViewer(QMainWindow):
                 self.show_traffic_gauge_check.setChecked(do_show_traffic_gauge)
                 self.show_traffic_histogram_check.setChecked(do_show_traffic_histogram)
                 self.collect_connections_async_check.setChecked(do_collect_connections_asynchronously)
+                self.show_listening_connections_check.setChecked(do_show_listening_connections)
+
+                # Restore column order for both tables
+                self._apply_conn_table_column_order(conn_table_column_order)
+                self._apply_summary_table_column_order(summary_table_column_order)
 
                 # Update buffer size input field
                 if hasattr(self, 'buffer_size_input'):
@@ -3438,15 +3472,145 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", str(e))
 
+    # ------------------------------------------------------------------
+    # Column order helpers — connection table
+    # ------------------------------------------------------------------
+
+    def _get_conn_table_column_order(self) -> list:
+        """Return the current visual-to-logical mapping as a list."""
+        try:
+            hdr = self.connection_table.horizontalHeader()
+            return [hdr.logicalIndex(v) for v in range(hdr.count())]
+        except Exception:
+            return []
+
+    def _apply_conn_table_column_order(self, order: list):
+        """Restore a previously saved column order onto the connection table."""
+        try:
+            if not order:
+                return
+            hdr = self.connection_table.horizontalHeader()
+            n = hdr.count()
+            if len(order) != n:
+                return
+            # Move each logical column to its saved visual position
+            for visual_pos, logical in enumerate(order):
+                current_visual = hdr.visualIndex(logical)
+                if current_visual != visual_pos:
+                    hdr.moveSection(current_visual, visual_pos)
+            self._sync_filter_order(self.connection_table, self._connection_filter_inputs,
+                                    self._connection_filter_inner)
+            self._sync_filter_widths()
+        except Exception:
+            pass
+
+    def _on_conn_table_section_moved(self, logical, old_visual, new_visual):
+        """Called when the user drags a column in the connection table."""
+        self._sync_filter_order(self.connection_table, self._connection_filter_inputs,
+                                self._connection_filter_inner)
+        self._sync_filter_widths()
+        self.save_settings()
+
+    # ------------------------------------------------------------------
+    # Column order helpers — summary table
+    # ------------------------------------------------------------------
+
+    def _get_summary_table_column_order(self) -> list:
+        """Return the current visual-to-logical mapping for the summary table."""
+        try:
+            hdr = self.summary_table.horizontalHeader()
+            return [hdr.logicalIndex(v) for v in range(hdr.count())]
+        except Exception:
+            return []
+
+    def _apply_summary_table_column_order(self, order: list):
+        """Restore a previously saved column order onto the summary table."""
+        try:
+            if not order:
+                return
+            hdr = self.summary_table.horizontalHeader()
+            n = hdr.count()
+            if len(order) != n:
+                return
+            for visual_pos, logical in enumerate(order):
+                current_visual = hdr.visualIndex(logical)
+                if current_visual != visual_pos:
+                    hdr.moveSection(current_visual, visual_pos)
+            self._sync_filter_order(self.summary_table, self._summary_filter_inputs,
+                                    self._summary_filter_inner)
+            self._sync_summary_filter_widths()
+        except Exception:
+            pass
+
+    def _on_summary_table_section_moved(self, logical, old_visual, new_visual):
+        """Called when the user drags a column in the summary table."""
+        self._sync_filter_order(self.summary_table, self._summary_filter_inputs,
+                                self._summary_filter_inner)
+        self._sync_summary_filter_widths()
+        self.save_settings()
+
+    def _reset_column_order(self):
+        """Reset both connection and summary tables to their default column order."""
+        try:
+            hdr = self.connection_table.horizontalHeader()
+            for logical in range(hdr.count()):
+                current_visual = hdr.visualIndex(logical)
+                if current_visual != logical:
+                    hdr.moveSection(current_visual, logical)
+            self._sync_filter_order(self.connection_table, self._connection_filter_inputs,
+                                    self._connection_filter_inner)
+            self._sync_filter_widths()
+        except Exception:
+            pass
+        try:
+            hdr = self.summary_table.horizontalHeader()
+            for logical in range(hdr.count()):
+                current_visual = hdr.visualIndex(logical)
+                if current_visual != logical:
+                    hdr.moveSection(current_visual, logical)
+            self._sync_filter_order(self.summary_table, self._summary_filter_inputs,
+                                    self._summary_filter_inner)
+            self._sync_summary_filter_widths()
+        except Exception:
+            pass
+        self.save_settings()
+
+    # ------------------------------------------------------------------
+    # Shared: reorder filter bar inputs to match the current visual order
+    # ------------------------------------------------------------------
+
+    def _sync_filter_order(self, table: 'QTableWidget', inputs: list,
+                           inner_widget: 'QWidget'):
+        """Re-insert filter QLineEdit widgets into *inner_widget* so their
+        visual positions match the current column order of *table*.
+
+        The inputs list is kept sorted by *logical* column index; the layout
+        order is changed to match the current visual order."""
+        try:
+            hdr = table.horizontalHeader()
+            layout = inner_widget.layout()
+            # layout item 0 is the vertical-header spacer — leave it alone
+            # Remove all inputs from the layout (without deleting them)
+            for le in inputs:
+                layout.removeWidget(le)
+            # Re-add in visual order
+            for visual_pos in range(hdr.count()):
+                logical = hdr.logicalIndex(visual_pos)
+                layout.addWidget(inputs[logical])
+        except Exception:
+            pass
+
     def _sync_filter_widths(self):
         """Resize filter bar inputs to match the current connection table column widths."""
         try:
+            hdr = self.connection_table.horizontalHeader()
             vh_width = self.connection_table.verticalHeader().width()
             self._connection_filter_vheader_spacer.setFixedWidth(vh_width)
             total_width = vh_width
-            for i, le in enumerate(self._connection_filter_inputs):
-                col_width = self.connection_table.columnWidth(i)
-                le.setFixedWidth(col_width)
+            for visual_pos in range(hdr.count()):
+                logical = hdr.logicalIndex(visual_pos)
+                col_width = self.connection_table.columnWidth(logical)
+                self._connection_filter_inputs[logical].setFixedWidth(col_width)
                 total_width += col_width
             self._connection_filter_inner.setFixedWidth(total_width)
         except Exception:
@@ -3481,6 +3645,7 @@ class TCPConnectionViewer(QMainWindow):
             REMOTE_PORT_ROW_INDEX:     lambda c: c.get('remoteport', ''),
             NAME_ROW_INDEX:            lambda c: c.get('name', ''),
             IP_TYPE_ROW_INDEX:         lambda c: c.get('ip_type', ''),
+            WAY_ROW_INDEX:             lambda c: 'IN' if c.get('state', '') == 'LISTEN' or c.get('inbound') else 'OUT',
         }
         for col, f in filters:
             getter = col_to_key.get(col)
@@ -3522,12 +3687,14 @@ class TCPConnectionViewer(QMainWindow):
     def _sync_summary_filter_widths(self):
         """Resize summary filter bar inputs to match the current summary table column widths."""
         try:
+            hdr = self.summary_table.horizontalHeader()
             vh_width = self.summary_table.verticalHeader().width()
             self._summary_filter_vheader_spacer.setFixedWidth(vh_width)
             total_width = vh_width
-            for i, le in enumerate(self._summary_filter_inputs):
-                col_width = self.summary_table.columnWidth(i)
-                le.setFixedWidth(col_width)
+            for visual_pos in range(hdr.count()):
+                logical = hdr.logicalIndex(visual_pos)
+                col_width = self.summary_table.columnWidth(logical)
+                self._summary_filter_inputs[logical].setFixedWidth(col_width)
                 total_width += col_width
             self._summary_filter_inner.setFixedWidth(total_width)
         except Exception:
@@ -4282,6 +4449,18 @@ class TCPConnectionViewer(QMainWindow):
         self.save_settings()
 
     @Slot()
+    def update_show_listening_connections(self):
+        global do_show_listening_connections
+        do_show_listening_connections = self.show_listening_connections_check.isChecked()
+        try:
+            from plugins.os_conn_table import set_include_listening as _set_listening
+            _set_listening(do_show_listening_connections)
+        except Exception:
+            pass
+        self.refresh_connections()
+        self.save_settings()
+
+    @Slot()
     def update_collect_connections_asynchronously(self):
         global do_collect_connections_asynchronously
         do_collect_connections_asynchronously = self.collect_connections_async_check.isChecked()
@@ -4579,7 +4758,7 @@ class TCPConnectionViewer(QMainWindow):
         # Connection table
         self.connection_table = QTableWidget(0, BYTES_RECV_ROW_INDEX+1)
         self.connection_table.setHorizontalHeaderLabels([
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Loc lat", "Loc lon", "Sent", "Recv"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Way", "Loc lat", "Loc lon", "Sent", "Recv"
         ])
 
         # Connect the header clicked signal to a custom sort function
@@ -4601,13 +4780,14 @@ class TCPConnectionViewer(QMainWindow):
         self.connection_table.setColumnWidth(LOCAL_PORT_ROW_INDEX, PORTS_COLUMN_SIZE)
         self.connection_table.setColumnWidth(REMOTE_PORT_ROW_INDEX, PORTS_COLUMN_SIZE)
         self.connection_table.setColumnWidth(IP_TYPE_ROW_INDEX, IP_TYPE_COLUMN_SIZE)
+        self.connection_table.setColumnWidth(WAY_ROW_INDEX, 40)
 
         self.connection_table.horizontalHeader().setMinimumSectionSize(SUSPECT_COLUMN_SIZE)
 
         # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
         _filter_placeholders = [
             "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port",
-            "Remote Addr", "Remote Port", "Name", "IP Type", "Lat", "Lon", "Sent", "Recv"
+            "Remote Addr", "Remote Port", "Name", "IP Type", "Way", "Lat", "Lon", "Sent", "Recv"
         ]
         self._connection_filter_inner = QWidget()
         _filter_inner_layout = QHBoxLayout(self._connection_filter_inner)
@@ -4635,6 +4815,9 @@ class TCPConnectionViewer(QMainWindow):
             self._connection_filter_scroll.horizontalScrollBar().setValue)
         self.connection_table.horizontalHeader().sectionResized.connect(
             lambda *_: self._sync_filter_widths())
+        self.connection_table.horizontalHeader().setSectionsMovable(True)
+        self.connection_table.horizontalHeader().sectionMoved.connect(
+            self._on_conn_table_section_moved)
 
         self.left_layout.addWidget(self._connection_filter_scroll)
         self.left_layout.addWidget(self.connection_table)
@@ -4778,9 +4961,9 @@ class TCPConnectionViewer(QMainWindow):
         summary_tab_layout.addWidget(summary_title_label)
 
         # Create summary table with 12 columns
-        self.summary_table = QTableWidget(0, 12)
+        self.summary_table = QTableWidget(0, 13)
         self.summary_table.setHorizontalHeaderLabels([
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count", "Sent", "Recv"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Way", "Name", "Count", "Sent", "Recv"
         ])
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -4794,7 +4977,7 @@ class TCPConnectionViewer(QMainWindow):
 
         # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
         _summary_filter_placeholders = [
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Name", "Count", "Sent", "Recv"
+            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Way", "Name", "Count", "Sent", "Recv"
         ]
         self._summary_filter_inner = QWidget()
         _summary_filter_inner_layout = QHBoxLayout(self._summary_filter_inner)
@@ -4822,6 +5005,9 @@ class TCPConnectionViewer(QMainWindow):
             self._summary_filter_scroll.horizontalScrollBar().setValue)
         self.summary_table.horizontalHeader().sectionResized.connect(
             lambda *_: self._sync_summary_filter_widths())
+        self.summary_table.horizontalHeader().setSectionsMovable(True)
+        self.summary_table.horizontalHeader().sectionMoved.connect(
+            self._on_summary_table_section_moved)
 
         # Wrap filter bar + table in a zero-spacing container so inputs sit flush against the header
         _summary_table_container = QWidget()
@@ -4881,6 +5067,12 @@ class TCPConnectionViewer(QMainWindow):
         self.only_show_remote_connections.setChecked(False)
         settings_tab_layout.addWidget(self.only_show_remote_connections)    
         self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)
+
+        # Show listening connections
+        self.show_listening_connections_check = QCheckBox("Show listening sockets (LISTEN state)")
+        self.show_listening_connections_check.setChecked(do_show_listening_connections)
+        settings_tab_layout.addWidget(self.show_listening_connections_check)
+        self.show_listening_connections_check.stateChanged.connect(self.update_show_listening_connections)
 
         # Resolve public IP using ipfy checkbox
         self.resolve_public_ip = QCheckBox("Resolve public internet IP using ipfy.com")
@@ -5097,6 +5289,12 @@ class TCPConnectionViewer(QMainWindow):
         )
         self.no_ui_check.stateChanged.connect(self._on_no_ui_changed)
         settings_tab_layout.addWidget(self.no_ui_check)
+
+        # Reset column order button
+        self.reset_column_order_btn = QPushButton("Reset columns table order to default")
+        self.reset_column_order_btn.setToolTip("Reset both the connection table and summary table columns to their default order")
+        self.reset_column_order_btn.clicked.connect(self._reset_column_order)
+        settings_tab_layout.addWidget(self.reset_column_order_btn)
 
         # Add stretch to push settings to the top
         settings_tab_layout.addStretch()
@@ -5738,6 +5936,15 @@ class TCPConnectionViewer(QMainWindow):
                 pass
 
         # --- Phase 3: Enrich each raw connection with geo/DNS/C2/icons -------
+        # Build a set of (local_addr, local_port, protocol) tuples for LISTEN
+        # sockets so we can tag established connections arriving at those ports
+        # as "inbound" (rendered with a red line on the map).
+        _listen_ports = set()
+        if do_show_listening_connections:
+            for rc in raw_connections:
+                if rc.get('state', '') == 'LISTEN':
+                    _listen_ports.add((rc.get('localport', ''), rc.get('protocol', 'TCP')))
+
         for rc in raw_connections:
             try:
                 process_name = rc.get('process', 'Unknown')
@@ -5751,6 +5958,7 @@ class TCPConnectionViewer(QMainWindow):
                 hostname = rc.get('hostname', LOCAL_HOSTNAME)
                 bytes_sent = rc.get('bytes_sent', 0)
                 bytes_recv = rc.get('bytes_recv', 0)
+                conn_state = rc.get('state', '')
 
                 lat = lng = None
                 name = ""
@@ -5783,7 +5991,7 @@ class TCPConnectionViewer(QMainWindow):
                     if do_reverse_dns:
                         resolved = ip_hostnames.get(ip_lookup)
                         if resolved:
-                            remote_addr = f"{remote_addr} ({resolved})"
+                            remote_addr = f"{remote_addr}"
                             name = resolved
 
                     # C2 check
@@ -5812,6 +6020,11 @@ class TCPConnectionViewer(QMainWindow):
                         except Exception:
                             pass
 
+                # Determine if this is an inbound connection to a listening port
+                is_inbound = bool(conn_state != 'LISTEN'
+                                  and _listen_ports
+                                  and (local_port, protocol) in _listen_ports)
+
                 # Standard connection entry
                 connections.append({
                     'process': process_name,
@@ -5826,10 +6039,12 @@ class TCPConnectionViewer(QMainWindow):
                     'ip_type': ip_type,
                     'lat': lat,
                     'lng': lng,
-                    'icon': 'greenIcon',
+                    'icon': 'listenIcon' if conn_state == 'LISTEN' else 'greenIcon',
                     'hostname': hostname,
                     'bytes_sent': bytes_sent,
                     'bytes_recv': bytes_recv,
+                    'state': conn_state,
+                    'inbound': is_inbound,
                 })
 
                 # New connection detection — O(1) set lookup.
@@ -5895,40 +6110,14 @@ class TCPConnectionViewer(QMainWindow):
             # Persist to database if enabled
             self._db_save_snapshot(snap_ts, connections, snap_agent)
 
-            # keep slider in sync
-            self.slider.setMaximum(self.connection_list_counter)
-            self.slider_value_label.setText(TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list)-1))
-
-            if self.timer.isActive():
-                self.slider.valueChanged.disconnect(self.update_slider_value)
-                self.slider.setValue(self.connection_list_counter)
-                self.slider.valueChanged.connect(self.update_slider_value)
-
-            # If Summary tab is active, refresh it with new data
-            try:
-                if hasattr(self, 'tab_widget') and self.tab_widget.currentIndex() == 1:
-                    self.update_summary_table()
-            except Exception:
-                pass
-
-            # Capture screenshot if enabled (only for live captures, not timeline replay)
-
-            if do_capture_screenshots:
-                try:
-                    logging.debug(f"Scheduling screenshot capture (buffer counter={self.connection_list_counter})")
-                    # Schedule screenshot capture after a short delay to ensure map is fully rendered
-                    QTimer.singleShot(1500, self._capture_map_screenshot)
-                except Exception as e:
-                    logging.error(f"Failed to schedule screenshot capture: {e}")
-
-            # Update video button visibility whenever connections are refreshed
-            try:
-                self._update_video_button_visibility()
-            except Exception:
-                pass
-
-            # Mark summary as needing update
+            # Mark summary as needing update (simple bool, safe from any thread)
             self._summary_needs_update = True
+
+            # NOTE: All UI-widget updates (slider sync, summary table refresh,
+            # screenshot scheduling, video button visibility) are handled by
+            # _post_collection_ui_update() which is called from _apply_connections()
+            # on the GUI thread.  This avoids heap corruption when
+            # get_active_tcp_connections() runs on a QThreadPool worker thread.
 
             # Performance logging
             elapsed = time.perf_counter() - start_time
@@ -6784,6 +6973,7 @@ class TCPConnectionViewer(QMainWindow):
                                         'greyIcon':   new L.Icon({iconUrl: resolved.grey,   iconSize:[25,41], iconAnchor:[12,41]}),
                                         'blackIcon':  new L.Icon({iconUrl: resolved.black,  iconSize:[25,41], iconAnchor:[12,41]}),
                                         'goldIcon':   new L.Icon({iconUrl: resolved.gold,   iconSize:[25,41], iconAnchor:[12,41]}),
+                                        'listenIcon': new L.Icon({iconUrl: resolved.orange, iconSize:[25,41], iconAnchor:[12,41]}),
                                     };
 
                                     // initialize map AFTER icons resolved
@@ -6978,11 +7168,19 @@ class TCPConnectionViewer(QMainWindow):
 
                                     // Build popup HTML for a regular marker
                                     function _buildPopupHtml(conn) {
-                                        var html = "<b>" + (conn.process || '') + "</b><br>" +
-                                                   "Protocol: " + (conn.protocol || 'TCP') + "<br>" +
+                                        var isListen = (conn.state === 'LISTEN');
+                                        var isInbound = !!conn.inbound;
+                                        var html = "<b>" + (conn.process || '') + "</b><br>";
+                                        if (isListen) {
+                                            html += "<span style='background:#ff9800;color:#fff;padding:1px 6px;border-radius:4px;font-size:11px'>&#128266; Listening Socket</span><br>";
+                                        }
+                                        if (isInbound) {
+                                            html += "<span style='background:#d32f2f;color:#fff;padding:1px 6px;border-radius:4px;font-size:11px'>&#8592; Inbound Connection</span><br>";
+                                        }
+                                        html += "Protocol: " + (conn.protocol || 'TCP') + "<br>" +
                                                    "PID: " + (conn.pid || '') + "<br>" +
                                                    "Remote: " + (conn.remote || '') + "<br>" +
-                                                   "Local: " + (conn.local || '') + "<br>" +
+                                                   "Local: " + (conn.local || '') + ":" + (conn.localport || '') + "<br>" +
                                                    (conn.name ? "Name: " + conn.name + "<br>" : "") +
                                                    (conn.origin_hostname ? "Source: " + conn.origin_hostname + "<br>" : "");
                                         var bSent = conn.bytes_sent || 0;
@@ -7347,7 +7545,7 @@ class TCPConnectionViewer(QMainWindow):
                                                     if (!agentMarkerCoords[connOrigin]) { agentMarkerCoords[connOrigin] = []; }
                                                     agentMarkerCoords[connOrigin].push([conn.lat, conn.lng]);
                                                 } else {
-                                                    serverMarkerCoords.push([conn.lat, conn.lng]);
+                                                    serverMarkerCoords.push({coords: [conn.lat, conn.lng], isListen: (conn.state === 'LISTEN'), isInbound: !!conn.inbound});
                                                 }
                                             }
                                         });
@@ -7359,7 +7557,7 @@ class TCPConnectionViewer(QMainWindow):
                                         if (drawLines) {
                                             var fpParts = [];
                                             if (publicIpCoords) fpParts.push('P' + publicIpCoords[0] + ',' + publicIpCoords[1]);
-                                            serverMarkerCoords.forEach(function(c) { fpParts.push('S' + c[0] + ',' + c[1]); });
+                                            serverMarkerCoords.forEach(function(s) { fpParts.push('S' + s.coords[0] + ',' + s.coords[1] + (s.isListen ? 'L' : '') + (s.isInbound ? 'I' : '')); });
                                             Object.keys(agentOriginCoords).sort().forEach(function(h) {
                                                 var o = agentOriginCoords[h];
                                                 fpParts.push('A' + h + ':' + o[0] + ',' + o[1]);
@@ -7376,9 +7574,10 @@ class TCPConnectionViewer(QMainWindow):
                                             _liveLinesFP = newFP;
                                             if (drawLines) {
                                                 if (publicIpCoords && serverMarkerCoords.length > 0) {
-                                                    serverMarkerCoords.forEach(function(markerCoords) {
-                                                        var polyline = L.polyline([publicIpCoords, markerCoords], {
-                                                            color: 'blue', weight: 2, opacity: 0.6, dashArray: '5, 10'
+                                                    serverMarkerCoords.forEach(function(s) {
+                                                        var lineColor = (s.isListen || s.isInbound) ? 'red' : 'blue';
+                                                        var polyline = L.polyline([publicIpCoords, s.coords], {
+                                                            color: lineColor, weight: 2, opacity: 0.6, dashArray: '5, 10'
                                                         }).addTo(map);
                                                         _liveLines.push(polyline);
                                                     });
@@ -7879,6 +8078,49 @@ class TCPConnectionViewer(QMainWindow):
         self._collector_worker = None  # release the worker reference
         self._apply_connections(connections, slider_position)
 
+    @Slot()
+    def _post_collection_ui_update(self):
+        """UI-thread-only bookkeeping that was formerly inside get_active_tcp_connections.
+
+        Touches QSlider, QLabel, QTimer, QPushButton — must never run on a pool thread.
+        Called from _apply_connections() which is guaranteed to execute on the GUI thread.
+        """
+        try:
+            # keep slider in sync
+            self.slider.setMaximum(self.connection_list_counter)
+            self.slider_value_label.setText(
+                TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list) - 1)
+            )
+
+            if self.timer.isActive():
+                self.slider.valueChanged.disconnect(self.update_slider_value)
+                self.slider.setValue(self.connection_list_counter)
+                self.slider.valueChanged.connect(self.update_slider_value)
+
+            # If Summary tab is active, refresh it with new data
+            try:
+                if hasattr(self, 'tab_widget') and self.tab_widget.currentIndex() == 1:
+                    self.update_summary_table()
+                    self._summary_needs_update = False
+            except Exception:
+                pass
+
+            # Capture screenshot if enabled (only for live captures, not timeline replay)
+            if do_capture_screenshots:
+                try:
+                    logging.debug(f"Scheduling screenshot capture (buffer counter={self.connection_list_counter})")
+                    QTimer.singleShot(1500, self._capture_map_screenshot)
+                except Exception as e:
+                    logging.error(f"Failed to schedule screenshot capture: {e}")
+
+            # Update video button visibility whenever connections are refreshed
+            try:
+                self._update_video_button_visibility()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.error(f"_post_collection_ui_update error: {e}")
+
     @Slot(object, object)
     def _apply_connections(self, connections, slider_position):
         """Update the table and map with a freshly collected connection list.
@@ -7886,6 +8128,10 @@ class TCPConnectionViewer(QMainWindow):
         This method always executes on the UI thread, whether the connections
         were collected synchronously or by the background worker.
         """
+        # Run the deferred UI bookkeeping (slider, summary, screenshots, video
+        # button) that must happen on the GUI thread.
+        self._post_collection_ui_update()
+
         force_tooltip = self._refresh_force_tooltip
         number_of_previous_objects = self._refresh_number_of_previous_objects
 
@@ -7953,6 +8199,8 @@ class TCPConnectionViewer(QMainWindow):
                     self.connection_table.setItem(row, REMOTE_PORT_ROW_INDEX, QTableWidgetItem(conn['remoteport']))
                     self.connection_table.setItem(row, NAME_ROW_INDEX, QTableWidgetItem(conn['name']))
                     self.connection_table.setItem(row, IP_TYPE_ROW_INDEX, QTableWidgetItem(conn['ip_type']))
+                    _way = 'IN' if (conn.get('state', '') == 'LISTEN' or conn.get('inbound')) else 'OUT'
+                    self.connection_table.setItem(row, WAY_ROW_INDEX, QTableWidgetItem(_way))
                     self.connection_table.setItem(row, HOSTNAME_ROW_INDEX, QTableWidgetItem(conn.get('hostname', '')))
                     self.connection_table.setItem(row, BYTES_SENT_ROW_INDEX, QTableWidgetItem(_format_bytes(conn.get('bytes_sent', 0))))
                     self.connection_table.setItem(row, BYTES_RECV_ROW_INDEX, QTableWidgetItem(_format_bytes(conn.get('bytes_recv', 0))))
@@ -8652,6 +8900,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"Error updating tab: {e}")
 
+    @Slot()
     def update_summary_table(self):
         """Populate the summary table with aggregated connection statistics"""
         try:
@@ -8669,8 +8918,12 @@ class TCPConnectionViewer(QMainWindow):
             # Get current setting for filtering local connections
             global show_only_remote_connections
 
+            # Snapshot the deque atomically so a background append cannot mutate it
+            # while we iterate (avoids "deque mutated during iteration" RuntimeError)
+            snapshot = list(self.connection_list)
+
             # Iterate through all timeline snapshots in connection_list
-            for timeline_entry in self.connection_list:
+            for timeline_entry in snapshot:
                 connection_list = timeline_entry.get('connection_list', [])
 
                 for conn in connection_list:
@@ -8683,6 +8936,7 @@ class TCPConnectionViewer(QMainWindow):
                     remote = conn.get('remote', '')
                     ip_type = conn.get('ip_type', '')
                     name = conn.get('name', '')
+                    way = 'IN' if (conn.get('state', '') == 'LISTEN' or conn.get('inbound')) else 'OUT'
 
                     # Filter out local connections if show_only_remote_connections is enabled
                     if show_only_remote_connections:
@@ -8695,7 +8949,7 @@ class TCPConnectionViewer(QMainWindow):
                     hostname = conn.get('hostname', '')
 
                     # Use tuple as dictionary key for grouping
-                    key = (hostname, process, pid, suspect, protocol, local, remote, ip_type, name)
+                    key = (hostname, process, pid, suspect, protocol, local, remote, ip_type, way, name)
 
                     b_sent = conn.get('bytes_sent', 0) or 0
                     b_recv = conn.get('bytes_recv', 0) or 0
@@ -8712,7 +8966,7 @@ class TCPConnectionViewer(QMainWindow):
             sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1]['count'], reverse=True)
 
             # Populate table with sorted results
-            for (hostname, process, pid, suspect, protocol, local, remote, ip_type, name), stats in sorted_stats:
+            for (hostname, process, pid, suspect, protocol, local, remote, ip_type, way, name), stats in sorted_stats:
                 count = stats['count']
                 row = self.summary_table.rowCount()
                 self.summary_table.insertRow(row)
@@ -8725,10 +8979,11 @@ class TCPConnectionViewer(QMainWindow):
                 self.summary_table.setItem(row, 5, QTableWidgetItem(local))
                 self.summary_table.setItem(row, 6, QTableWidgetItem(remote))
                 self.summary_table.setItem(row, 7, QTableWidgetItem(ip_type))
-                self.summary_table.setItem(row, 8, QTableWidgetItem(name))
-                self.summary_table.setItem(row, 9, QTableWidgetItem(str(count)))
-                self.summary_table.setItem(row, 10, QTableWidgetItem(_format_bytes(stats['bytes_sent'])))
-                self.summary_table.setItem(row, 11, QTableWidgetItem(_format_bytes(stats['bytes_recv'])))
+                self.summary_table.setItem(row, 8, QTableWidgetItem(way))
+                self.summary_table.setItem(row, 9, QTableWidgetItem(name))
+                self.summary_table.setItem(row, 10, QTableWidgetItem(str(count)))
+                self.summary_table.setItem(row, 11, QTableWidgetItem(_format_bytes(stats['bytes_sent'])))
+                self.summary_table.setItem(row, 12, QTableWidgetItem(_format_bytes(stats['bytes_recv'])))
 
                 # Highlight suspect connections in red
                 if suspect == "Yes":
