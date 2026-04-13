@@ -584,8 +584,58 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                 pass
             return None  # let sniff() use its default
 
+        def _get_forced_iface():
+            """Return the user-configured forced interface name, or empty string."""
+            try:
+                import tcp_geo_map as _app
+                forced = getattr(_app, 'do_scapy_force_use_interface_name', '')
+                if forced:
+                    return forced.strip()
+            except Exception:
+                pass
+            return ''
+
+        def _log_available_interfaces():
+            """Log all interfaces Scapy can see — called on adapter errors so
+            the user knows which name to put in *do_scapy_force_use_interface_name*."""
+            try:
+                from scapy.all import get_if_list as _gif
+                iface_list = _gif()
+                logging.warning(
+                    "ScapyLiveCollector: available Scapy interfaces (get_if_list): %s",
+                    iface_list,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "ScapyLiveCollector: could not enumerate interfaces via get_if_list: %s", exc
+                )
+            try:
+                from scapy.all import show_interfaces as _si
+                import io, contextlib
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    _si()
+                iface_table = buf.getvalue()
+                if iface_table.strip():
+                    logging.warning(
+                        "ScapyLiveCollector: Scapy show_interfaces() output:\n%s",
+                        iface_table,
+                    )
+            except Exception as exc:
+                logging.warning(
+                    "ScapyLiveCollector: could not run show_interfaces(): %s", exc
+                )
+
         def _run_sniff(l2socket=None):
-            ifaces = _get_all_ifaces()
+            forced = _get_forced_iface()
+            if forced:
+                ifaces = forced
+                logging.info(
+                    "ScapyLiveCollector: using forced interface from settings: %s",
+                    forced,
+                )
+            else:
+                ifaces = _get_all_ifaces()
             kwargs = dict(
                 prn=_process_packet,
                 store=0,
@@ -593,9 +643,10 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             )
             if ifaces is not None:
                 kwargs['iface'] = ifaces
-                logging.debug(
-                    f"ScapyLiveCollector: sniffing on {len(ifaces)} interfaces"
-                )
+                if isinstance(ifaces, list):
+                    logging.debug(
+                        f"ScapyLiveCollector: sniffing on {len(ifaces)} interfaces"
+                    )
 
             if l2socket is not None:
                 kwargs['L2socket'] = l2socket
@@ -615,7 +666,10 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             logging.warning(
                 f"ScapyLiveCollector: L2 sniff raised {type(e).__name__}: {e}"
             )
-            if "winpcap" in msg or "layer 2" in msg or "not available" in msg or "npcap" in msg:
+            # Log available interfaces so the user can configure the forced interface
+            if isinstance(e, OSError):
+                _log_available_interfaces()
+            if "winpcap" in msg or "layer 2" in msg or "not available" in msg or "npcap" in msg or "not found" in msg:
                 # --- Attempt 2: Layer 3 fallback (no Npcap needed) -----------
                 logging.info(
                     "ScapyLiveCollector: falling back to L3 socket "
@@ -650,7 +704,10 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
             logging.warning(
                 f"ScapyLiveCollector: L2 sniff raised {type(e).__name__}: {e}"
             )
-            if "winpcap" in msg or "layer 2" in msg or "not available" in msg or "npcap" in msg:
+            # Log available interfaces for any adapter-related error
+            if "interface" in msg or "adapter" in msg or "not found" in msg:
+                _log_available_interfaces()
+            if "winpcap" in msg or "layer 2" in msg or "not available" in msg or "npcap" in msg or "not found" in msg:
                 logging.info(
                     "ScapyLiveCollector: falling back to L3 socket "
                     f"({conf.L3socket})..."

@@ -4,6 +4,7 @@ import psutil
 import subprocess
 import csv
 import signal
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # --- Constants that must be defined early ---
 DATABASE_EXPIRE_AFTER_DAYS = 7
@@ -41,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.7.5" # Current script version
+VERSION = "3.7.6" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -368,6 +369,7 @@ do_show_traffic_gauge = True   # Set to True to show sent/recv traffic gauges ne
 do_show_traffic_histogram = True  # Set to True to show the network traffic histogram overlay on the map
 do_collect_connections_asynchronously = True  # Set to True to collect connections on a background thread (prevents UI hangs)
 do_show_listening_connections = False  # Set to True to include LISTEN sockets in the connection list
+do_scapy_force_use_interface_name = ""  # When non-empty, passed as iface= to Scapy sniff() (overrides auto-detection)
 conn_table_column_order: list = []        # Visual column order for the main connection table (logical indices)
 summary_table_column_order: list = []     # Visual column order for the summary table (logical indices)
 # Default summary table column order: Count (logical 10) moved to the last visual position.
@@ -649,6 +651,74 @@ class VideoGeneratorWorker(QRunnable):
 class ConnectionCollectorSignals(QObject):
     """Signals for the async connection collector worker."""
     finished = Signal(object, object)  # connections (list), slider_position (int | None)
+
+class SummaryAggregationSignals(QObject):
+    """Signals emitted by the background summary-table aggregation worker."""
+    finished = Signal(object, int, int)  # sorted_stats (list), total_unique, total_connections
+
+class SummaryAggregationWorker(QRunnable):
+    """Aggregate connection_list into summary stats on a pool thread.
+
+    The heavy loop (snapshot iteration, IP parsing, is_routable checks,
+    dict accumulation) runs off the GUI thread.  Only the final table
+    population happens on the UI thread via the *finished* signal.
+    """
+
+    def __init__(self, snapshot, filter_remote):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.snapshot = snapshot
+        self.filter_remote = filter_remote
+        self.signals = SummaryAggregationSignals()
+
+    def run(self):
+        try:
+            connection_stats = {}
+            for timeline_entry in self.snapshot:
+                connection_list = timeline_entry.get('connection_list', [])
+                for conn in connection_list:
+                    process = conn.get('process', '')
+                    pid = conn.get('pid', '')
+                    suspect = conn.get('suspect', '')
+                    protocol = conn.get('protocol', '')
+                    local = conn.get('local', '')
+                    remote = conn.get('remote', '')
+                    ip_type = conn.get('ip_type', '')
+                    name = conn.get('name', '')
+                    way = 'IN' if (conn.get('state', '') == 'LISTEN' or conn.get('inbound')) else 'OUT'
+
+                    if self.filter_remote:
+                        remote_ip = remote.split(' (')[0].split(':')[0]
+                        if not is_routable(remote_ip):
+                            continue
+
+                    hostname = conn.get('hostname', '')
+                    key = (hostname, process, pid, suspect, protocol, local, remote, ip_type, way, name)
+
+                    b_sent = conn.get('bytes_sent', 0) or 0
+                    b_recv = conn.get('bytes_recv', 0) or 0
+
+                    if key in connection_stats:
+                        entry = connection_stats[key]
+                        entry['count'] += 1
+                        entry['bytes_sent'] += b_sent
+                        entry['bytes_recv'] += b_recv
+                    else:
+                        connection_stats[key] = {'count': 1, 'bytes_sent': b_sent, 'bytes_recv': b_recv}
+
+            sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1]['count'], reverse=True)
+            total_unique = len(sorted_stats)
+            total_connections = sum(s['count'] for _, s in sorted_stats)
+        except Exception as e:
+            logging.error(f"SummaryAggregationWorker error: {e}")
+            sorted_stats = []
+            total_unique = 0
+            total_connections = 0
+
+        try:
+            self.signals.finished.emit(sorted_stats, total_unique, total_connections)
+        except RuntimeError:
+            logging.debug("SummaryAggregationWorker: signal emit skipped (source deleted)")
 
 class ConnectionCollectorWorker(QRunnable):
     """
@@ -1016,6 +1086,16 @@ def _format_bytes(num_bytes):
     val = num_bytes / (k ** i)
     return f'{val:.1f} {sizes[i]}'
 
+def _make_bytes_item(num_bytes):
+    """Create a QTableWidgetItem that displays a human-readable byte string
+    but stores the raw integer in Qt.UserRole so that column sorting can
+    compare numerically instead of lexicographically."""
+    raw = int(num_bytes) if num_bytes else 0
+    item = QTableWidgetItem(_format_bytes(raw))
+    item.setData(Qt.UserRole, raw)
+    return item
+
+@functools.lru_cache(maxsize=4096)
 def is_routable(ip_str: str) -> bool:
     """Return True if *ip_str* is a publicly routable (non-private) IP address.
 
@@ -1024,6 +1104,8 @@ def is_routable(ip_str: str) -> bool:
     'Hide local connections' filter.
     Returns False for any value that is not a valid IP address.
     """
+    if ip_str == '*':
+        return False
     try:
         ip = ipaddress.ip_address(ip_str)
         return not ip.is_private
@@ -1644,7 +1726,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order
+        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, do_scapy_force_use_interface_name
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1661,6 +1743,7 @@ class TCPConnectionViewer(QMainWindow):
             'do_show_traffic_histogram': do_show_traffic_histogram,
             'do_collect_connections_asynchronously': do_collect_connections_asynchronously,
             'do_show_listening_connections': do_show_listening_connections,
+            'do_scapy_force_use_interface_name': do_scapy_force_use_interface_name,
             'conn_table_column_order': self._get_conn_table_column_order(),
             'summary_table_column_order': self._get_summary_table_column_order(),
             'map_refresh_interval': map_refresh_interval,
@@ -1760,6 +1843,7 @@ class TCPConnectionViewer(QMainWindow):
                 global logging_level
                 global do_always_supplement_psutil_with_netstat_when_available
                 global do_show_listening_connections
+                global do_scapy_force_use_interface_name
                 global conn_table_column_order, summary_table_column_order
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
@@ -1783,6 +1867,7 @@ class TCPConnectionViewer(QMainWindow):
                     _set_listening(do_show_listening_connections)
                 except Exception:
                     pass
+                do_scapy_force_use_interface_name = settings.get('do_scapy_force_use_interface_name', do_scapy_force_use_interface_name)
                 _saved_conn_order = settings.get('conn_table_column_order', [])
                 if isinstance(_saved_conn_order, list):
                     conn_table_column_order = [int(x) for x in _saved_conn_order]
@@ -2075,6 +2160,14 @@ class TCPConnectionViewer(QMainWindow):
                 if hasattr(self, '_pcap_path_row'):
                     self._pcap_path_row.setVisible(self._active_collector.name == "PCAP File Collector")
 
+                # Restore Scapy forced interface selection
+                if hasattr(self, '_scapy_iface_combo'):
+                    self._scapy_iface_combo.blockSignals(True)
+                    self._set_scapy_iface_combo(do_scapy_force_use_interface_name)
+                    self._scapy_iface_combo.blockSignals(False)
+                if hasattr(self, '_scapy_iface_row'):
+                    self._scapy_iface_row.setVisible(self._active_collector.name == "Scapy Live Capture")
+
         except Exception as e:
             logging.error(f"Error applying settings to UI: {e}")
 
@@ -2306,6 +2399,9 @@ class TCPConnectionViewer(QMainWindow):
             # Show the PCAP path row only when the PCAP file collector is active
             if hasattr(self, '_pcap_path_row'):
                 self._pcap_path_row.setVisible(self._active_collector.name == "PCAP File Collector")
+            # Show the Scapy forced interface row only when the Scapy collector is active
+            if hasattr(self, '_scapy_iface_row'):
+                self._scapy_iface_row.setVisible(self._active_collector.name == "Scapy Live Capture")
             self.save_settings()
 
     @Slot()
@@ -2328,6 +2424,71 @@ class TCPConnectionViewer(QMainWindow):
         if path and hasattr(self, '_pcap_path_input'):
             self._pcap_path_input.setText(path)
             self._pcap_file_path = path
+
+    @Slot()
+    def _populate_scapy_iface_combo(self):
+        """Populate the Scapy interface combo with 'Auto-detect' + available interfaces.
+
+        Each entry shows a human-friendly label built from the Scapy
+        ``NetworkInterface`` object (name, description, IP) while the
+        item's *user-data* stores the ``network_name`` string that is
+        passed to ``sniff(iface=…)``.
+        """
+        if not hasattr(self, '_scapy_iface_combo'):
+            return
+        combo = self._scapy_iface_combo
+        combo.blockSignals(True)
+        prev_value = combo.currentData() or ''
+        combo.clear()
+        # First item: auto-detect (empty string as user data)
+        combo.addItem('Auto-detect (all interfaces)', '')
+        # Enumerate interfaces via Scapy's IFACES registry (rich objects)
+        try:
+            from scapy.all import IFACES
+            for iface in IFACES.values():
+                net_name = getattr(iface, 'network_name', '') or ''
+                if not net_name:
+                    continue
+                friendly = getattr(iface, 'name', '') or net_name
+                desc = getattr(iface, 'description', '') or ''
+                ip = getattr(iface, 'ip', '') or ''
+                parts = [friendly]
+                if desc and desc != friendly:
+                    parts.append(desc)
+                if ip:
+                    parts.append(ip)
+                display = ' — '.join(parts)
+                combo.addItem(display, net_name)
+        except Exception:
+            # Fallback: use get_if_list() raw names when IFACES is unavailable
+            try:
+                from scapy.all import get_if_list
+                for raw_name in get_if_list():
+                    if raw_name:
+                        combo.addItem(raw_name, raw_name)
+            except Exception as e:
+                logging.warning(f"Could not enumerate Scapy interfaces: {e}")
+        # Restore previous selection (or the global setting)
+        target = prev_value or do_scapy_force_use_interface_name
+        self._set_scapy_iface_combo(target)
+        combo.blockSignals(False)
+
+    def _set_scapy_iface_combo(self, iface_name):
+        """Select the combo item whose user-data matches *iface_name*."""
+        combo = self._scapy_iface_combo
+        for i in range(combo.count()):
+            if combo.itemData(i) == iface_name:
+                combo.setCurrentIndex(i)
+                return
+        # If the saved name is not in the list, fall back to auto-detect
+        combo.setCurrentIndex(0)
+
+    @Slot(int)
+    def _on_scapy_iface_changed(self, _index=0):
+        """Save the selected Scapy interface when the user picks one."""
+        global do_scapy_force_use_interface_name
+        if hasattr(self, '_scapy_iface_combo'):
+            do_scapy_force_use_interface_name = self._scapy_iface_combo.currentData() or ''
             self.save_settings()
 
     @Slot(int)
@@ -3882,8 +4043,10 @@ class TCPConnectionViewer(QMainWindow):
         """
         Sort the connection_table robustly.
 
-        - Snapshot every row as a list of strings.
-        - Detect numeric values for numeric sort (ints/floats).
+        - Snapshot every row as a list of (text, user_data) pairs.
+        - When user_data (Qt.UserRole) is present on the sort column,
+          use it as the numeric key (used by Sent / Recv byte columns).
+        - Otherwise detect numeric values for numeric sort (ints/floats).
         - Fall back to case-insensitive string comparison.
         - Uses a (type_rank, value) tuple key so that numeric and string
           values never compare against each other (avoids Python 3 TypeError).
@@ -3896,26 +4059,32 @@ class TCPConnectionViewer(QMainWindow):
         col_count = self.connection_table.columnCount()
 
         for r in range(row_count):
-            row_values = []
+            row_cells = []  # list of (text, user_data_or_None)
             for c in range(col_count):
                 item = self.connection_table.item(r, c)
-                row_values.append(item.text() if item is not None else "")
+                text = item.text() if item is not None else ""
+                ud = item.data(Qt.UserRole) if item is not None else None
+                row_cells.append((text, ud))
             # determine key from the sort column
-            raw_key = row_values[column_index] if column_index < len(row_values) else ""
-            # Build a (type_rank, value) tuple so mixed types never compare directly.
-            # type_rank: 0 = numeric, 1 = non-empty string, 2 = empty (always last)
-            if raw_key == "":
+            text, ud = row_cells[column_index] if column_index < len(row_cells) else ("", None)
+            if text == "" and ud is None:
                 sort_key = (2, "")
+            elif ud is not None:
+                # Qt.UserRole carries a raw numeric value (e.g. byte counts)
+                try:
+                    sort_key = (0, int(ud))
+                except (TypeError, ValueError):
+                    sort_key = (1, str(ud).lower())
             else:
                 try:
-                    if raw_key.isdigit():
-                        sort_key = (0, int(raw_key))
+                    if text.isdigit():
+                        sort_key = (0, int(text))
                     else:
-                        normalized = raw_key.replace(",", "")
+                        normalized = text.replace(",", "")
                         sort_key = (0, float(normalized))
                 except Exception:
-                    sort_key = (1, raw_key.lower())
-            rows.append((sort_key, row_values))
+                    sort_key = (1, text.lower())
+            rows.append((sort_key, row_cells))
 
         # stable sort — empty cells always sort to the end
         rows.sort(key=lambda x: x[0], reverse=reverse)
@@ -3928,11 +4097,14 @@ class TCPConnectionViewer(QMainWindow):
         # repopulate table from sorted snapshot
         self.connection_table.setUpdatesEnabled(False)
         self.connection_table.setRowCount(0)
-        for _, row_values in rows:
+        for _, row_cells in rows:
             new_row = self.connection_table.rowCount()
             self.connection_table.insertRow(new_row)
-            for c, text in enumerate(row_values):
-                self.connection_table.setItem(new_row, c, QTableWidgetItem(text))
+            for c, (text, ud) in enumerate(row_cells):
+                item = QTableWidgetItem(text)
+                if ud is not None:
+                    item.setData(Qt.UserRole, ud)
+                self.connection_table.setItem(new_row, c, item)
         self.connection_table.setUpdatesEnabled(True)
 
     @Slot(int)
@@ -3960,8 +4132,10 @@ class TCPConnectionViewer(QMainWindow):
         """
         Sort the summary_table robustly.
 
-        - Snapshot every row as a list of strings.
-        - Detect numeric values for numeric sort (ints/floats).
+        - Snapshot every row as a list of (text, user_data, color) tuples.
+        - When user_data (Qt.UserRole) is present on the sort column,
+          use it as the numeric key (used by Sent / Recv byte columns).
+        - Otherwise detect numeric values for numeric sort (ints/floats).
         - Fall back to case-insensitive string comparison.
         - Uses a (type_rank, value) tuple key so that numeric and string
           values never compare against each other (avoids Python 3 TypeError).
@@ -3975,30 +4149,33 @@ class TCPConnectionViewer(QMainWindow):
         col_count = self.summary_table.columnCount()
 
         for r in range(row_count):
-            row_values = []
-            row_colors = []
+            row_cells = []  # list of (text, user_data_or_None, color)
             for c in range(col_count):
                 item = self.summary_table.item(r, c)
-                row_values.append(item.text() if item is not None else "")
-                # Store the foreground color to preserve red highlighting
-                row_colors.append(item.foreground() if item is not None else None)
+                text = item.text() if item is not None else ""
+                ud = item.data(Qt.UserRole) if item is not None else None
+                color = item.foreground() if item is not None else None
+                row_cells.append((text, ud, color))
 
             # determine key from the sort column
-            raw_key = row_values[column_index] if column_index < len(row_values) else ""
-            # Build a (type_rank, value) tuple so mixed types never compare directly.
-            # type_rank: 0 = numeric, 1 = non-empty string, 2 = empty (always last)
-            if raw_key == "":
+            text, ud, _color = row_cells[column_index] if column_index < len(row_cells) else ("", None, None)
+            if text == "" and ud is None:
                 sort_key = (2, "")
+            elif ud is not None:
+                try:
+                    sort_key = (0, int(ud))
+                except (TypeError, ValueError):
+                    sort_key = (1, str(ud).lower())
             else:
                 try:
-                    if raw_key.isdigit():
-                        sort_key = (0, int(raw_key))
+                    if text.isdigit():
+                        sort_key = (0, int(text))
                     else:
-                        normalized = raw_key.replace(",", "")
+                        normalized = text.replace(",", "")
                         sort_key = (0, float(normalized))
                 except Exception:
-                    sort_key = (1, raw_key.lower())
-            rows.append((sort_key, row_values, row_colors))
+                    sort_key = (1, text.lower())
+            rows.append((sort_key, row_cells))
 
         # stable sort — empty cells always sort to the end
         rows.sort(key=lambda x: x[0], reverse=reverse)
@@ -4011,14 +4188,15 @@ class TCPConnectionViewer(QMainWindow):
         # repopulate table from sorted snapshot
         self.summary_table.setUpdatesEnabled(False)
         self.summary_table.setRowCount(0)
-        for _, row_values, row_colors in rows:
+        for _, row_cells in rows:
             new_row = self.summary_table.rowCount()
             self.summary_table.insertRow(new_row)
-            for c, text in enumerate(row_values):
+            for c, (text, ud, color) in enumerate(row_cells):
                 item = QTableWidgetItem(text)
-                # Restore original color if it was saved
-                if c < len(row_colors) and row_colors[c] is not None:
-                    item.setForeground(row_colors[c])
+                if ud is not None:
+                    item.setData(Qt.UserRole, ud)
+                if color is not None:
+                    item.setForeground(color)
                 self.summary_table.setItem(new_row, c, item)
         self.summary_table.setUpdatesEnabled(True)
 
@@ -5272,6 +5450,30 @@ class TCPConnectionViewer(QMainWindow):
         settings_tab_layout.addWidget(self._pcap_path_row)
         # Show/hide based on current active collector
         self._pcap_path_row.setVisible(self._active_collector.name == "PCAP File Collector")
+
+        # Scapy forced interface name row — visible only when Scapy collector is active
+        self._scapy_iface_row = QWidget()
+        scapy_iface_layout = QHBoxLayout(self._scapy_iface_row)
+        scapy_iface_layout.setContentsMargins(0, 0, 0, 0)
+        scapy_iface_layout.addWidget(QLabel("Scapy interface:"))
+        self._scapy_iface_combo = QComboBox()
+        self._scapy_iface_combo.setToolTip(
+            "Select the network interface Scapy will sniff on.\n"
+            "'Auto-detect' sniffs on all available interfaces.\n"
+            "If Scapy fails with an OSError about 'Network interface was not found',\n"
+            "try selecting a specific interface from this list."
+        )
+        self._populate_scapy_iface_combo()
+        self._scapy_iface_combo.currentIndexChanged.connect(self._on_scapy_iface_changed)
+        scapy_iface_layout.addWidget(self._scapy_iface_combo, 1)
+        # Refresh button to re-enumerate interfaces
+        scapy_iface_refresh_btn = QPushButton("Refresh")
+        scapy_iface_refresh_btn.setFixedWidth(70)
+        scapy_iface_refresh_btn.setToolTip("Re-enumerate available network interfaces")
+        scapy_iface_refresh_btn.clicked.connect(self._populate_scapy_iface_combo)
+        scapy_iface_layout.addWidget(scapy_iface_refresh_btn)
+        settings_tab_layout.addWidget(self._scapy_iface_row)
+        self._scapy_iface_row.setVisible(self._active_collector.name == "Scapy Live Capture")
 
         # --- Server / Agent mode settings ---
         server_agent_separator = QLabel("─── Server / Agent Mode ───")
@@ -8261,8 +8463,8 @@ class TCPConnectionViewer(QMainWindow):
                     _way = 'IN' if (conn.get('state', '') == 'LISTEN' or conn.get('inbound')) else 'OUT'
                     self.connection_table.setItem(row, WAY_ROW_INDEX, QTableWidgetItem(_way))
                     self.connection_table.setItem(row, HOSTNAME_ROW_INDEX, QTableWidgetItem(conn.get('hostname', '')))
-                    self.connection_table.setItem(row, BYTES_SENT_ROW_INDEX, QTableWidgetItem(_format_bytes(conn.get('bytes_sent', 0))))
-                    self.connection_table.setItem(row, BYTES_RECV_ROW_INDEX, QTableWidgetItem(_format_bytes(conn.get('bytes_recv', 0))))
+                    self.connection_table.setItem(row, BYTES_SENT_ROW_INDEX, _make_bytes_item(conn.get('bytes_sent', 0)))
+                    self.connection_table.setItem(row, BYTES_RECV_ROW_INDEX, _make_bytes_item(conn.get('bytes_recv', 0)))
 
                 if ip in ('*', '0.0.0.0', '::', ''):
                     # UDP listener with no remote peer — not a real unresolved address
@@ -8961,69 +9163,39 @@ class TCPConnectionViewer(QMainWindow):
 
     @Slot()
     def update_summary_table(self):
-        """Populate the summary table with aggregated connection statistics"""
-        try:
-            # Clear existing rows
-            self.summary_table.setUpdatesEnabled(False)
-            self.summary_table.setRowCount(0)
+        """Kick off background aggregation of connection statistics.
 
+        The heavy iteration over every timeline snapshot is done on a
+        QThreadPool thread (``SummaryAggregationWorker``).  Only the
+        final table population runs on the GUI thread via
+        ``_on_summary_aggregation_ready``.
+        """
+        try:
             if not self.connection_list:
+                self.summary_table.setUpdatesEnabled(False)
+                self.summary_table.setRowCount(0)
                 self.summary_table.setUpdatesEnabled(True)
                 return
 
-            # Dictionary to track unique connections: key -> { 'count': int, 'bytes_sent': int, 'bytes_recv': int }
-            connection_stats = {}
-
-            # Get current setting for filtering local connections
-            global show_only_remote_connections
-
-            # Snapshot the deque atomically so a background append cannot mutate it
-            # while we iterate (avoids "deque mutated during iteration" RuntimeError)
+            # Snapshot the deque atomically so the worker iterates a stable copy
             snapshot = list(self.connection_list)
 
-            # Iterate through all timeline snapshots in connection_list
-            for timeline_entry in snapshot:
-                connection_list = timeline_entry.get('connection_list', [])
+            worker = SummaryAggregationWorker(snapshot, show_only_remote_connections)
+            # prevent the worker ref from being GC'd before the pool finishes
+            self._summary_worker = worker
+            worker.signals.finished.connect(self._on_summary_aggregation_ready)
+            QThreadPool.globalInstance().start(worker)
 
-                for conn in connection_list:
-                    # Create a unique key from connection attributes
-                    process = conn.get('process', '')
-                    pid = conn.get('pid', '')
-                    suspect = conn.get('suspect', '')
-                    protocol = conn.get('protocol', '')
-                    local = conn.get('local', '')
-                    remote = conn.get('remote', '')
-                    ip_type = conn.get('ip_type', '')
-                    name = conn.get('name', '')
-                    way = 'IN' if (conn.get('state', '') == 'LISTEN' or conn.get('inbound')) else 'OUT'
+        except Exception as e:
+            logging.error(f"Error launching summary aggregation: {e}")
 
-                    # Filter out non-routable connections if show_only_remote_connections is enabled
-                    if show_only_remote_connections:
-                        # Extract IP address (before any hostname in parentheses)
-                        remote_ip = remote.split(' (')[0].split(':')[0]
-                        if not is_routable(remote_ip):
-                            continue
+    @Slot(object, int, int)
+    def _on_summary_aggregation_ready(self, sorted_stats, total_unique, total_connections):
+        """Populate the summary QTableWidget from pre-aggregated stats (GUI thread)."""
+        try:
+            self.summary_table.setUpdatesEnabled(False)
+            self.summary_table.setRowCount(0)
 
-                    hostname = conn.get('hostname', '')
-
-                    # Use tuple as dictionary key for grouping
-                    key = (hostname, process, pid, suspect, protocol, local, remote, ip_type, way, name)
-
-                    b_sent = conn.get('bytes_sent', 0) or 0
-                    b_recv = conn.get('bytes_recv', 0) or 0
-
-                    # Increment count and accumulate bytes for this unique connection
-                    if key in connection_stats:
-                        connection_stats[key]['count'] += 1
-                        connection_stats[key]['bytes_sent'] = max(connection_stats[key]['bytes_sent'], b_sent)
-                        connection_stats[key]['bytes_recv'] = max(connection_stats[key]['bytes_recv'], b_recv)
-                    else:
-                        connection_stats[key] = {'count': 1, 'bytes_sent': b_sent, 'bytes_recv': b_recv}
-
-            # Sort by count descending (highest first)
-            sorted_stats = sorted(connection_stats.items(), key=lambda x: x[1]['count'], reverse=True)
-
-            # Populate table with sorted results
             for (hostname, process, pid, suspect, protocol, local, remote, ip_type, way, name), stats in sorted_stats:
                 count = stats['count']
                 row = self.summary_table.rowCount()
@@ -9040,8 +9212,8 @@ class TCPConnectionViewer(QMainWindow):
                 self.summary_table.setItem(row, 8, QTableWidgetItem(way))
                 self.summary_table.setItem(row, 9, QTableWidgetItem(name))
                 self.summary_table.setItem(row, 10, QTableWidgetItem(str(count)))
-                self.summary_table.setItem(row, 11, QTableWidgetItem(_format_bytes(stats['bytes_sent'])))
-                self.summary_table.setItem(row, 12, QTableWidgetItem(_format_bytes(stats['bytes_recv'])))
+                self.summary_table.setItem(row, 11, _make_bytes_item(stats['bytes_sent']))
+                self.summary_table.setItem(row, 12, _make_bytes_item(stats['bytes_recv']))
 
                 # Highlight suspect connections in red
                 if suspect == "Yes":
@@ -9051,10 +9223,6 @@ class TCPConnectionViewer(QMainWindow):
             self.summary_table.setUpdatesEnabled(True)
 
             # Update title with total count
-            total_unique = len(sorted_stats)
-            total_connections = sum(s['count'] for _, s in sorted_stats)
-
-            # Find the title label and update it
             for i in range(self.tab_widget.widget(1).layout().count()):
                 item = self.tab_widget.widget(1).layout().itemAt(i)
                 if item and isinstance(item.widget(), QLabel):
