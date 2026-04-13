@@ -41,7 +41,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.7.4" # Current script version
+VERSION = "3.7.5" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -370,6 +370,10 @@ do_collect_connections_asynchronously = True  # Set to True to collect connectio
 do_show_listening_connections = False  # Set to True to include LISTEN sockets in the connection list
 conn_table_column_order: list = []        # Visual column order for the main connection table (logical indices)
 summary_table_column_order: list = []     # Visual column order for the summary table (logical indices)
+# Default summary table column order: Count (logical 10) moved to the last visual position.
+# Columns: Hostname(0) Process(1) PID(2) C2(3) Protocol(4) LocalAddr(5) RemoteAddr(6)
+#          Type(7) Way(8) Name(9) Sent(11) Recv(12) Count(10)
+SUMMARY_TABLE_DEFAULT_COLUMN_ORDER: list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 10]
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
 
 # Database persistence layer globals
@@ -1011,6 +1015,20 @@ def _format_bytes(num_bytes):
     i = min(int(num_bytes > 0 and (num_bytes).bit_length() - 1) // 10, len(sizes) - 1)
     val = num_bytes / (k ** i)
     return f'{val:.1f} {sizes[i]}'
+
+def is_routable(ip_str: str) -> bool:
+    """Return True if *ip_str* is a publicly routable (non-private) IP address.
+
+    Uses :mod:`ipaddress` so every RFC-1918 / RFC-4193 / loopback / link-local
+    address is treated as non-routable, matching the intent of the
+    'Hide local connections' filter.
+    Returns False for any value that is not a valid IP address.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return not ip.is_private
+    except ValueError:
+        return False
 
 def _discover_collector_plugins():
     """Scan the ``plugins/`` directory for ConnectionCollectorPlugin subclasses.
@@ -2001,7 +2019,7 @@ class TCPConnectionViewer(QMainWindow):
                 # Sync database persistence UI
                 if hasattr(self, 'db_provider_combo'):
                     self.db_provider_combo.blockSignals(True)
-                    self.db_provider_combo.setCurrentText(db_provider_name)
+                    self._set_db_combo_by_name(db_provider_name)
                     self.db_provider_combo.blockSignals(False)
                 if hasattr(self, 'db_buffer_size_input'):
                     self.db_buffer_size_input.setText(str(max_connection_list_database_size))
@@ -3077,6 +3095,12 @@ class TCPConnectionViewer(QMainWindow):
 
         menu = QMenu(self)
 
+        # Hide / Unhide local connections (routable filter)
+        action_toggle_remote = menu.addAction("Hide local connections and local network traffic")
+        action_toggle_remote.setCheckable(True)
+        action_toggle_remote.setChecked(show_only_remote_connections)
+        menu.addSeparator()
+
         # Copy cell value — always the first action
         cell_item = self.connection_table.item(row, index.column())
         cell_text = cell_item.text() if cell_item else ""
@@ -3116,6 +3140,10 @@ class TCPConnectionViewer(QMainWindow):
 
         chosen = menu.exec(self.connection_table.viewport().mapToGlobal(pos))
         if chosen is None:
+            return
+
+        if chosen == action_toggle_remote:
+            self._toggle_only_remote_connections()
             return
 
         if chosen == action_copy:
@@ -3299,6 +3327,12 @@ class TCPConnectionViewer(QMainWindow):
 
         menu = QMenu(self)
 
+        # Hide / Unhide local connections (routable filter)
+        action_toggle_remote = menu.addAction("Hide local connections")
+        action_toggle_remote.setCheckable(True)
+        action_toggle_remote.setChecked(show_only_remote_connections)
+        menu.addSeparator()
+
         # Hide / Unhide agent actions (only when in server mode with agents)
         action_hide_agent = action_unhide_agent = None
         action_hide_all_others = action_unhide_all = None
@@ -3326,6 +3360,10 @@ class TCPConnectionViewer(QMainWindow):
 
         chosen = menu.exec(self.summary_table.viewport().mapToGlobal(pos))
         if chosen is None:
+            return
+
+        if chosen == action_toggle_remote:
+            self._toggle_only_remote_connections()
             return
 
         if chosen == action_hide_agent:
@@ -3527,7 +3565,7 @@ class TCPConnectionViewer(QMainWindow):
         """Restore a previously saved column order onto the summary table."""
         try:
             if not order:
-                return
+                order = SUMMARY_TABLE_DEFAULT_COLUMN_ORDER
             hdr = self.summary_table.horizontalHeader()
             n = hdr.count()
             if len(order) != n:
@@ -3563,14 +3601,7 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
         try:
-            hdr = self.summary_table.horizontalHeader()
-            for logical in range(hdr.count()):
-                current_visual = hdr.visualIndex(logical)
-                if current_visual != logical:
-                    hdr.moveSection(current_visual, logical)
-            self._sync_filter_order(self.summary_table, self._summary_filter_inputs,
-                                    self._summary_filter_inner)
-            self._sync_summary_filter_widths()
+            self._apply_summary_table_column_order(SUMMARY_TABLE_DEFAULT_COLUMN_ORDER)
         except Exception:
             pass
         self.save_settings()
@@ -4220,28 +4251,39 @@ class TCPConnectionViewer(QMainWindow):
             logging.error(f"Database snapshot save error: {e}")
 
     @Slot(str)
+    def _set_db_combo_by_name(self, name: str) -> None:
+        """Select the combo item whose user data matches *name* (the real provider key)."""
+        for i in range(self.db_provider_combo.count()):
+            if self.db_provider_combo.itemData(i) == name:
+                self.db_provider_combo.setCurrentIndex(i)
+                return
+        # Fallback: if not found (e.g. provider removed), select Disabled
+        self.db_provider_combo.setCurrentIndex(0)
+
     def _on_db_provider_changed(self, text: str) -> None:
         global db_provider_name
-        if text == db_provider_name:
+        # Resolve the real provider key from the item's user data
+        provider_key = self.db_provider_combo.currentData() or text
+        if provider_key == db_provider_name:
             return
-        if text == "Disabled":
+        if provider_key == "Disabled":
             self._deactivate_db_provider()
             db_provider_name = "Disabled"
             self.save_settings()
             logging.info("Database persistence disabled.")
             return
-        ok = self._activate_db_provider(text)
+        ok = self._activate_db_provider(provider_key)
         if ok:
-            db_provider_name = text
+            db_provider_name = provider_key
             self.save_settings()
         else:
             QMessageBox.warning(
                 self, "Database Error",
-                f"Could not connect to the '{text}' provider.\n"
+                f"Could not connect to the '{provider_key}' provider.\n"
                 "Check logs for details. Reverting to Disabled."
             )
             self.db_provider_combo.blockSignals(True)
-            self.db_provider_combo.setCurrentText(db_provider_name)
+            self._set_db_combo_by_name(db_provider_name)
             self.db_provider_combo.blockSignals(False)
 
     @Slot()
@@ -4425,6 +4467,16 @@ class TCPConnectionViewer(QMainWindow):
             show_only_new_active_connections = False
             self.setStyleSheet("") # Reset any previous styles
 
+        self.refresh_connections()
+        self.save_settings()
+
+    def _toggle_only_remote_connections(self):
+        """Toggle the 'Hide local connections' filter and keep the Settings checkbox in sync."""
+        global show_only_remote_connections
+        show_only_remote_connections = not show_only_remote_connections
+        self.only_show_remote_connections.setChecked(show_only_remote_connections)
+        if not show_only_remote_connections:
+            self.setStyleSheet("")  # Reset any previous styles
         self.refresh_connections()
         self.save_settings()
 
@@ -5063,7 +5115,7 @@ class TCPConnectionViewer(QMainWindow):
         self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)
 
         # Hide remote local connections
-        self.only_show_remote_connections = QCheckBox("Hide local connections on tables")
+        self.only_show_remote_connections = QCheckBox("Hide local connections and local network traffic on tables")
         self.only_show_remote_connections.setChecked(False)
         settings_tab_layout.addWidget(self.only_show_remote_connections)    
         self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)
@@ -5128,15 +5180,22 @@ class TCPConnectionViewer(QMainWindow):
         db_provider_layout.addWidget(db_provider_label)
 
         self.db_provider_combo = QComboBox()
-        self.db_provider_combo.addItem("Disabled")
-        # Discover available providers from the db_providers package
+        # "Disabled" — no user data needed (display == key)
+        self.db_provider_combo.addItem("Disabled", "Disabled")
+        # Discover available providers from the db_providers package.
+        # SQLite is always listed second (Recommended); remaining providers follow alphabetically.
         try:
             from db_providers import get_available_providers
-            for pname in sorted(get_available_providers().keys()):
-                self.db_provider_combo.addItem(pname)
+            _providers = sorted(get_available_providers().keys())
+            if "SQLite" in _providers:
+                self.db_provider_combo.addItem("SQLite (Recommended)", "SQLite")
+            for pname in _providers:
+                if pname == "SQLite":
+                    continue
+                self.db_provider_combo.addItem(pname, pname)
         except Exception:
             pass  # package not importable — only "Disabled" shown
-        self.db_provider_combo.setCurrentText(db_provider_name)
+        self._set_db_combo_by_name(db_provider_name)
         self.db_provider_combo.currentTextChanged.connect(self._on_db_provider_changed)
         db_provider_layout.addWidget(self.db_provider_combo)
         db_provider_layout.addStretch()
@@ -8186,7 +8245,7 @@ class TCPConnectionViewer(QMainWindow):
 
                 row = self.connection_table.rowCount()
 
-                if not (show_only_remote_connections and ip in ('127.0.0.1','::1')):
+                if not (show_only_remote_connections and not is_routable(ip)):
                     self.connection_table.insertRow(row)
 
                     self.connection_table.setItem(row, PROCESS_ROW_INDEX, QTableWidgetItem(conn['process']))
@@ -8208,7 +8267,7 @@ class TCPConnectionViewer(QMainWindow):
                 if ip in ('*', '0.0.0.0', '::', ''):
                     # UDP listener with no remote peer — not a real unresolved address
                     udp_no_remote += 1
-                elif ip not in ('127.0.0.1','::1'):
+                elif is_routable(ip):
 
                     ip = conn['remote'].split(' ')[0]
                     ip = ip.split(' (')[0]  # Remove any appended hostname                    
@@ -8938,12 +8997,11 @@ class TCPConnectionViewer(QMainWindow):
                     name = conn.get('name', '')
                     way = 'IN' if (conn.get('state', '') == 'LISTEN' or conn.get('inbound')) else 'OUT'
 
-                    # Filter out local connections if show_only_remote_connections is enabled
+                    # Filter out non-routable connections if show_only_remote_connections is enabled
                     if show_only_remote_connections:
                         # Extract IP address (before any hostname in parentheses)
                         remote_ip = remote.split(' (')[0].split(':')[0]
-                        # Skip local connections
-                        if remote_ip in ('127.0.0.1', '::1'):
+                        if not is_routable(remote_ip):
                             continue
 
                     hostname = conn.get('hostname', '')
