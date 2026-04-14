@@ -84,6 +84,8 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         self._sniffer_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._started = False
+        self.npcap_unavailable = False  # True when both L2 and L3 sniffing failed (Npcap/WinPcap not installed)
+        self._npcap_error_detail = ""  # human-readable error message from the failed sniff attempt
         self._hostname = _platform.node()
         self._pid_cache: dict = {}
         self._pid_cache_time: float = 0.0
@@ -119,7 +121,7 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
         ``_CONN_TIMEOUT``).  This guarantees the Scapy collector returns
         *at least* as many connections as the OS table alone.
         """
-        if not self._started:
+        if not self._started and not self.npcap_unavailable:
             self._start_sniffer()
 
         # ---- Sleep / resume detection ----------------------------------------
@@ -691,6 +693,11 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                         f"ScapyLiveCollector: L3 fallback error: "
                         f"{type(e2).__name__}: {e2}"
                     )
+                    self.npcap_unavailable = True
+                    self._npcap_error_detail = (
+                        f"L2 failed ({type(e).__name__}: {e}); "
+                        f"L3 fallback also failed ({type(e2).__name__}: {e2})"
+                    )
             else:
                 logging.error(f"ScapyLiveCollector: L2 sniffer error: {e}")
 
@@ -727,6 +734,11 @@ class ScapyLiveCollector(ConnectionCollectorPlugin):
                     logging.error(
                         f"ScapyLiveCollector: L3 fallback error: "
                         f"{type(e2).__name__}: {e2}"
+                    )
+                    self.npcap_unavailable = True
+                    self._npcap_error_detail = (
+                        f"L2 failed ({type(e).__name__}: {e}); "
+                        f"L3 fallback also failed ({type(e2).__name__}: {e2})"
                     )
             else:
                 logging.error(f"ScapyLiveCollector: sniffer error: {e}")
