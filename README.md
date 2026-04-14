@@ -1,197 +1,269 @@
-# Summary
+﻿# tcp_geo_map.py
 
-tcp_geo_map.py is a python desktop UI tool that enumerates active TCP and UDP connections (via `psutil` like a "netstat") per process, resolves geolocation using (MaxMind GeoLite2) and optionally it can perform reverse DNS/C2 checks. 
-"Live snapshots" of the outbound TCP connections are then displayed in a Qt GUI (`PySide6`) with a Leaflet map using OpenStreetMap giving a graphical representation of where the current machine connects to.
-If "Perform C2 checks against C2-TRACKER database" feature is on (turned on by default) users will be warned if the machine running the script connects to a suspected remote IP address. 
+A Python desktop tool that enumerates active TCP and UDP connections per process, resolves geolocation via MaxMind GeoLite2, and displays them on a live Leaflet/OpenStreetMap in a PySide6 Qt GUI. Connection snapshots are collected on a configurable timer, stored in a FIFO replay buffer, and can be replayed at any time using the built-in timeline slider.
 
-"Live network connection snapshots" refresh times can be customized, connections can be replayed and saved...
-When the "Resolve public internet IP address" feature is turned on you can monitor your exit point.
+> **Warning C2-Tracker notice:** The C2 threat-intelligence check feature (`do_c2_check`) relied on the [montysecurity/C2-Tracker](https://github.com/montysecurity/C2-Tracker) feed. That repository is now **archived and no longer maintained**, meaning no new threat data is available and existing data is stale. The feature remains in the codebase for reference but is **disabled by default** and should not be relied upon for security decisions.
 
-Maximum connection snapshots to keep in memory can be modified on the Settings tab.
+---
 
-In the settings tab the "Capture screenshots of the map to disk" feature may be turned on to take screenshots of the map into the screen_captures folder. Everytime the map is lived refreshed an new .jpg file will be generated. When the feature is on a new button will apear on the main tab that will generate a new .mp4 video capture of all the present .jpg file in the same location. To prevent disk space from getting filled the older files are automaticaly deleted.
+## Why use tcp_geo_map.py?
 
-The latest release introduces many enhancements from general performance to agent (client) / server architecture and its new plugin API (ConnectionCollectorPlugin interface) that makes it extensible.
+Ever wondered what endpoints a machine is connecting to, or whether it is sending unexpected telemetry? tcp_geo_map.py renders live network connections on an interactive world map per process, letting you see at a glance *who* is talking, *where*, and *how much* traffic is flowing. It is equally useful as a day-to-day privacy monitor and as a forensic triage tool -- each row in the connection table can be right-clicked to launch Sysinternals Process Monitor, dump the process (Windows/Linux), and more.
 
-You can now start on one machine from the settings tab the server feature. Once done you can then deploy as many clients as you wish and point them to the server. From now on the server instance will now render remote machine connections allowing you to monitor your home machine network for example.
+---
 
-The built-in plugins are:
+## Tested on
 
-•	The psutil interface that requires low privileges.
-
-•	A scapy live packet capture interface that requires administrative privileges or https://npcap.com/.
-
-•	A pcap file visualization for recorded packet captures (pcaps).
-
-# Why use tcp_geo_map.py?
-Ever wondered, is this machine clean? To what endpoints and geographical destination is this host connecting to such as to sending telemetry or simply understand this machine "network" behavior based on what processes (running programs) on it? 
-This GeoInt OSINT script UI shows on the earth map live network connections made and will warn based on the C2-Tracker list maintained by montysecurity if the machine connects to a suspicious C2 endpoint.
-
-tcp_geo_map.pc as turned into a very effective forensic tool as each process / connection entry allows right clicking to collect traces on table of connections, dumps for Windows (using sysinternals toolset) and Linux (gcore, htop)
-
-# Tested on
-- (Kali, Bazzite) Linux
+- Kali Linux, Bazzite Linux
 - Windows 11
 
-![til](./pictures/tcp_geo_map_demo.gif)
+![Demo](./pictures/tcp_geo_map_demo.gif)
 
-# Contributors & Attribution
-* This script uses GeoLite2 geo database to render the remote IP location using OpenStreetMap/leaflet/folium check out: https://github.com/sapics/ip-location-db/tree/main/geolite2-city
+---
 
-When prompted for download and agreed the script will fetch the following two files and save them in the database subfolder:
-- https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-city-mmdb/geolite2-city-ipv4.mmdb
-- https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-city-mmdb/geolite2-city-ipv6.mmdb
+## Requirements
 
-Accepting GeoLite2 the licensing terms for GeoLite is a requirement for this application to work.
+On Windows it is recommended to install [Npcap](https://npcap.com/) for full Layer 2 capture; without it the collector falls back to Layer 3. Administrative/root privileges are required for raw socket access regardless of Npcap presence.²
 
-GeoLite2 is created by MaxMind. The license of GeoLite2 is written in GEOLITE2_LICENSE and End User License Agreement (EULA) is written in GEOLITE2_EULA. Please carefully read the GEOLITE2_LICENSE and GEOLITE2_EULA files, if you use these databases. This package comes with certain restrictions and obligations, most notably:
+---
 
-You cannot prevent the library from updating the databases.
-You cannot use the GeoLite2 data: for FCRA purposes, to identify specific households or individuals.
-You can read the latest version of GeoLite2 EULA here https://www.maxmind.com/en/geolite2/eula. GeoLite2 database is provided under CC BY-SA 4.0 by MaxMind.
+## Built-in connection collector plugins
 
-THe map is rendered using OpenStreetMap.org engine. OpenStreetMap data is available under the Open Database License (ODbL) v1.0 for further details please visit: https://www.openstreetmap.org/copyright/ and https://opendatacommons.org/licenses/odbl/1-0/.
+The active collector is selected in **Settings -> Connection Collector Plugin**. The default is **Scapy Live Capture**.
 
-* ipfy.com
-Is a public internet API that provides any application such as this one to get its public address using an http call. If the "Resolve public internet IP using ipfy.com" checkbox is enabled a call to ipfy.com is performed and your public IP address will be queried and resolved using their service. If successful the public IP address will be shown on the map as a red circle.
+| Plugin | Notes |
+|--------|-------|
+| **Scapy Live Capture** *(Recommended -- default)* | Live packet capture via Scapy `sniff()`. Provides per-connection byte-level sent/recv accounting. On Windows, install [Npcap](https://npcap.com/) for full Layer 2 capture; without it the collector falls back to Layer 3. Requires administrative/root privileges or Npcap. |
+| **psutil / OS connection table** | Uses `psutil.net_connections()` supplemented with `netstat`/`ss`. Lower privilege requirements; no byte-level traffic accounting. |
+| **PCAP File Collector** | Reads an existing `.pcap` / `.pcapng` file and overlays its traffic byte counts on the live OS connection table. Useful for offline analysis of recorded captures. Requires `scapy`. |
 
-* C2_TRACKER 
-C2 Tracker is a free-to-use-community-driven IOC feed that searches to collect IP addresses of known malware/botnet/C2 infrastructure.
+> **Windows without Npcap:** If Npcap is not installed and the Scapy collector is active, a one-time warning dialog is shown directing you to [https://npcap.com/](https://npcap.com/). This warning can be suppressed permanently via **Settings -> Warn if Npcap is not installed**.
 
-When prompted for download and agreed the script will fetch the following file containing the list of C2 Suspect IP addresses and save it in the database subfolder:
-- https://github.com/montysecurity/C2-Tracker/raw/refs/heads/main/data/all.txt
+---
 
-* procmon-parser
-When right clicking on a table item sysinternals procmon can be started to automaticaly start capturing process activity. To generate the procmon capture profile it uses https://github.com/eronnen/procmon-parser .
+## Database persistence providers
 
-* flask
-When using server and agent mode, the server will start by default a flask web server on port 5000 (port can be configured in the settings tab). You may need to create a firewall rule allow python to listen and allow remote agents (clients) to connect to it
+Connection history can be persisted across restarts. Configured in **Settings -> Database Persistence**.
 
-* scapy
-You may replace psutil collection by scapy live packet capture. To do so navigate to the settings tab and select the scapy collector. This requires to run the script (python) as an administrator. By default the scapy plugin will try to capture layer 2 packets and then falls back to layer 3 if not found. For layer 2 capture you will need to install https://npcap.com/ but this is not mandatory as if not present the default plugin will fallback to layer 3 (requiring administrative privileges though).
+| Provider | Notes |
+|----------|-------|
+| **Disabled** *(default)* | No persistence; the in-memory buffer is lost on exit. |
+| **SQLite** *(Recommended)* | Zero-configuration local file at `connection_databases/connection_history.db`. |
+| **MongoDB** | Requires a running MongoDB instance. |
+| **SQL Server** | Requires a reachable SQL Server instance. |
+| **Oracle** | Requires a reachable Oracle database instance. |
 
-* aiodns
-Is now used for async reverse dns name resolution.
+Use `--force_complete_database_load` at startup to pre-fill the in-memory buffer from the database and replay the full stored history on the timeline slider without starting live capture.
 
-tcp_geo_map uses:
+---
 
-* maxminddb
-* PySide6
-* psutil
-* folium / OpenStreetMap
-* opencv-python
-* procmon-parser
-* flask
-* scapy
-* https://github.com/pointhi/leaflet-color-markers
-* aiodns
+## Server / Agent mode
 
-When a remote C2/suspect IP connection listed is the C2_TRACKER is made the UI will turn red, display a warning message and the process performing such a call will be tagged in red and "C2" column will mark "Yes".
+One machine can run as a **server** and aggregate connections POSTed by multiple remote **agents**:
 
-Databases are considered as obsolete after a week, and you will be prompted to refresh it.
+1. On the server: enable **Server mode** in Settings (or pass `--enable_server_mode`). A Flask endpoint starts on the configured port (default `5000`).
+2. On each client: enable **Agent mode** in Settings and point it at the server hostname (or pass `--enable_agent_mode <host>`). The agent periodically POSTs its live connections to the server.
+3. The server renders all agents connections on the same map, colour-coded per agent. Up to `MAX_SERVER_AGENTS` (default `100`) distinct agents are accepted; new agents beyond this limit receive HTTP 429.
 
-This tool has been developped with the help of Claude Sonnet and Claude Opus AI.
+You may need to add a firewall rule to allow inbound TCP on the Flask port.
 
-# Avoiding prompts
-You can start the script by passing --accept_eula (Accept End User License Agreement) this means you agree, approve to follow all the licensing terms of all contributors and attributions including GeoLite2/MaxMind, C2_TRACKER, PySide6, psutil, folium / OpenStreetMap / Leaflet. 
-When --accept_eula is passed the databases will be downloaded automatically when they expire (by default every 7 days) and the /resources/leaflet/ files cache will be populated automatically as well to speedup startup time and reduce telemetry footprint this means you agree as well with leaflet and https://github.com/pointhi/leaflet-color-markers licensing agreements.
+---
 
-# Offline / Telemetry reduction
-Access to tile.openstreetmap.org is required to render the map so internet access is required to that site.
-When starting the application will download leaflet/OpenStreetMap marker icons from https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img as well as https://unpkg.com/leaflet and will prompt you to cache them locally into /resources/leaflet/ in order to speed up next startup time.  You can also use the script download_resources.ps1 powershell script located in resources\leaflet directory  to download the below files independently.
-If you want to be fully private you will need to download a .osm/.pbf extract of your area of interest, set up a local tile server or vector-tile stack, and point your `{z}/{x}/{y}` URL to your own server instead of tile.openstreetmap.org using the `TILE_OPENSTREETMAP_SERVER` constant in `tcp_geo_map.py` (see the Settings section below for details).
-By default ipfy calls are made to resolve internet exit point. If you wish to turn it off uncheck the "Resolve public internet IP using ipfy.com" in the settings tab.
+## Map marker colours
 
-# Map marker colors
-- Green icon - Connection that is available since the last refresh
-- Blue icon - A new connection was made
-- Red icon - A possible C2 / Suspect connection
-- Yellow icon - A selected item.
+| Colour | Meaning |
+|--------|---------|
+| Green | Connection present since the last refresh |
+| Blue | New connection observed this refresh cycle |
+| Red | Public exit-point circle; or a C2-Tracker match *(feature deprecated -- see notice above)* |
+| Yellow | Currently selected connection |
 
-Markers can be clicked for additional details, map can be zoomed...
+Markers are clickable for details; the map can be panned and zoomed freely.
 
-# Install
-- (kali) linux install using venv:
+---
 
+## Features overview
+
+- **Live geo-mapping** -- remote IP locations resolved via MaxMind GeoLite2 plotted on OpenStreetMap at every refresh.
+- **Timeline replay** -- captured snapshots stored in a FIFO buffer; use the time slider or the Replay button to step through history.
+- **Traffic gauges & histogram** -- per-marker sent/recv byte gauges and a global traffic histogram overlay (requires Scapy or PCAP collector).
+- **Summary tab** -- aggregated per-process/host connection statistics across the entire capture buffer; useful for spotting sporadic short-lived connections.
+- **Reverse DNS** -- background async DNS lookups populate the **Name** column without blocking the UI.
+- **Public IP monitoring** -- optional ipify.com query to show the current internet exit point on the map.
+- **Screenshot & video capture** -- optionally save a `.jpg` map screenshot on every refresh; generate an `.mp4` timelapse from captured frames. Old frames are deleted automatically to avoid filling disk space.
+- **Right-click actions** -- per-row context menu to launch Sysinternals Process Monitor (Windows), create process dumps (Windows/Linux), and copy connection details.
+- **Persistent UI state** -- window geometry, settings, column widths, column order, and map position/zoom are all saved to `settings.json` automatically.
+- **Full-screen mode** -- press `F11` to toggle; the map can be expanded to fill the entire window using the two resizable splitters.
+- **Extensible collector API** -- drop a new `ConnectionCollectorPlugin` subclass into the `plugins/` directory and it appears automatically in the Settings collector combo.
+- **Headless agent mode** -- run as a background agent with no window using `--no_ui` combined with `--enable_agent_mode`.
+
+---
+
+## Install
+
+### Linux (venv recommended)
+
+```bash
 git clone https://github.com/jclauzel/R001D00rs
-
 python3 -m venv ./R001D00rs
-
 source R001D00rs/bin/activate
-
-pip3 install pyside6 requests maxminddb psutil opencv-python procmon-parser flask scapy aiodns
-
-or
-
 pip install -r REQUIREMENTS.txt
-
-
-Then execute script using:
-
-cd R001D00rs 
-
+cd R001D00rs
 python3 tcp_geo_map.py
+```
 
-- Windows:
+### Windows
 
-Install a recent python interpreter from https://www.python.org/ if not done yet or directly from the Windows Store (search for Python and select 3.13 or higher).
+1. Install Python 3.13+ from [python.org](https://www.python.org/) or the Microsoft Store.
+2. Download the latest release from [GitHub Releases](https://github.com/jclauzel/R001D00rs/releases) or `git clone https://github.com/jclauzel/R001D00rs`.
+3. Install dependencies:
 
-Download source from latest "release" located on the right side of https://github.com/jclauzel/R001D00rs or git clone https://github.com/jclauzel/R001D00rs
-
-Install required packages:
-
-pip3 install pyside6 requests maxminddb opencv-python procmon-parser flask scapy aiodns
-
-or
-
+```bat
 pip install -r REQUIREMENTS.txt
+```
 
-Execute the script:
+4. Run:
 
-python .\tcp_geo_map.py
+```bat
+python tcp_geo_map.py
+```
 
-- Note optional as a best practice it is always best to create an vistual environement here is how to do so:
+**Windows venv (best practice):**
 
-Windows:
-
-cd .\R001D00rs\
-
+```bat
+cd R001D00rs
 python -m venv R001D00rs
-
 R001D00rs\Scripts\activate
-
-pip install -r requirements.txt
-
-python .\tcp_geo_map.py
-
+pip install -r REQUIREMENTS.txt
+python tcp_geo_map.py
 deactivate
+```
 
+> **Scapy / Npcap on Windows:** Install [Npcap](https://npcap.com/) for full Layer 2 packet capture with the Scapy collector. Without it the collector falls back to Layer 3 (administrative privileges still required for raw socket access).
 
+---
 
-# Features overview
-- Download and install of the MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases are made easy using a driven step-by-step process.
-- When C2 detection is enabled if a remote connection to such a host defined in https://github.com/montysecurity/C2-Tracker/ database the UI will turn red and spew a warning.
-- Remote IP location that can be resolved using MaxMind GeoLite2 will be displayed at every refresh on the OpenStreetMap. Note this IP geolocation is inherently imprecise and you can read more about this at: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/ but gives a great starting point to whom your machine is communicating with.
-- As the connections are refreshed based on a timer it is no case exhaustive and if a connection is opened and closed between two "netstat" collections it will not be collected, however, as stated above it is a good starting point. To avoid possible skipping connections keep the refresh time small (by default 2000 milliseconds so 2 seconds).
-- Once connections have been captured you can use at any given point in time the time slider to revisit the connections or use the "replay" button option.
-- Connections lists can be saved to disk.
-- Maps can be moved, zoommed.
-- UI state (screen full size, maximized) and settings are persisted to settings.json on script close. As a result next time the script is started, it restores its state as it was when leaving. F11 can be used to toggle on and off full-screen display.
-- Settings can be rested by simply deleting the settings.json file stored in the same directory.
-- The UI on the left shows the connection table collected at the time of the refresh and the map is shown on the right. There is a vertical slider that can be grabbed between the two to adjust the size and the map can be set fully horizontally.
-- Bellow the map are located buttons and settings. There is also a horizontal slider that can be grabbed between these two parts of the screen. By combining the two sliders, you can have the map full screen.
-- On the left table, connections are listed and can be selected. When clicked if the geo is resolved the map will show this unique remite address for clarity.
-- Each table column can be sorted by clicking on the corresponding table header for example "Process".
-- The application can be started by passing the --accept_eula as a parameter (as stated this means you accept and agree with MaxMind, GeoLite2, https://github.com/montysecurity/C2-Tracker, https://raw.githubusercontent.com/pointhi/leaflet-color-markers/ licensing terms ). Since the application starts capturing when the script start, the buffer will evict older connections and the UI reset its state to the selected monitor this means you can set the application to auto start when logging in and have live view of your connections on a separate monitor, for example.
-- MaxMind/GeoLite2 and https://github.com/montysecurity/C2-Tracker databases will be considered stale/obsolete after 7 days by default. When this occurs the application will prompt for a new download of the database. The process is eased and automated through the UI when accepting the licensing rights. When --accept_eula is passed as a startup parameter since it means you agree with their licensing terms, the download of the databases will be done automatically.
-- Summary tab shows an aggregated list view of all connections that are still in the capture buffer. This is useful for many reasons and may help uncover quick sporadic connections.
-- No high privileges required during execution on Linux some limitations may apply check psutil.net_connections section at https://psutil.readthedocs.io/en/latest/.
+## Command-line options
 
-# Settings
+```
+Usage: python tcp_geo_map.py [OPTIONS]
 
-All settings are persisted in `settings.json` (located in the same directory as the script) and are saved automatically whenever a setting is changed in the UI, as well as when the application closes. To reset all settings to their defaults, delete `settings.json` — it will be recreated with defaults on the next launch.
+  --accept_eula
+      Automatically accept the GeoLite2/MaxMind EULA and allow the database
+      to be downloaded and refreshed on startup without prompting. By passing
+      this flag you confirm you have read and agree to all licensing terms
+      listed in the Contributors & Attribution section.
+      Note: C2-Tracker is no longer downloaded -- that repository is archived.
 
-The table below documents every key stored in `settings.json`.
+  --enable_server_mode
+      Start in server mode. A Flask endpoint is started on the configured
+      port (default 5000) to collect connection data from remote agents.
+
+  --enable_agent_mode <host>
+      Start in agent mode. The app periodically POSTs its live connection
+      data to the server at <host> (bare hostname/IP or legacy full URL
+      e.g. "http://myserver:5000").
+
+  --no_ui
+      Run as a headless background agent -- no window is shown and no
+      taskbar button is created. Only meaningful with --enable_agent_mode.
+
+  --no_ui_off
+      Explicitly disable headless mode and persist that choice to
+      settings.json so future launches without any flag also show the UI.
+      Takes precedence over any saved "agent_no_ui" value in settings.json.
+
+  --force_complete_database_load
+      Override the in-memory buffer size with the database limit and
+      pre-fill the buffer from the persisted database so the full stored
+      history is available on the timeline slider. Live capture is NOT
+      started -- the app enters replay-only mode. Has no effect when the
+      database layer is set to "Disabled".
+
+  -h, -?, /?, --h, --help
+      Show this help message and exit.
+```
+
+---
+
+## Offline / telemetry reduction
+
+- **Map tiles** -- `tile.openstreetmap.org` is required to render the map. To run fully offline, point `TILE_OPENSTREETMAP_SERVER` in `tcp_geo_map.py` to a self-hosted tile server.
+- **Leaflet resources** -- on first launch the app downloads Leaflet JS/CSS and marker icons from `unpkg.com` and `raw.githubusercontent.com` and caches them in `resources/leaflet/`. Use `resources/leaflet/download_resources.ps1` to pre-populate this cache offline.
+- **ipify.com** -- queried only when **Resolve public internet IP using ipify.com** is enabled. Uncheck to disable entirely.
+- **GeoLite2 database** -- downloaded once (with EULA acceptance) and refreshed automatically after 7 days. Stored in the `database/` subfolder.
+
+---
+
+## Contributors & attribution
+
+### MaxMind GeoLite2
+
+IP geolocation database used to resolve remote IP coordinates.
+Source: [ip-location-db/geolite2-city-mmdb](https://github.com/sapics/ip-location-db/tree/main/geolite2-city)
+
+Files downloaded on first use (with EULA acceptance):
+- `https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-city-mmdb/geolite2-city-ipv4.mmdb`
+- `https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-city-mmdb/geolite2-city-ipv6.mmdb`
+
+GeoLite2 is created by MaxMind and provided under CC BY-SA 4.0. Licensing terms are in `GEOLITE2_LICENSE` and `GEOLITE2_EULA`. See also: [MaxMind GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula).
+
+### OpenStreetMap / Leaflet
+
+Map rendering uses the OpenStreetMap engine. Data is available under the [Open Database License (ODbL) v1.0](https://opendatacommons.org/licenses/odbl/1-0/). See [openstreetmap.org/copyright](https://www.openstreetmap.org/copyright/).
+Marker icons from [leaflet-color-markers](https://github.com/pointhi/leaflet-color-markers).
+
+### ipify.com
+
+Provides the public IP address lookup when **Resolve public internet IP using ipify.com** is enabled.
+
+### C2-Tracker (archived -- data no longer available)
+
+C2 Tracker was a community-driven IOC feed of suspected malware/botnet/C2 IP addresses maintained by [montysecurity](https://github.com/montysecurity/C2-Tracker).
+**The repository is now archived and no longer updated. No new data will be downloaded.** The C2 check setting (`do_c2_check`) remains in the codebase but is disabled by default and carries no security value.
+
+### procmon-parser
+
+Used to auto-generate Sysinternals Process Monitor capture profiles when right-clicking a table row.
+Source: [eronnen/procmon-parser](https://github.com/eronnen/procmon-parser)
+
+### Flask
+
+Powers the server endpoint in server/agent mode (default port 5000).
+
+### Scapy
+
+Used by the Scapy Live Capture collector plugin and the PCAP File Collector plugin.
+Install [Npcap](https://npcap.com/) on Windows for full Layer 2 capture.
+
+### aiodns
+
+Used for asynchronous reverse DNS name resolution.
+
+---
+
+## Python dependencies
+
+```
+aiodns
+PySide6 >= 6.5.1
+psutil >= 5.9.5
+maxminddb >= 2.2.0
+pandas >= 2.0.3
+numpy >= 1.25.0
+requests >= 2.31.0
+folium >= 0.14.0
+opencv-python >= 4.8.0
+procmon-parser >= 0.3.3
+flask >= 3.0.0
+scapy >= 2.5.0
+```
+
+---
+
+## Settings
+
+All settings are persisted in `settings.json` (same directory as the script) and saved automatically on every change and on application close. To reset all settings to defaults, delete `settings.json` -- it is recreated on the next launch.
 
 ---
 
@@ -199,11 +271,14 @@ The table below documents every key stored in `settings.json`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_connection_list_filo_buffer_size` | integer | `1000` | Maximum number of connection snapshots kept in memory. The capture buffer is a First-In-First-Out (FIFO) queue: once full, the oldest snapshot is evicted to make room for the newest. Larger values let you look further back in time using the time slider or replay feature but consume more memory. Configurable on the Settings tab. |
-| `map_refresh_interval` | integer (ms) | `2000` | How often (in milliseconds) the connection table and map are refreshed. Lowering this value reduces the chance of missing short-lived connections. Selectable from the refresh-interval drop-down on the main tab. |
-| `show_only_new_active_connections` | boolean | `false` | When `true`, only connections that are **new** since the previous refresh are shown in the table and on the map. Useful for spotting sudden new activity without noise from persistent connections. |
-| `show_only_remote_connections` | boolean | `false` | When `true`, loopback addresses (`127.0.0.1`, `::1`) and other purely local connections are hidden from the connection table. Local connections are never plotted on the map regardless of this setting. |
-| `do_pause_table_sorting` | boolean | `false` | When `true`, the connection table stops re-sorting on each refresh cycle. Existing sort order is preserved so you can read the table without it jumping. New connections are still collected and appended; sorting resumes when unchecked. |
+| `max_connection_list_filo_buffer_size` | integer | `1000` | Maximum connection snapshots kept in the in-memory FIFO replay buffer. When full, the oldest snapshot is evicted. Larger values allow deeper history replay but use more memory. Configurable on the Settings tab. |
+| `map_refresh_interval` | integer (ms) | `1000` | How often the connection table and map are refreshed in milliseconds. Lower values reduce the chance of missing short-lived connections. |
+| `show_only_new_active_connections` | boolean | `false` | When `true`, only connections new since the previous refresh are shown in the table and on the map. |
+| `show_only_remote_connections` | boolean | `false` | When `true`, loopback and LAN-local connections are hidden from the table and map. |
+| `do_pause_table_sorting` | boolean | `false` | When `true`, the main connection table stops re-sorting on each refresh so you can read it without rows jumping. New connections are still collected. |
+| `do_collect_connections_asynchronously` | boolean | `true` | When `true`, connection collection runs on a background thread, keeping the UI responsive during slow collector operations such as VPN switches. Set to `false` as a thread-safety fallback; all three views (table, map, Summary) work correctly in both modes. |
+| `do_show_listening_connections` | boolean | `false` | When `true`, sockets in the `LISTEN` state are included in the connection table. |
+| `do_always_supplement_psutil_with_netstat_when_available` | boolean | `true` | When `true`, psutil connection data is cross-referenced with `netstat`/`ss` to catch connections psutil may miss (e.g. system-owned sockets on Linux). |
 
 ---
 
@@ -211,58 +286,28 @@ The table below documents every key stored in `settings.json`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `do_reverse_dns` | boolean | `true` | Perform reverse DNS lookups on remote IP addresses. Lookups are executed by a background thread to avoid blocking the UI, so the **Name** column may take a moment to populate after startup. Resolved hostnames also appear in map marker pop-ups. |
-| `do_resolve_public_ip` | boolean | `false` | When `true`, the application periodically queries [ipify.org](https://api.ipify.org) to determine the machine's current public/exit IP address and plots it on the map as a red circle. The result is cached for 60 seconds to avoid excessive external requests. Only useful when behind NAT or a VPN where the local IP differs from the public one. |
-| `do_c2_check` | boolean | `false` | Enable C2-Tracker threat-intelligence checks. Each remote IP is compared against the [montysecurity/C2-Tracker](https://github.com/montysecurity/C2-Tracker) database. When a match is found the UI turns red, a warning is displayed, and the offending row is tagged **C2: Yes** in the table. Requires the C2-Tracker database to be downloaded first (prompted automatically or via `--accept_eula`). |
+| `do_reverse_dns` | boolean | `true` | Perform async reverse DNS lookups on remote IPs. Results populate the **Name** column and map marker pop-ups. |
+| `do_resolve_public_ip` | boolean | `true` | Periodically query [ipify.org](https://api.ipify.org) for the machine's public exit IP and plot it on the map as a red circle. Result is cached for 60 seconds. |
+| `do_pulse_exit_points` | boolean | `true` | Animate a pulsing ring on agent/server exit-point circles on the map. |
+| `do_c2_check` | boolean | `false` | **Deprecated -- no data available.** Compare remote IPs against the C2-Tracker database. The upstream repository is **archived** and no longer updated. This setting has no practical security value and should remain disabled. |
 
 ---
 
-### Display & table sorting
+### Display & map
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `table_column_sort_index` | integer | `-1` | Column index used to sort the main connection table. `-1` means no explicit sort is applied (connections appear in capture order). |
-| `table_column_sort_reverse` | boolean | `false` | Sort direction for the main connection table. `false` = ascending, `true` = descending. |
-| `summary_table_column_sort_index` | integer | `-1` | Column index used to sort the Summary tab aggregated table. `-1` means no explicit sort. |
-| `summary_table_column_sort_reverse` | boolean | `false` | Sort direction for the Summary tab table. `false` = ascending, `true` = descending. |
-
----
-
-### Screenshots & recording
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `do_capture_screenshots` | boolean | `false` | When `true`, a `.jpg` screenshot of the map is written to the `screen_captures/` folder every time the map refreshes. Once enabled, a **Generate Video** button appears on the main tab that compiles all current screenshots into an `.mp4` video using OpenCV. Older screenshots are automatically pruned to prevent unbounded disk growth. Requires `opencv-python`. |
-
----
-
-### Window & map layout
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `is_fullscreen` | boolean | `false` | Whether the application window was full-screen when last closed. Restored automatically on the next launch. |
-| `is_maximized` | boolean | `false` | Whether the application window was maximized when last closed. Restored automatically on the next launch. Mutually exclusive with `is_fullscreen`. |
-| `fullscreen_screen_name` | string | `null` | The OS display name (e.g. `"\\.\DISPLAY1"`) of the monitor the window was on. Used to restore the window to the correct screen on multi-monitor setups. |
-| `splitter_state` | string (Base64) | `null` | Serialized state of the horizontal splitter that divides the connection table (left) from the map (right). Restored automatically; do not edit by hand. |
-| `right_splitter_state` | string (Base64) | `null` | Serialized state of the vertical splitter that divides the map (top) from the controls/settings area (bottom). Restored automatically; do not edit by hand. |
-| `map_center_lat` | float | — | Latitude of the map viewport centre when the application was last closed. Restored on next launch so the map opens at the same position. |
-| `map_center_lng` | float | — | Longitude of the map viewport centre when the application was last closed. |
-| `map_zoom` | integer | — | Zoom level of the map when the application was last closed. |
-
----
-
-### Server / Agent mode
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enable_server_mode` | boolean | `false` | When `true`, the application starts a Flask HTTP endpoint (default port 5000) that accepts connection data POSTed by remote agents. All agent connections are rendered on the map alongside local connections. |
-| `enable_agent_mode` | boolean | `false` | When `true`, the application periodically POSTs its live connection snapshot to the configured server. Can be combined with `--no_ui` / `--no_ui_off` for headless deployment. |
-| `agent_server_host` | string | `""` | Hostname or IP address of the server to POST to in agent mode. No scheme or port — e.g. `"192.168.1.10"` or `"myserver"`. Configured via the **Agent server address** field on the Settings tab. |
-| `flask_server_port` | integer | `5000` | TCP port the Flask server listens on in server mode. Must be reachable by all agents; a firewall rule may be required. |
-| `flask_agent_port` | integer | `5000` | TCP port the agent POSTs to on the server. Must match `flask_server_port` on the server side. |
-| `agent_no_ui` | boolean | `false` | When `true`, the application window is never shown — the process runs headless as a background agent. Equivalent to passing `--no_ui` on the command line. Set to `false` explicitly via `--no_ui_off`. Only meaningful when `enable_agent_mode` is also `true`. |
-| `max_server_agents` | integer | `100` | Maximum number of distinct agents the server will accept simultaneously. When the limit is reached, new (unknown) agents receive HTTP 429 (Too Many Requests) and a rejection overlay is shown on their map. Agents already in the cache are unaffected. Persisted to and loaded from `settings.json`; also editable by changing the `MAX_SERVER_AGENTS` constant in the script. Must be a positive integer. |
-| `agent_colors` | object | `{}` | Maps each remote agent hostname to a display colour used for its map markers and table rows, e.g. `{"laptop": "blue", "server": "green"}`. Managed automatically by the **Agent Management** tab; colours persist across restarts. |
+| `do_show_traffic_gauge` | boolean | `true` | Show per-marker sent/recv byte gauges on the map. Requires the Scapy Live Capture or PCAP File Collector plugin. |
+| `do_show_traffic_histogram` | boolean | `true` | Show the network traffic histogram overlay on the map. |
+| `do_capture_screenshots` | boolean | `false` | Save a `.jpg` screenshot of the map to `screen_captures/` on every refresh. When enabled a **Generate .mp4 video** button appears on the main tab. Old frames are deleted automatically. |
+| `table_column_sort_index` | integer | `-1` | Column index for the main connection table sort. `-1` = insertion order. |
+| `table_column_sort_reverse` | boolean | `false` | Sort direction for the main table. `false` = ascending, `true` = descending. |
+| `summary_table_column_sort_index` | integer | `-1` | Column index for the Summary tab sort. `-1` = insertion order. |
+| `summary_table_column_sort_reverse` | boolean | `false` | Sort direction for the Summary table. `false` = ascending, `true` = descending. |
+| `conn_table_column_order` | integer[] | `[]` | Persisted visual column order for the main connection table (logical indices). |
+| `summary_table_column_order` | integer[] | `[]` | Persisted visual column order for the Summary table (logical indices). |
+| `conn_table_column_widths` | integer[] | `[]` | Persisted per-column pixel widths for the main connection table. |
+| `summary_table_column_widths` | integer[] | `[]` | Persisted per-column pixel widths for the Summary table. |
 
 ---
 
@@ -270,8 +315,35 @@ The table below documents every key stored in `settings.json`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `active_collector_plugin` | string | `"Psutil Collector"` | Name of the active connection-collector plugin. Built-in options: `"Psutil Collector"` (default, low-privilege), `"Scapy Live Capture"` (requires admin/root or Npcap on Windows), `"PCAP File"` (offline replay of a saved `.pcap`). Selectable on the Settings tab. |
-| `pcap_file_path` | string | `""` | Absolute path to the `.pcap` file used when `active_collector_plugin` is `"PCAP File"`. Set via the **Browse** button on the Settings tab. Has no effect when any other collector is active. |
+| `active_collector_plugin` | string | `"Scapy Live Capture"` | Name of the active collector plugin. Built-in values: `"Scapy Live Capture"` *(Recommended)*, `"psutil"`, `"PCAP File Collector"`. |
+| `pcap_file_path` | string | `""` | Path to the `.pcap` / `.pcapng` file used by the PCAP File Collector. Configurable via the Settings tab. |
+| `do_scapy_force_use_interface_name` | string | `""` | When non-empty, passed as `iface=` to Scapy `sniff()`, overriding interface auto-detection. Use the **Scapy interface** combo in Settings to select from available interfaces. |
+| `do_warn_npcap_not_installed` | boolean | `true` | When `true`, a one-time warning dialog is shown on startup if Npcap is not detected and the Scapy collector is active. Uncheck **Warn if Npcap is not installed** in Settings to suppress future warnings. |
+
+---
+
+### Database persistence
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `db_provider_name` | string | `"Disabled"` | Database backend for persistent connection history. Options: `"Disabled"`, `"SQLite"` *(Recommended)*, `"MongoDB"`, `"SQL Server"`, `"Oracle"`. |
+| `max_connection_list_database_size` | integer | `100000` | Maximum snapshots stored in the database. Older records are purged automatically when the limit is exceeded. |
+
+---
+
+### Server / Agent mode
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable_server_mode` | boolean | `false` | Start a Flask server endpoint to receive connections from remote agents. |
+| `enable_agent_mode` | boolean | `false` | Periodically POST this machine's live connections to a remote server. |
+| `agent_server_host` | string | `""` | Hostname or IP of the server to POST to in agent mode (no scheme, no port). |
+| `flask_server_port` | integer | `5000` | Port the Flask server listens on (server mode). |
+| `flask_agent_port` | integer | `5000` | Port the agent POSTs to (agent mode). |
+| `max_server_agents` | integer | `100` | Maximum distinct agents accepted by the server. New agents beyond this limit receive HTTP 429. |
+| `agent_no_ui` | boolean | `false` | When `true` in agent mode, the window is never shown (headless agent). |
+| `agent_colors` | object | `{}` | Per-agent hex colour assignments used to colour-code each agent's markers on the map. |
+| `agent_hidden` | object | `{}` | Per-agent visibility flags. Agents set to `true` are hidden from the map and table. |
 
 ---
 
@@ -279,66 +351,20 @@ The table below documents every key stored in `settings.json`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `loggingLevel` | string | `"WARNING"` | Controls the verbosity of the application log. Accepted values (case-insensitive): `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`. Set to `"DEBUG"` to enable full diagnostic output useful for troubleshooting. The level is applied at startup before the UI is created, and again when settings are loaded, so it takes effect as early as possible. Persisted automatically by **Save Settings**. |
+| `loggingLevel` | string | `"WARNING"` | Python logging level written to the console. Valid values: `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`. |
 
 ---
 
-### Database persistence
+## Avoiding prompts
 
-Connection snapshots can optionally be persisted to a database so that history survives application restarts. The database layer is an abstraction — four back-ends are provided out of the box (SQLite, MongoDB, SQL Server, Oracle) and new providers can be added by dropping a `*_provider.py` file into the `db_providers/` package. Only the selected provider's dependencies are imported; the application continues to work normally when the feature is set to **Disabled** (the default).
+Pass `--accept_eula` to suppress the GeoLite2 EULA prompt and allow automatic database downloads and refreshes without prompting. By passing this flag you confirm you have read and agree to all licensing terms listed in the Contributors & Attribution section above (MaxMind GeoLite2, OpenStreetMap/Leaflet, leaflet-color-markers).
 
-All database files created by file-based providers (e.g. SQLite) are stored in the `connection_databases/` subfolder next to the script.
+When `--accept_eula` is passed the Leaflet resource cache (`resources/leaflet/`) is also populated automatically on first run to speed up subsequent startups and reduce external requests.
 
-Database writes are performed on a dedicated background thread via a `queue.Queue` so that I/O never blocks the UI.
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `db_provider_name` | string | `"Disabled"` | Active database back-end. One of `"Disabled"`, `"SQLite"`, `"MongoDB"`, `"SQL Server"`, or `"Oracle"`. When set to `"Disabled"` no database operations occur and no extra dependencies are needed. Selectable on the Settings tab. |
-| `max_connection_list_database_size` | integer | `100000` | Maximum number of snapshots retained in the database. When the count exceeds this value, the oldest entries are automatically purged after each new insert. Configurable on the Settings tab. |
-
-#### `--force_complete_database_load`
-
-When the database layer is enabled, passing `--force_complete_database_load` on the command line temporarily overrides the in-memory buffer size (`max_connection_list_filo_buffer_size`) with the database limit (`max_connection_list_database_size`) so the **entire** stored history can be loaded and replayed via the time slider. This is useful for forensic review of a large capture database.
-
-Agents discovered in the database snapshots are automatically registered in the **Agent Management** pane — even if the database was originally captured on a different machine — so their colour, hide and active-state columns are fully functional during replay.
-
-This flag has no effect when `db_provider_name` is `"Disabled"`.
-
-```
-python tcp_geo_map.py --force_complete_database_load
-```
+> **Note:** C2-Tracker is no longer downloaded (automatically or otherwise) because the upstream repository is archived and no longer provides current data.
 
 ---
 
-### Other settings configurable in the script itself
+## Development notes
 
-The following constants are not exposed in the UI and must be changed directly in `tcp_geo_map.py`:
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK` | `False` | Set to `True` to persist the reverse-DNS cache to `ip_cache.json` between runs. Speeds up startup but leaves a record on disk of every IP address the machine has connected to. |
-| `IP_DNS_NAME_CACHE_FILE` | `"ip_cache.json"` | File name used for the on-disk DNS cache when `PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK` is enabled. |
-| `DATABASE_EXPIRE_AFTER_DAYS` | `7` | Number of days after which the GeoLite2 and C2-Tracker databases are considered stale and a refresh is prompted. |
-| `TILE_OPENSTREETMAP_SERVER` | `"tile.openstreetmap.org"` | Tile server hostname used to render the map. Change this to point to a self-hosted tile server for fully offline / private operation. |
-| `CONNECTION_DATABASES_DIR` | `"connection_databases"` | Subfolder (relative to the script) where file-based database providers (e.g. SQLite) store their database files. Created automatically when a provider is activated. |
-
-# Troubleshooting
-To enable verbose diagnostic output, set `loggingLevel` in `settings.json` to `"DEBUG"`:
-
-```json
-{
-    "loggingLevel": "DEBUG"
-}
-```
-
-Accepted values (case-insensitive): `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`. The default is `"WARNING"`.
-The level is applied at the next application start. You can also change it at runtime via **Settings → Logging Level** and save with **Save Settings**.
-
-# Known limitations
-- Proxies since this is where the remote IP address is.
-- Tor usage will only show the first hop node.
-- When using the scapy collector and you have not installed npcap from https://npcap.com/ (recommended) administrative privileges are required. As a result, if you start python tcp_geo_map.py from Windows Task manager make sure tick the box "Run with the highest privileges" or the scapy collector will not be able to collect the flowing packets. Another workaround is to switch back to the default psutil collector but some features such as traffic flow will not show up.
-
-# Warranty, Disclaimer of Warranty, Limitation of Liability.
-THE SCRIPT SOFTWARE IS PROVIDED "AS IS." THE AUTHOR MAKES NO WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SCRIPT SOFTWARE WHICH MAY CONTAIN THIRD PARTY COMMERCIAL SOFTWARE. 
-IN NO EVENT WILL THE AUTHOR BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR FOR DIRECT, SPECIAL, INDIRECT, CONSEQUENTIAL, INCIDENTAL OR PUNITIVE DAMAGES HOWEVER CAUSED AND REGARDLESS OF THE THEORY OF LIABILITY ARISING OUT OF THE USE OF OR INABILITY TO USE THE SCRIPT SOFTWARE, EVEN IF THE AUTHOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+This tool was developed with the assistance of Claude Sonnet and Claude Opus AI.

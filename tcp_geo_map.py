@@ -1932,7 +1932,8 @@ class TCPConnectionViewer(QMainWindow):
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
-                do_c2_check = settings.get('do_c2_check', do_c2_check)
+                #do_c2_check = settings.get('do_c2_check', do_c2_check)
+                do_c2_check = False
                 do_always_supplement_psutil_with_netstat_when_available = settings.get('do_always_supplement_psutil_with_netstat_when_available', do_always_supplement_psutil_with_netstat_when_available)
                 _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
                 show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
@@ -4781,12 +4782,16 @@ class TCPConnectionViewer(QMainWindow):
     def update_c2_check(self):
         global do_c2_check
 
-        new_state = self.c2_check.isChecked()
-        if new_state == True:
-            do_c2_check = True
-        else:
-            do_c2_check = False
-            self.setStyleSheet("") # Reset any previous styles
+        do_c2_check = False
+        self.c2_check.setChecked(False)
+        #C2-Tracker is now archived and no longer maintained, so this setting is effectively deprecated.  We keep it in the UI for now in case users still want to toggle the (now static) C2 check on/off, but it no longer has any functional impact on the app's behavior.
+
+        # new_state = self.c2_check.isChecked()
+        # if new_state == True:
+        #     do_c2_check = True
+        # else:
+        #     do_c2_check = False
+        #     self.setStyleSheet("") # Reset any previous styles
 
         self.refresh_connections()
         self.save_settings()
@@ -5450,10 +5455,15 @@ class TCPConnectionViewer(QMainWindow):
 
         # C2 Check checkbox
         self.c2_check = QCheckBox("Perform C2 checks against C2-TRACKER database")
+        self.c2_check.setVisible(False)
+        self.c2_check.setToolTip(
+            "https://github.com/montysecurity/C2-Tracker project is now archived and no data is available.\n"
+            "This functionality is no more available until a new feed can be sourced."
+            )
         self.c2_check.setChecked(False)
         settings_tab_layout.addWidget(self.c2_check)    
-        self.c2_check.stateChanged.connect(self.update_c2_check)
-        self.c2_check.setChecked(True)
+        #self.c2_check.stateChanged.connect(self.update_c2_check)
+        
 
         # Only show new connections
         self.only_show_new_connections = QCheckBox("Only show new connections")
@@ -5866,7 +5876,7 @@ class TCPConnectionViewer(QMainWindow):
             db_entries = [
                 ("GeoLite2 IPv4", IPV4_DB_PATH, GEOLITE2_IPV4_DOWNLOAD_URL),
                 ("GeoLite2 IPv6", IPV6_DB_PATH, GEOLITE2_IPV6_DOWNLOAD_URL),
-                ("C2 Tracker",    C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
+                #("C2 Tracker",    C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
             ]
 
             self.db_status_table.setRowCount(0)
@@ -6032,27 +6042,27 @@ class TCPConnectionViewer(QMainWindow):
             # Check each database file
             self._check_and_download_database(IPV4_DB_PATH, "IPv4", GEOLITE2_IPV4_DOWNLOAD_URL, GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TITLE, GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT)
             self._check_and_download_database(IPV6_DB_PATH, "IPv6", GEOLITE2_IPV6_DOWNLOAD_URL, GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TITLE, GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT)
-            self._check_and_download_database(C2_TRACKER_DB_PATH, "C2-TRACKER", C2_TRACKER_DB_DOWNLOAD_URL, C2_TRACKER_DB_DOWNLOAD_ABOUT_TITLE, C2_TRACKER_DB_DOWNLOAD_ABOUT_TEXT)
+            #self._check_and_download_database(C2_TRACKER_DB_PATH, "C2-TRACKER", C2_TRACKER_DB_DOWNLOAD_URL, C2_TRACKER_DB_DOWNLOAD_ABOUT_TITLE, C2_TRACKER_DB_DOWNLOAD_ABOUT_TEXT)
 
             # Open databases
             self.reader_ipv4 = maxminddb.open_database(IPV4_DB_PATH)
             self.reader_ipv6 = maxminddb.open_database(IPV6_DB_PATH)
 
             # Load C2-TRACKER into both set (fast lookup) and dict (details)
-            self.reader_c2_tracker = {}
-            self.reader_c2_tracker_set = set()
-            if os.path.exists(C2_TRACKER_DB_PATH):
-                with open(C2_TRACKER_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        parts = line.split("\t")
-                        ip = parts[0]
-                        self.reader_c2_tracker_set.add(ip)  # Fast O(1) lookup
-                        typ = parts[1] if len(parts) > 1 else ""
-                        info = parts[2] if len(parts) > 2 else ""
-                        self.reader_c2_tracker[ip] = (typ, info)
+            # self.reader_c2_tracker = {}
+            # self.reader_c2_tracker_set = set()
+            # if os.path.exists(C2_TRACKER_DB_PATH):
+            #     with open(C2_TRACKER_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            #         for line in f:
+            #             line = line.strip()
+            #             if not line or line.startswith("#"):
+            #                 continue
+            #             parts = line.split("\t")
+            #             ip = parts[0]
+            #             self.reader_c2_tracker_set.add(ip)  # Fast O(1) lookup
+            #             typ = parts[1] if len(parts) > 1 else ""
+            #             info = parts[2] if len(parts) > 2 else ""
+            #             self.reader_c2_tracker[ip] = (typ, info)
 
         except Exception as e:
             QMessageBox.critical(self, "Database Error", f"Failed to load databases: {str(e)}, nothing may show on map.")
