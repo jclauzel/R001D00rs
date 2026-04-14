@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.7.7" # Current script version
+VERSION = "3.7.8" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -1216,6 +1216,7 @@ class TCPConnectionViewer(QMainWindow):
         self.connections = []
         self._last_map_connections = []  # fully-processed connections for map re-renders
         self._async_collection_in_progress = False  # guard: only one background collection at a time
+        self._sync_collection_in_progress = False   # guard: prevent sync re-entrancy (defensive)
 
         # Pinned (double-clicked) connection — persists across refreshes, shown as yellow marker
         self._pinned_connection = None
@@ -1320,7 +1321,8 @@ class TCPConnectionViewer(QMainWindow):
 
         # --- Connection collector plugin system ---
         self._collector_plugins = _discover_collector_plugins()
-        self._active_collector = self._collector_plugins[0]  # default: PsutilCollector
+        _default_collector = next((p for p in self._collector_plugins if p.name == "Scapy Live Capture"), None)
+        self._active_collector = _default_collector if _default_collector is not None else self._collector_plugins[0]
 
         # Set up QWebChannel for JavaScript-to-Python communication (map marker clicks)
         self.map_bridge = MapBridge(self)
@@ -1368,14 +1370,51 @@ class TCPConnectionViewer(QMainWindow):
         if enable_server_mode:
             self._start_flask_server()
 
-        # Set up timer to refresh connections periodically
+        # When --force_complete_database_load is requested but no DB provider was
+        # activated by _apply_settings_to_ui (e.g. db_provider_name is "Disabled"
+        # or settings.json is absent on a different machine), automatically fall
+        # back to SQLite — the standard file-based format — so the user can replay
+        # a copied database without having to reconfigure settings first.
+        if force_complete_database_load and self._db_provider is None:
+            logging.info(
+                "--force_complete_database_load: no DB provider active, "
+                "auto-activating SQLite to load history.")
+            self._activate_db_provider("SQLite")
 
+        # Set up timer to refresh connections periodically
         self.timer.timeout.connect(self.refresh_connections)
-        self.timer.start(map_refresh_interval)  # Refresh every 5 seconds
         self.timer_replay_connections.timeout.connect(self.replay_connections)
 
-        # Start wave animation on stop button (since capture starts automatically)
-        self._start_stop_button_wave()
+        if force_complete_database_load:
+            # Database-replay mode: the in-memory buffer has been pre-filled from
+            # the database.  Do NOT start live capture — the purpose of this flag
+            # is to browse / replay historical data (potentially from another
+            # machine).  Leave the UI in the stopped/replay state so the slider
+            # and the replay toggle button are immediately usable.
+            #
+            # Explicitly re-sync the slider here (authoritative pass) so the
+            # displayed count always matches the actual buffer — regardless of
+            # whether _restore_snapshots_from_db ran before or after the slider
+            # was constructed.
+            _n = len(self.connection_list)
+            self.slider.blockSignals(True)
+            self.slider.setMaximum(self.connection_list_counter)
+            self.slider.setValue(self.connection_list_counter)
+            self.slider.blockSignals(False)
+            self.slider_value_label.setText(
+                TIME_SLIDER_TEXT + str(_n) + "/" + str(_n))
+            self.start_capture_btn.setVisible(True)
+            self.stop_capture_btn.setVisible(False)
+            self.toggle_button.setVisible(True)
+            self._stop_capture_button_flash()  # ensure no stale flash state
+            # Render the last loaded snapshot once the event loop is running so
+            # the map HTML has had a chance to start loading.
+            _last_idx = max(0, _n - 1)
+            QTimer.singleShot(0, lambda: self.refresh_connections(slider_position=_last_idx))
+        else:
+            self.timer.start(map_refresh_interval)  # Refresh every 5 seconds
+            # Start wave animation on stop button (since capture starts automatically)
+            self._start_stop_button_wave()
 
         # Set up cleanup timer for public IP DNS attempt cache
         self.public_ip_dns_cache_cleanup_timer = QTimer(self)
@@ -2201,7 +2240,7 @@ class TCPConnectionViewer(QMainWindow):
                 # Restore active collector plugin in combo box
                 if hasattr(self, '_collector_combo'):
                     for i in range(self._collector_combo.count()):
-                        if self._collector_combo.itemText(i) == self._active_collector.name:
+                        if self._collector_combo.itemData(i, Qt.UserRole) == self._active_collector.name:
                             self._collector_combo.setCurrentIndex(i)
                             break
 
@@ -4475,12 +4514,22 @@ class TCPConnectionViewer(QMainWindow):
             # Sync slider (block signals to avoid triggering update_slider_value
             # which would stop the capture timer and flip button state)
             if hasattr(self, 'slider'):
+                total = len(self.connection_list)
                 self.slider.blockSignals(True)
                 self.slider.setMaximum(self.connection_list_counter)
+                # Point the slider at the last snapshot so the user immediately
+                # sees the most-recent state and can scrub backwards from there.
                 self.slider.setValue(self.connection_list_counter)
                 self.slider.blockSignals(False)
                 self.slider_value_label.setText(
-                    TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(len(self.connection_list) - 1))
+                    TIME_SLIDER_TEXT + str(self.slider.value()) + "/" + str(total))
+
+            if force_complete_database_load:
+                # Update the window title so it is obvious the app is in
+                # database-replay mode and is not collecting live traffic.
+                self.setWindowTitle(
+                    f"TCP/UDP Geo Map - R001D00rs - v {VERSION}  "
+                    f"[Database Replay — {len(self.connection_list)} snapshots loaded]")
         except Exception as e:
             logging.error(f"Error restoring snapshots from database: {e}")
 
@@ -5531,8 +5580,10 @@ class TCPConnectionViewer(QMainWindow):
         collector_row.addWidget(collector_label)
         self._collector_combo = QComboBox()
         for plugin in self._collector_plugins:
-            self._collector_combo.addItem(plugin.name)
+            display_name = f"{plugin.name} (Recommended)" if plugin.name == "Scapy Live Capture" else plugin.name
+            self._collector_combo.addItem(display_name)
             idx = self._collector_combo.count() - 1
+            self._collector_combo.setItemData(idx, plugin.name, Qt.UserRole)
             if plugin.description:
                 self._collector_combo.setItemData(idx, plugin.description, Qt.ToolTipRole)
         self._collector_combo.currentIndexChanged.connect(self._on_collector_changed)
@@ -8435,14 +8486,38 @@ class TCPConnectionViewer(QMainWindow):
             self._collector_worker = worker  # keep alive until slot fires
             QThreadPool.globalInstance().start(worker)
         else:
-            connections = self.get_active_tcp_connections(slider_position)
-            self._apply_connections(connections, slider_position)
+            # Synchronous path — runs entirely on the UI thread.
+            # Skip if a stale async worker is still in-flight; it will clear
+            # _async_collection_in_progress when it finishes (and its result
+            # will be discarded by _on_connections_ready), so the next tick
+            # will proceed normally.
+            if self._async_collection_in_progress:
+                logging.debug("refresh_connections: stale async worker still in flight, skipping sync tick")
+                return
+            # Defensive re-entrancy guard: Qt blocks the event loop while this
+            # method runs synchronously, so true re-entrancy cannot happen, but
+            # guard anyway in case a future code path calls processEvents().
+            if self._sync_collection_in_progress:
+                logging.debug("refresh_connections: sync collection already in progress, skipping tick")
+                return
+            self._sync_collection_in_progress = True
+            try:
+                connections = self.get_active_tcp_connections(slider_position)
+                self._apply_connections(connections, slider_position)
+            finally:
+                self._sync_collection_in_progress = False
 
     @Slot(object, object)
     def _on_connections_ready(self, connections, slider_position):
         """Called on the UI thread when the async connection worker finishes."""
         self._async_collection_in_progress = False
         self._collector_worker = None  # release the worker reference
+        # If the user switched to sync mode while the worker was in flight,
+        # discard the stale result.  The sync path will collect fresh data on
+        # the next timer tick now that _async_collection_in_progress is clear.
+        if not do_collect_connections_asynchronously:
+            logging.debug("_on_connections_ready: discarding stale async result (mode is now sync)")
+            return
         self._apply_connections(connections, slider_position)
 
     @Slot()
