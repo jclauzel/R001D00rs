@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.7.8" # Current script version
+VERSION = "3.7.9" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -369,6 +369,7 @@ do_show_traffic_gauge = True   # Set to True to show sent/recv traffic gauges ne
 do_show_traffic_histogram = True  # Set to True to show the network traffic histogram overlay on the map
 do_collect_connections_asynchronously = True  # Set to True to collect connections on a background thread (prevents UI hangs)
 do_show_listening_connections = False  # Set to True to include LISTEN sockets in the connection list
+do_warn_npcap_not_installed = True     # When True, show a one-time warning dialog if Npcap is missing on Windows (Scapy collector)
 do_scapy_force_use_interface_name = ""  # When non-empty, passed as iface= to Scapy sniff() (overrides auto-detection)
 conn_table_column_order: list = []        # Visual column order for the main connection table (logical indices)
 summary_table_column_order: list = []     # Visual column order for the summary table (logical indices)
@@ -1217,6 +1218,7 @@ class TCPConnectionViewer(QMainWindow):
         self._last_map_connections = []  # fully-processed connections for map re-renders
         self._async_collection_in_progress = False  # guard: only one background collection at a time
         self._sync_collection_in_progress = False   # guard: prevent sync re-entrancy (defensive)
+        self._npcap_warning_shown = False  # one-shot: True after the Npcap-missing dialog has been shown this session
 
         # Pinned (double-clicked) connection — persists across refreshes, shown as yellow marker
         self._pinned_connection = None
@@ -1803,7 +1805,7 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name
+        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name, do_warn_npcap_not_installed
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
@@ -1820,6 +1822,7 @@ class TCPConnectionViewer(QMainWindow):
             'do_show_traffic_histogram': do_show_traffic_histogram,
             'do_collect_connections_asynchronously': do_collect_connections_asynchronously,
             'do_show_listening_connections': do_show_listening_connections,
+            'do_warn_npcap_not_installed': do_warn_npcap_not_installed,
             'do_scapy_force_use_interface_name': do_scapy_force_use_interface_name,
             'conn_table_column_order': self._get_conn_table_column_order(),
             'summary_table_column_order': self._get_summary_table_column_order(),
@@ -1923,6 +1926,7 @@ class TCPConnectionViewer(QMainWindow):
                 global do_always_supplement_psutil_with_netstat_when_available
                 global do_show_listening_connections
                 global do_scapy_force_use_interface_name
+                global do_warn_npcap_not_installed
                 global conn_table_column_order, summary_table_column_order
                 global conn_table_column_widths, summary_table_column_widths
 
@@ -1948,6 +1952,7 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception:
                     pass
                 do_scapy_force_use_interface_name = settings.get('do_scapy_force_use_interface_name', do_scapy_force_use_interface_name)
+                do_warn_npcap_not_installed = settings.get('do_warn_npcap_not_installed', do_warn_npcap_not_installed)
                 _saved_conn_order = settings.get('conn_table_column_order', [])
                 if isinstance(_saved_conn_order, list):
                     conn_table_column_order = [int(x) for x in _saved_conn_order]
@@ -2178,6 +2183,9 @@ class TCPConnectionViewer(QMainWindow):
                 self.show_traffic_histogram_check.setChecked(do_show_traffic_histogram)
                 self.collect_connections_async_check.setChecked(do_collect_connections_asynchronously)
                 self.show_listening_connections_check.setChecked(do_show_listening_connections)
+
+                if hasattr(self, 'warn_npcap_check'):
+                    self.warn_npcap_check.setChecked(do_warn_npcap_not_installed)
 
                 # Restore column order for both tables
                 self._apply_conn_table_column_order(conn_table_column_order)
@@ -4846,6 +4854,12 @@ class TCPConnectionViewer(QMainWindow):
         self.save_settings()
 
     @Slot()
+    def _on_warn_npcap_changed(self):
+        global do_warn_npcap_not_installed
+        do_warn_npcap_not_installed = self.warn_npcap_check.isChecked()
+        self.save_settings()
+
+    @Slot()
     def update_show_traffic_gauge(self):
         global do_show_traffic_gauge
         do_show_traffic_gauge = self.show_traffic_gauge_check.isChecked()
@@ -5631,6 +5645,18 @@ class TCPConnectionViewer(QMainWindow):
         scapy_iface_layout.addWidget(scapy_iface_refresh_btn)
         settings_tab_layout.addWidget(self._scapy_iface_row)
         self._scapy_iface_row.setVisible(self._active_collector.name == "Scapy Live Capture")
+
+        # Warn if Npcap is not installed checkbox
+        self.warn_npcap_check = QCheckBox("Warn if Npcap is not installed (Scapy collector on Windows)")
+        self.warn_npcap_check.setChecked(do_warn_npcap_not_installed)
+        self.warn_npcap_check.setToolTip(
+            "When checked, a one-time warning dialog is shown on startup if Npcap\n"
+            "is not detected and the Scapy collector is active.\n"
+            "Npcap is required for full packet capture on Windows.\n"
+            "Download from https://npcap.com/"
+        )
+        self.warn_npcap_check.stateChanged.connect(self._on_warn_npcap_changed)
+        settings_tab_layout.addWidget(self.warn_npcap_check)
 
         # --- Server / Agent mode settings ---
         server_agent_separator = QLabel("─── Server / Agent Mode ───")
@@ -8560,6 +8586,10 @@ class TCPConnectionViewer(QMainWindow):
                 self._update_video_button_visibility()
             except Exception:
                 pass
+
+            # One-time Npcap-missing warning (only when Scapy collector is active)
+            self._check_npcap_warning()
+
         except Exception as e:
             logging.error(f"_post_collection_ui_update error: {e}")
 
@@ -9299,6 +9329,47 @@ class TCPConnectionViewer(QMainWindow):
 
         except Exception as e:
             logging.error(f"Error cleaning up old screenshots: {e}")
+
+    def _check_npcap_warning(self):
+        """Show a one-time warning dialog if Npcap is not installed and the Scapy collector is active.
+
+        Guarded by ``_npcap_warning_shown`` so the dialog appears at most once
+        per application session, and by the ``do_warn_npcap_not_installed``
+        setting so the user can suppress it from the Settings pane.
+        """
+        try:
+            if self._npcap_warning_shown:
+                return
+            if not do_warn_npcap_not_installed:
+                return
+            collector = self._active_collector
+            if not getattr(collector, 'npcap_unavailable', False):
+                return
+            self._npcap_warning_shown = True
+            detail = getattr(collector, '_npcap_error_detail', '')
+            from PySide6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Npcap Not Detected")
+            msg.setText(
+                "The Scapy Live Capture collector could not start packet capture "
+                "because <b>Npcap</b> is not installed on this system.<br><br>"
+                "Without Npcap the Scapy collector cannot capture network traffic. "
+                "The application will continue to work using the OS connection table "
+                "but byte-level traffic accounting will be unavailable.<br><br>"
+                "Please install Npcap from: "
+                "<a href='https://npcap.com/'>https://npcap.com/</a><br><br>"
+                "<small>You can disable this warning in Settings → "
+                "\"Warn if Npcap is not installed\".</small>"
+            )
+            msg.setTextFormat(Qt.RichText)
+            msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            if detail:
+                msg.setDetailedText(detail)
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec()
+        except Exception as e:
+            logging.debug(f"_check_npcap_warning error: {e}")
 
     def _update_video_button_visibility(self):
         """Show or hide the Generate Video button based on whether screenshots exist"""
