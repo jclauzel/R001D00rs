@@ -50,10 +50,12 @@ from typing import Dict, FrozenSet, List, Tuple
 from ipanalyze import IPAnalyzePlugin, IPAnalyzeResult
 
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+_CUSTOM_FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_files")
 
 _DEFAULT_CONFIG = {
     "sources": [
         {
+            "source_type": "http",
             "url": "",
             "description": "Add a URL to a text/CSV IP blocklist",
             "ttl_seconds": 86400,
@@ -165,7 +167,11 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
                 fmt = src.get("format", "text").lower()
                 col = int(src.get("csv_ip_column", 0))
                 desc = src.get("description", url) or url
-                ip_set = self._get_ip_set(url, ttl, fmt, col)
+                source_type = src.get("source_type", "http")
+                if source_type == "file":
+                    ip_set = self._get_file_ip_set(url, fmt, col)
+                else:
+                    ip_set = self._get_ip_set(url, ttl, fmt, col)
                 if ip_address in ip_set:
                     return desc
                 return None
@@ -263,8 +269,8 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import (
             QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout,
-            QHeaderView, QLabel, QPushButton, QSpinBox, QTableWidget,
-            QTableWidgetItem, QVBoxLayout, QWidget,
+            QHeaderView, QLabel, QMessageBox, QPushButton, QSpinBox,
+            QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
         )
 
         cfg = self.load_config()
@@ -280,26 +286,31 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
         )
 
         # Column indices
-        COL_URL = 0
-        COL_DESC = 1
-        COL_TTL = 2
-        COL_FMT = 3
-        COL_CSVCOL = 4
-        COL_ENABLED = 5
-        COL_REMOVE = 6
-        HEADERS = ["URL", "Description", "TTL (s)", "Format",
-                    "CSV Col", "Enabled", ""]
+        COL_SOURCE = 0
+        COL_LOCATION = 1
+        COL_DESC = 2
+        COL_TTL = 3
+        COL_FMT = 4
+        COL_CSVCOL = 5
+        COL_ENABLED = 6
+        COL_REACHABLE = 7
+        COL_REMOVE = 8
+        HEADERS = ["Source", "Location", "Description", "TTL (s)", "Format",
+                    "CSV Col", "Enabled", "Reachable", ""]
 
         tbl = QTableWidget(0, len(HEADERS))
         tbl.setHorizontalHeaderLabels(HEADERS)
         tbl.horizontalHeader().setStretchLastSection(False)
         tbl.horizontalHeader().setSectionResizeMode(
-            COL_URL, QHeaderView.Stretch
+            COL_LOCATION, QHeaderView.Stretch
         )
         tbl.horizontalHeader().setSectionResizeMode(
             COL_DESC, QHeaderView.Stretch
         )
         tbl.setSelectionBehavior(QTableWidget.SelectRows)
+
+        # Ensure custom_files directory exists
+        os.makedirs(_CUSTOM_FILES_DIR, exist_ok=True)
 
         def _rewire_remove_buttons():
             """Re-bind every minus button to the correct row index."""
@@ -312,18 +323,115 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
                         lambda checked=False, rr=r: _remove_row(rr)
                     )
 
+        def _validate_location(row: int):
+            """Validate the location for the given row based on source type."""
+            source_combo = tbl.cellWidget(row, COL_SOURCE)
+            loc_item = tbl.item(row, COL_LOCATION)
+            if source_combo is None or loc_item is None:
+                return
+            location = loc_item.text().strip()
+            if not location:
+                _set_reachable(row, None)
+                return
+            source_type = source_combo.currentText()
+            if source_type == "Http download":
+                _try_download_url(location, row)
+            else:
+                _try_check_file(location, row)
+
+        def _try_download_url(url: str, row: int):
+            """Attempt to download *url* and update the Reachable column."""
+            try:
+                import requests
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                # Cache on disk
+                cache_file = self._cache_path(url)
+                os.makedirs(_CACHE_DIR, exist_ok=True)
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                _set_reachable(row, True)
+            except Exception as exc:
+                _set_reachable(row, False)
+                QMessageBox.warning(
+                    dialog,
+                    "Download failed",
+                    f"Could not download:\n{url}\n\n"
+                    f"Error: {exc}\n\n"
+                    "Please check the URL and try again.",
+                )
+
+        def _try_check_file(filename: str, row: int):
+            """Check if the file exists under custom_files."""
+            filepath = os.path.join(_CUSTOM_FILES_DIR, filename)
+            if os.path.isfile(filepath):
+                _set_reachable(row, True)
+            else:
+                _set_reachable(row, False)
+                QMessageBox.warning(
+                    dialog,
+                    "File not found",
+                    f"Could not find file:\n{filepath}\n\n"
+                    f"Please place the file in the 'ipanalyze/custom_files/' folder.",
+                )
+
+        def _set_reachable(row: int, reachable):
+            """Update the Reachable cell for *row*."""
+            if reachable is None:
+                item = QTableWidgetItem("")
+            elif reachable:
+                item = QTableWidgetItem("\u2714 Reachable")
+            else:
+                item = QTableWidgetItem("\u2716 Unreachable")
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            tbl.setItem(row, COL_REACHABLE, item)
+
+        def _update_csv_col_state(row: int, fmt_combo: QComboBox):
+            """Enable/disable the CSV col spinbox based on format."""
+            csv_spin = tbl.cellWidget(row, COL_CSVCOL)
+            if isinstance(csv_spin, QSpinBox):
+                csv_spin.setEnabled(fmt_combo.currentText() == "csv")
+
+        def _on_location_changed(item):
+            """When the Location cell is edited, validate it."""
+            if item is None:
+                return
+            if item.column() == COL_LOCATION:
+                _validate_location(item.row())
+
+        tbl.itemChanged.connect(_on_location_changed)
+
+        def _on_source_type_changed(row: int):
+            """Reset reachable when source type changes and re-validate."""
+            _set_reachable(row, None)
+            loc_item = tbl.item(row, COL_LOCATION)
+            if loc_item and loc_item.text().strip():
+                _validate_location(row)
+
         def _add_source_row(src=None):
             """Append one source row to the table."""
             if src is None:
                 src = {
-                    "url": "", "description": "", "ttl_seconds": 86400,
+                    "source_type": "http", "url": "",
+                    "description": "", "ttl_seconds": 86400,
                     "format": "text", "csv_ip_column": 0, "enabled": False,
                 }
             row = tbl.rowCount()
             tbl.insertRow(row)
 
-            # URL
-            tbl.setItem(row, COL_URL,
+            # Source type combo
+            source_combo = QComboBox()
+            source_combo.addItems(["Http download", "File"])
+            src_type = src.get("source_type", "http")
+            source_combo.setCurrentText(
+                "File" if src_type == "file" else "Http download"
+            )
+            tbl.setCellWidget(row, COL_SOURCE, source_combo)
+            source_combo.currentTextChanged.connect(
+                lambda _txt, r=row: _on_source_type_changed(r)
+            )
+            # Location (URL or filename)
+            tbl.setItem(row, COL_LOCATION,
                         QTableWidgetItem(src.get("url", "")))
             # Description
             tbl.setItem(row, COL_DESC,
@@ -345,7 +453,12 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
             csv_col_spin = QSpinBox()
             csv_col_spin.setRange(0, 999)
             csv_col_spin.setValue(int(src.get("csv_ip_column", 0)))
+            csv_col_spin.setEnabled(fmt_combo.currentText() == "csv")
             tbl.setCellWidget(row, COL_CSVCOL, csv_col_spin)
+            # Wire format combo to toggle CSV col
+            fmt_combo.currentTextChanged.connect(
+                lambda _txt, r=row, fc=fmt_combo: _update_csv_col_state(r, fc)
+            )
             # Enabled checkbox (centred in cell)
             chk = QCheckBox()
             chk.setChecked(bool(src.get("enabled", False)))
@@ -355,6 +468,12 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
             chk_layout.setAlignment(Qt.AlignCenter)
             chk_layout.setContentsMargins(0, 0, 0, 0)
             tbl.setCellWidget(row, COL_ENABLED, chk_container)
+            # Reachable indicator (read-only)
+            loc_val = src.get("url", "").strip()
+            if loc_val:
+                _set_reachable(row, True)  # assume previously saved are reachable
+            else:
+                _set_reachable(row, None)
             # Remove button
             remove_btn = QPushButton("\u2212")
             remove_btn.setFixedWidth(28)
@@ -383,21 +502,48 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
         btn_box = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel
         )
-        btn_box.accepted.connect(dialog.accept)
+
+        def _on_save():
+            """Validate reachability before accepting."""
+            for r in range(tbl.rowCount()):
+                loc_item = tbl.item(r, COL_LOCATION)
+                loc_val = loc_item.text().strip() if loc_item else ""
+                if not loc_val:
+                    continue
+                reach_item = tbl.item(r, COL_REACHABLE)
+                reach_text = reach_item.text() if reach_item else ""
+                if "\u2714" not in reach_text:
+                    QMessageBox.warning(
+                        dialog,
+                        "Cannot save",
+                        f"Row {r + 1} source is not reachable.\n"
+                        "Please fix or remove unreachable sources before saving.",
+                    )
+                    return
+            dialog.accept()
+
+        btn_box.accepted.connect(_on_save)
         btn_box.rejected.connect(dialog.reject)
         root_layout.addWidget(btn_box)
 
         if dialog.exec() == QDialog.Accepted:
             new_sources = []
             for r in range(tbl.rowCount()):
-                url_item = tbl.item(r, COL_URL)
+                source_w = tbl.cellWidget(r, COL_SOURCE)
+                loc_item = tbl.item(r, COL_LOCATION)
                 desc_item = tbl.item(r, COL_DESC)
                 ttl_w = tbl.cellWidget(r, COL_TTL)
                 fmt_w = tbl.cellWidget(r, COL_FMT)
                 csv_w = tbl.cellWidget(r, COL_CSVCOL)
                 chk_cont = tbl.cellWidget(r, COL_ENABLED)
 
-                url_val = url_item.text().strip() if url_item else ""
+                source_type_val = "http"
+                if isinstance(source_w, QComboBox):
+                    source_type_val = (
+                        "file" if source_w.currentText() == "File"
+                        else "http"
+                    )
+                loc_val = loc_item.text().strip() if loc_item else ""
                 desc_val = desc_item.text().strip() if desc_item else ""
                 ttl_val = (ttl_w.value()
                            if isinstance(ttl_w, QSpinBox) else 86400)
@@ -412,7 +558,8 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
                         enabled_val = chk_widget.isChecked()
 
                 new_sources.append({
-                    "url": url_val,
+                    "source_type": source_type_val,
+                    "url": loc_val,
                     "description": desc_val,
                     "ttl_seconds": ttl_val,
                     "format": fmt_val,
@@ -461,31 +608,74 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
         )
 
     def _download(self, url: str) -> Tuple[str, str]:
-        """Download *url* and return ``(raw_text, sha256_hex[:32])``."""
+        """Download *url* with up to 3 retries.
+
+        Returns ``(raw_text, sha256_hex[:32])``.
+        Raises ``RuntimeError`` if all retries fail and no disk cache exists.
+        """
+        import requests
+
         cache_file = self._cache_path(url)
-        raw_text = ""
+        last_exc = None
 
-        try:
-            import requests
-            logging.info("HttpTextCsvPlugin: downloading %s", url)
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            raw_text = resp.text
-
-            # Persist to disk cache
-            with open(cache_file, "w", encoding="utf-8") as f:
-                f.write(raw_text)
-
-        except Exception as exc:
-            logging.warning(
-                "HttpTextCsvPlugin: download failed for %s: %s", url, exc,
-            )
-            if os.path.exists(cache_file):
+        for attempt in range(1, 4):
+            try:
                 logging.info(
-                    "HttpTextCsvPlugin: using on-disk cache for %s", url,
+                    "HttpTextCsvPlugin: downloading %s (attempt %d/3)",
+                    url, attempt,
                 )
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    raw_text = f.read()
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                raw_text = resp.text
+
+                # Persist to disk cache
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    f.write(raw_text)
+
+                content_hash = hashlib.sha256(
+                    raw_text.encode()
+                ).hexdigest()[:32]
+                return raw_text, content_hash
+            except Exception as exc:
+                last_exc = exc
+                logging.warning(
+                    "HttpTextCsvPlugin: download attempt %d failed for %s: %s",
+                    attempt, url, exc,
+                )
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+
+        # All 3 retries failed — try disk cache as last resort
+        if os.path.exists(cache_file):
+            logging.info(
+                "HttpTextCsvPlugin: using on-disk cache for %s after 3 failures",
+                url,
+            )
+            with open(cache_file, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+            content_hash = hashlib.sha256(raw_text.encode()).hexdigest()[:32]
+            return raw_text, content_hash
+
+        # No cache, no successful download — raise to signal plugin failure
+        raise RuntimeError(
+            f"Failed to download {url} after 3 retries: {last_exc}"
+        )
+
+    def _get_file_ip_set(self, filename: str,
+                         fmt: str, csv_ip_column: int) -> FrozenSet[str]:
+        """Return the IP set parsed from a local file in custom_files/.
+
+        Always re-reads the file (no TTL caching) so edits are picked up
+        immediately.  Raises ``FileNotFoundError`` if the file is missing.
+        """
+        filepath = os.path.join(_CUSTOM_FILES_DIR, filename)
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(
+                f"Custom file not found: {filepath}"
+            )
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            raw_text = f.read()
 
         content_hash = hashlib.sha256(raw_text.encode()).hexdigest()[:32]
-        return raw_text, content_hash
+        return _parse_ip_set_cached(content_hash, raw_text, fmt, csv_ip_column)

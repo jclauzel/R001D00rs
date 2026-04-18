@@ -1,11 +1,11 @@
 [
   {
     "module": "http_text_csv_plugin",
-    "enabled": false
+    "enabled": true
   },
   {
     "module": "pihole_plugin",
-    "enabled": true
+    "enabled": false
   },
   {
     "module": "dev_test_plugin",
