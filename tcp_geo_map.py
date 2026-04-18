@@ -1210,6 +1210,9 @@ class TCPConnectionViewer(QMainWindow):
         self._ipanalyze_plugins = []  # List[IPAnalyzePlugin] loaded from registry
         self._geo_cache = {}  # (ip_address, ip_type) -> (lat, lng) — avoids repeated maxminddb lookups
         self._current_alerts = []  # alerts from the most recent collection cycle
+        self._all_alerts = []  # accumulated alerts across all cycles (newest appended last)
+        self._alerts_sort_column = 0  # default sort column (Time)
+        self._alerts_sort_reverse = True  # default descending (newest first)
         self.connections = []
         self._last_map_connections = []  # fully-processed connections for map re-renders
         self._async_collection_in_progress = False  # guard: only one background collection at a time
@@ -4055,6 +4058,81 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+    def _sync_alerts_filter_widths(self):
+        """Resize alerts filter bar inputs to match the current alerts table column widths."""
+        try:
+            hdr = self.alerts_table.horizontalHeader()
+            vh_width = self.alerts_table.verticalHeader().width()
+            self._alerts_filter_vheader_spacer.setFixedWidth(vh_width)
+            total_width = vh_width
+            for visual_pos in range(hdr.count()):
+                logical = hdr.logicalIndex(visual_pos)
+                col_width = self.alerts_table.columnWidth(logical)
+                self._alerts_filter_inputs[logical].setFixedWidth(col_width)
+                total_width += col_width
+            self._alerts_filter_inner.setFixedWidth(total_width)
+        except Exception:
+            pass
+
+    @Slot()
+    def apply_alerts_table_filter(self):
+        """Show/hide alerts table rows based on the active per-column filter inputs."""
+        try:
+            filters = [le.text().strip().lower() for le in self._alerts_filter_inputs]
+            has_filter = any(filters)
+            for row in range(self.alerts_table.rowCount()):
+                if not has_filter:
+                    self.alerts_table.setRowHidden(row, False)
+                    continue
+                visible = True
+                for col, f in enumerate(filters):
+                    if f:
+                        item = self.alerts_table.item(row, col)
+                        if f not in (item.text().lower() if item else ""):
+                            visible = False
+                            break
+                self.alerts_table.setRowHidden(row, not visible)
+        except Exception:
+            pass
+
+    @Slot(int)
+    def _on_alerts_header_clicked(self, index):
+        """Handle clicks on alerts table column headers to toggle sorting."""
+        if self._alerts_sort_column == index:
+            self._alerts_sort_reverse = not self._alerts_sort_reverse
+        else:
+            self._alerts_sort_column = index
+            self._alerts_sort_reverse = True  # descending by default for new column
+
+        self._sort_alerts_table()
+        self._update_sort_indicator(self.alerts_table, self._alerts_table_headers,
+                                    self._alerts_sort_column, self._alerts_sort_reverse)
+        self.apply_alerts_table_filter()
+
+    def _sort_alerts_table(self):
+        """Sort the alerts table rows by the current sort column and direction."""
+        try:
+            row_data = []
+            for row in range(self.alerts_table.rowCount()):
+                row_items = []
+                for col in range(self.alerts_table.columnCount()):
+                    item = self.alerts_table.item(row, col)
+                    row_items.append(item.text() if item else "")
+                row_data.append(row_items)
+
+            col = self._alerts_sort_column
+            row_data.sort(key=lambda r: r[col].lower() if col < len(r) else "", reverse=self._alerts_sort_reverse)
+
+            self.alerts_table.setUpdatesEnabled(False)
+            for row, items in enumerate(row_data):
+                for col_idx, val in enumerate(items):
+                    item = QTableWidgetItem(val)
+                    item.setForeground(Qt.red)
+                    self.alerts_table.setItem(row, col_idx, item)
+            self.alerts_table.setUpdatesEnabled(True)
+        except Exception as e:
+            logging.error(f"Error sorting alerts table: {e}")
+
     def _update_sort_indicator(self, table, base_headers, sort_col, descending):
         """Set ▲ / ▼ on the sorted column header; reset all others to base text."""
         header = table.horizontalHeader()
@@ -4816,16 +4894,19 @@ class TCPConnectionViewer(QMainWindow):
         self._refresh_ipanalyze_plugin_table()
 
     def _update_alerts_table(self):
-        """Populate the Alerts tab table from self._current_alerts (newest first)."""
+        """Populate the Alerts tab table from self._all_alerts (accumulated across cycles).
+
+        Sorted by the current sort column (default: Time descending = newest first).
+        """
         if not hasattr(self, 'alerts_table'):
             return
         try:
-            alerts = list(reversed(self._current_alerts)) if self._current_alerts else []
-            self.alerts_table.setUpdatesEnabled(False)
-            self.alerts_table.setRowCount(0)
+            # Use accumulated alerts instead of just current cycle
+            alerts = list(self._all_alerts) if self._all_alerts else []
+
+            # Build rows as list of value lists for sorting
+            row_data = []
             for alert in alerts:
-                row = self.alerts_table.rowCount()
-                self.alerts_table.insertRow(row)
                 values = [
                     alert.get('datetime', ''),
                     alert.get('hostname', ''),
@@ -4842,11 +4923,32 @@ class TCPConnectionViewer(QMainWindow):
                     alert.get('way', ''),
                     alert.get('name', ''),
                 ]
-                for col, val in enumerate(values):
-                    item = QTableWidgetItem(str(val))
+                row_data.append([str(v) for v in values])
+
+            # Sort by current sort column (default: Time=0, descending=True)
+            sort_col = self._alerts_sort_column
+            sort_rev = self._alerts_sort_reverse
+            if row_data:
+                row_data.sort(key=lambda r: r[sort_col].lower() if sort_col < len(r) else "", reverse=sort_rev)
+
+            self.alerts_table.setUpdatesEnabled(False)
+            self.alerts_table.setRowCount(0)
+            for row_values in row_data:
+                row = self.alerts_table.rowCount()
+                self.alerts_table.insertRow(row)
+                for col, val in enumerate(row_values):
+                    item = QTableWidgetItem(val)
                     item.setForeground(Qt.red)
                     self.alerts_table.setItem(row, col, item)
             self.alerts_table.setUpdatesEnabled(True)
+
+            # Update sort indicator and sync filter widths
+            self._update_sort_indicator(self.alerts_table, self._alerts_table_headers,
+                                        self._alerts_sort_column, self._alerts_sort_reverse)
+            QTimer.singleShot(0, self._sync_alerts_filter_widths)
+
+            # Re-apply filter if any is active
+            self.apply_alerts_table_filter()
         except Exception as e:
             logging.error(f"Error updating alerts table: {e}")
 
@@ -5946,6 +6048,38 @@ class TCPConnectionViewer(QMainWindow):
         self.alerts_table.horizontalHeader().setStretchLastSection(True)
         self.alerts_table.verticalHeader().setVisible(False)
         self.alerts_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.alerts_table.setSortingEnabled(False)  # We handle sorting manually
+        self.alerts_table.horizontalHeader().sectionClicked.connect(self._on_alerts_header_clicked)
+
+        # Per-column filter bar for alerts table
+        self._alerts_filter_inner = QWidget()
+        _alerts_filter_layout = QHBoxLayout(self._alerts_filter_inner)
+        _alerts_filter_layout.setContentsMargins(0, 0, 0, 0)
+        _alerts_filter_layout.setSpacing(0)
+        self._alerts_filter_vheader_spacer = QWidget()
+        _alerts_filter_layout.addWidget(self._alerts_filter_vheader_spacer)
+        self._alerts_filter_inputs = []
+        for placeholder in self._alerts_table_headers:
+            le = QLineEdit()
+            le.setPlaceholderText(placeholder)
+            le.setClearButtonEnabled(True)
+            le.setFixedHeight(24)
+            le.textChanged.connect(self.apply_alerts_table_filter)
+            self._alerts_filter_inputs.append(le)
+            _alerts_filter_layout.addWidget(le)
+        self._alerts_filter_scroll = QScrollArea()
+        self._alerts_filter_scroll.setWidget(self._alerts_filter_inner)
+        self._alerts_filter_scroll.setWidgetResizable(False)
+        self._alerts_filter_scroll.setFixedHeight(28)
+        self._alerts_filter_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._alerts_filter_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._alerts_filter_scroll.setFrameShape(QFrame.NoFrame)
+        self.alerts_table.horizontalScrollBar().valueChanged.connect(
+            self._alerts_filter_scroll.horizontalScrollBar().setValue)
+        self.alerts_table.horizontalHeader().sectionResized.connect(
+            lambda *_: self._sync_alerts_filter_widths())
+
+        alerts_tab_layout.addWidget(self._alerts_filter_scroll)
         alerts_tab_layout.addWidget(self.alerts_table)
 
         self.tab_widget.addTab(alerts_tab_widget, "Alerts")
@@ -6791,6 +6925,9 @@ class TCPConnectionViewer(QMainWindow):
                 logging.error(f"Agent POST failed: {e}")
 
         self._current_alerts = snap_alerts
+        # Accumulate alerts across all cycles for the Alerts tab (newest last)
+        if snap_alerts and position_timeline is None:
+            self._all_alerts.extend(snap_alerts)
         return connections
     
     def get_coordinates(self, ip_address, ip_type):
@@ -8994,7 +9131,9 @@ class TCPConnectionViewer(QMainWindow):
                 
                 if conn['suspect']:
                     for col in range(self.connection_table.columnCount()):
-                        self.connection_table.item(row, col).setForeground(Qt.red)
+                        item = self.connection_table.item(row, col)
+                        if item is not None:
+                            item.setForeground(Qt.red)
 
                     self.setStyleSheet("border: 2px solid red;") # Set window border to red
                 
@@ -9780,7 +9919,9 @@ class TCPConnectionViewer(QMainWindow):
                 # Highlight suspect connections in red
                 if suspect:
                     for col in range(self.summary_table.columnCount()):
-                        self.summary_table.item(row, col).setForeground(Qt.red)
+                        item = self.summary_table.item(row, col)
+                        if item is not None:
+                            item.setForeground(Qt.red)
 
             self.summary_table.setUpdatesEnabled(True)
 
