@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.8.1" # Current script version
+VERSION = "3.8.3" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -356,6 +356,7 @@ do_resolve_public_ip = True  # Set to True to resolve public IP addresses to hos
 do_pulse_exit_points = True  # Set to True to animate a pulsing ring on agent/server exit-point circles
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
 do_ipanalyze = False  # Master on/off toggle for the IPAnalyze plugin framework
+do_show_alerts_on_map = True  # Show latest IPAnalyze alerts panel on the map (top-right corner)
 do_always_supplement_psutil_with_netstat_when_available = True  # When True, psutil connection data is always supplemented with netstat to catch any connections psutil may miss
 _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
@@ -1213,6 +1214,9 @@ class TCPConnectionViewer(QMainWindow):
         self._all_alerts = []  # accumulated alerts across all cycles (newest appended last)
         self._alerts_sort_column = 0  # default sort column (Time)
         self._alerts_sort_reverse = True  # default descending (newest first)
+        self._alerts_tab_blink_timer = None  # QTimer for blinking the Alerts tab
+        self._alerts_tab_blink_state = False  # toggle state for blink animation
+        self._alerts_tab_blink_count = 0  # count blinks to auto-stop
         self.connections = []
         self._last_map_connections = []  # fully-processed connections for map re-renders
         self._async_collection_in_progress = False  # guard: only one background collection at a time
@@ -1816,11 +1820,12 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size, do_ipanalyze, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name, do_warn_npcap_not_installed
+        global max_connection_list_filo_buffer_size, do_ipanalyze, do_show_alerts_on_map, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name, do_warn_npcap_not_installed
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
             'do_ipanalyze' : do_ipanalyze,
+            'do_show_alerts_on_map': do_show_alerts_on_map,
             'do_always_supplement_psutil_with_netstat_when_available': do_always_supplement_psutil_with_netstat_when_available,
             'show_only_new_active_connections': show_only_new_active_connections,
             'show_only_remote_connections': show_only_remote_connections,
@@ -1919,7 +1924,7 @@ class TCPConnectionViewer(QMainWindow):
             True if settings file was found and loaded successfully
             None if settings file doesn't exist (first run)
         """
-        global max_connection_list_filo_buffer_size, do_ipanalyze, show_only_new_active_connections
+        global max_connection_list_filo_buffer_size, do_ipanalyze, do_show_alerts_on_map, show_only_new_active_connections
         global show_only_remote_connections, do_reverse_dns, map_refresh_interval
         global table_column_sort_index, table_column_sort_reverse
         global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously
@@ -1946,6 +1951,7 @@ class TCPConnectionViewer(QMainWindow):
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
                 do_ipanalyze = settings.get('do_ipanalyze', do_ipanalyze)
+                do_show_alerts_on_map = settings.get('do_show_alerts_on_map', do_show_alerts_on_map)
                 do_always_supplement_psutil_with_netstat_when_available = settings.get('do_always_supplement_psutil_with_netstat_when_available', do_always_supplement_psutil_with_netstat_when_available)
                 _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
                 show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
@@ -2189,6 +2195,8 @@ class TCPConnectionViewer(QMainWindow):
                 if hasattr(self, 'ipanalyze_check'):
                     self.ipanalyze_check.setChecked(do_ipanalyze)
                     self._toggle_ipanalyze_ui(do_ipanalyze)
+                if hasattr(self, 'show_alerts_on_map_check'):
+                    self.show_alerts_on_map_check.setChecked(do_show_alerts_on_map)
                 self.resolve_public_ip.setChecked(do_resolve_public_ip)
                 self.pulse_exit_points_check.setChecked(do_pulse_exit_points)
                 self.capture_screenshots_check.setChecked(do_capture_screenshots)
@@ -4876,6 +4884,63 @@ class TCPConnectionViewer(QMainWindow):
             self._load_ipanalyze_plugins()
         self.save_settings()
 
+    def _on_show_alerts_on_map_toggled(self):
+        """Toggle the alerts panel display on the map."""
+        global do_show_alerts_on_map
+        do_show_alerts_on_map = self.show_alerts_on_map_check.isChecked()
+        self.save_settings()
+
+    def _start_alerts_tab_blink(self):
+        """Start blinking the Alerts tab in red to draw attention to new alerts."""
+        if not hasattr(self, '_alerts_tab_index'):
+            return
+        # Don't restart if already blinking
+        if self._alerts_tab_blink_timer is not None and self._alerts_tab_blink_timer.isActive():
+            return
+
+        self._alerts_tab_blink_count = 0
+        self._alerts_tab_blink_state = False
+
+        if self._alerts_tab_blink_timer is None:
+            self._alerts_tab_blink_timer = QTimer()
+            self._alerts_tab_blink_timer.timeout.connect(self._alerts_tab_blink_tick)
+
+        self._alerts_tab_blink_timer.start(300)  # blink every 300ms
+
+    def _alerts_tab_blink_tick(self):
+        """Toggle the Alerts tab color for blink effect."""
+        if not hasattr(self, '_alerts_tab_index'):
+            return
+
+        self._alerts_tab_blink_state = not self._alerts_tab_blink_state
+        self._alerts_tab_blink_count += 1
+
+        tab_bar = self.tab_widget.tabBar()
+        if self._alerts_tab_blink_state:
+            tab_bar.setTabTextColor(self._alerts_tab_index, QColor(255, 0, 0))  # Red
+        else:
+            tab_bar.setTabTextColor(self._alerts_tab_index, QColor())  # Default
+
+        # Stop after ~10 blinks (20 ticks = 6 seconds)
+        if self._alerts_tab_blink_count >= 20:
+            self._stop_alerts_tab_blink()
+
+    def _stop_alerts_tab_blink(self):
+        """Stop the Alerts tab blinking and reset to default color."""
+        if self._alerts_tab_blink_timer is not None:
+            self._alerts_tab_blink_timer.stop()
+        if hasattr(self, '_alerts_tab_index'):
+            tab_bar = self.tab_widget.tabBar()
+            tab_bar.setTabTextColor(self._alerts_tab_index, QColor())  # Default
+
+    def _update_alerts_tab_title(self):
+        """Update the Alerts tab text to show the current alert count."""
+        if not hasattr(self, '_alerts_tab_index'):
+            return
+        count = len(self._all_alerts) if self._all_alerts else 0
+        text = f"Alerts ({count})" if count > 0 else "Alerts"
+        self.tab_widget.setTabText(self._alerts_tab_index, text)
+
     def _toggle_ipanalyze_ui(self, enabled):
         """Show or hide the IPAnalyze plugin table in the Settings pane and Alerts tab."""
         if hasattr(self, '_ipanalyze_plugin_group'):
@@ -4949,6 +5014,9 @@ class TCPConnectionViewer(QMainWindow):
 
             # Re-apply filter if any is active
             self.apply_alerts_table_filter()
+
+            # Update tab title with count
+            self._update_alerts_tab_title()
         except Exception as e:
             logging.error(f"Error updating alerts table: {e}")
 
@@ -5668,6 +5736,16 @@ class TCPConnectionViewer(QMainWindow):
         self.ipanalyze_check.setChecked(do_ipanalyze)
         settings_tab_layout.addWidget(self.ipanalyze_check)
         self.ipanalyze_check.stateChanged.connect(self._on_ipanalyze_toggled)
+
+        # Show alerts on map checkbox (child of IPAnalyze)
+        self.show_alerts_on_map_check = QCheckBox("Show latest alerts on map")
+        self.show_alerts_on_map_check.setToolTip(
+            "When enabled, the top 10 most recent IPAnalyze alerts are displayed\n"
+            "in a panel on the map. Click an entry to view full alert details."
+        )
+        self.show_alerts_on_map_check.setChecked(do_show_alerts_on_map)
+        settings_tab_layout.addWidget(self.show_alerts_on_map_check)
+        self.show_alerts_on_map_check.stateChanged.connect(self._on_show_alerts_on_map_toggled)
 
         # IPAnalyze plugin management group (visible only when enabled)
         self._ipanalyze_plugin_group = QGroupBox("IPAnalyze Plugins")
@@ -7371,6 +7449,16 @@ class TCPConnectionViewer(QMainWindow):
         histogram_js = '' if skip_histogram else (
             f"try{{updateTrafficHistogram({delta_sent},{delta_recv},{str(do_show_traffic_histogram).lower()})}}catch(e){{}};"
         )
+
+        # Build alerts panel data (top 10 most recent, sorted by time descending)
+        alerts_show = do_ipanalyze and do_show_alerts_on_map
+        alerts_for_map = []
+        if alerts_show and self._all_alerts:
+            # Sort by datetime descending and take top 10
+            sorted_alerts = sorted(self._all_alerts, key=lambda a: a.get('datetime', ''), reverse=True)[:10]
+            alerts_for_map = sorted_alerts
+        alerts_json = json.dumps(alerts_for_map)
+
         js = (
             f"try{{updateConnections({data_json}, {str(force_show_tooltip).lower()}, {str(draw_lines).lower()}, {str(do_show_traffic_gauge).lower()}, {str(do_pulse_exit_points).lower()})}}catch(e){{console.error('updateConnections error',e)}};"
             f"try{{setStats({json.dumps(stats_text)})}}catch(e){{}};"
@@ -7380,6 +7468,7 @@ class TCPConnectionViewer(QMainWindow):
             f"try{{setRejectedOverlay({show_rejected})}}catch(e){{}};"
             f"try{{setAgentStatus({json.dumps(agent_status_text)})}}catch(e){{}};"
             f"{histogram_js}"
+            f"try{{updateAlertsPanel({alerts_json},{str(alerts_show).lower()})}}catch(e){{console.error('updateAlertsPanel error',e)}};"
             f"try{{triggerPulse()}}catch(e){{}}"
         )
 
@@ -8658,6 +8747,151 @@ class TCPConnectionViewer(QMainWindow):
 
                                     window.triggerPulse = triggerPulse;
 
+                                    // --- IPAnalyze Alerts Panel ---
+                                    var _alertsData = [];
+                                    var _alertDetailIndex = 0;
+
+                                    function updateAlertsPanel(alerts, show) {
+                                        try {
+                                            var panel = document.getElementById('alerts-panel');
+                                            var listEl = document.getElementById('alerts-panel-list');
+                                            if (!panel || !listEl) return;
+
+                                            _alertsData = alerts || [];
+
+                                            if (!show || _alertsData.length === 0) {
+                                                panel.style.display = 'none';
+                                                return;
+                                            }
+
+                                            // Build entries HTML (top 10 most recent, already sorted by time desc)
+                                            var html = '';
+                                            var count = Math.min(_alertsData.length, 10);
+                                            for (var i = 0; i < count; i++) {
+                                                var a = _alertsData[i];
+                                                html += '<div class="ap-entry" data-idx="' + i + '">';
+                                                html += '<div class="ap-time">' + (a.datetime || '') + '</div>';
+                                                html += '<span class="ap-agent">' + (a.hostname || 'Local') + '</span> ';
+                                                html += '<span class="ap-plugin">' + (a.plugin || '') + '</span>';
+                                                if (a.process) html += ' <span style="color:#666">(' + a.process + ')</span>';
+                                                html += '</div>';
+                                            }
+                                            listEl.innerHTML = html;
+                                            panel.style.display = 'block';
+
+                                            // Attach click handlers
+                                            var entries = listEl.querySelectorAll('.ap-entry');
+                                            for (var j = 0; j < entries.length; j++) {
+                                                entries[j].onclick = function() {
+                                                    var idx = parseInt(this.getAttribute('data-idx'), 10);
+                                                    openAlertDetail(idx);
+                                                };
+                                            }
+                                        } catch(e) { console.error('[AlertsPanel]', e); }
+                                    }
+                                    window.updateAlertsPanel = updateAlertsPanel;
+
+                                    function openAlertDetail(idx) {
+                                        try {
+                                            if (idx < 0 || idx >= _alertsData.length) return;
+                                            _alertDetailIndex = idx;
+                                            renderAlertDetail();
+                                            var overlay = document.getElementById('alert-detail-overlay');
+                                            if (overlay) overlay.classList.add('active');
+                                        } catch(e) { console.error('[AlertDetail]', e); }
+                                    }
+                                    window.openAlertDetail = openAlertDetail;
+
+                                    function renderAlertDetail() {
+                                        try {
+                                            var a = _alertsData[_alertDetailIndex];
+                                            if (!a) return;
+                                            var body = document.getElementById('alert-detail-body');
+                                            if (!body) return;
+
+                                            var fields = [
+                                                ['Time', a.datetime],
+                                                ['Agent', a.hostname || 'Local'],
+                                                ['Plugin', a.plugin],
+                                                ['Info', a.additional_info],
+                                                ['Process', a.process],
+                                                ['PID', a.pid],
+                                                ['Protocol', a.protocol],
+                                                ['Local', a.local],
+                                                ['Local Port', a.localport],
+                                                ['Remote', a.remote],
+                                                ['Remote Port', a.remoteport],
+                                                ['IP Type', a.ip_type],
+                                                ['Direction', a.way],
+                                                ['Name', a.name]
+                                            ];
+                                            var html = '';
+                                            for (var i = 0; i < fields.length; i++) {
+                                                var val = fields[i][1] || '';
+                                                if (val) {
+                                                    html += '<div class="ad-row"><span class="ad-label">' + fields[i][0] + ':</span> ' + val + '</div>';
+                                                }
+                                            }
+                                            body.innerHTML = html;
+
+                                            // Update nav position indicator
+                                            var pos = document.getElementById('alert-nav-pos');
+                                            if (pos) {
+                                                pos.innerText = (_alertDetailIndex + 1) + ' / ' + _alertsData.length;
+                                            }
+
+                                            // Update button states
+                                            var prevBtn = document.getElementById('alert-nav-prev');
+                                            var nextBtn = document.getElementById('alert-nav-next');
+                                            if (prevBtn) prevBtn.disabled = (_alertDetailIndex <= 0);
+                                            if (nextBtn) nextBtn.disabled = (_alertDetailIndex >= _alertsData.length - 1);
+                                        } catch(e) { console.error('[AlertDetail render]', e); }
+                                    }
+
+                                    function closeAlertDetail() {
+                                        try {
+                                            var overlay = document.getElementById('alert-detail-overlay');
+                                            if (overlay) overlay.classList.remove('active');
+                                        } catch(e) {}
+                                    }
+                                    window.closeAlertDetail = closeAlertDetail;
+
+                                    function alertNavPrev() {
+                                        if (_alertDetailIndex > 0) {
+                                            _alertDetailIndex--;
+                                            renderAlertDetail();
+                                        }
+                                    }
+                                    window.alertNavPrev = alertNavPrev;
+
+                                    function alertNavNext() {
+                                        if (_alertDetailIndex < _alertsData.length - 1) {
+                                            _alertDetailIndex++;
+                                            renderAlertDetail();
+                                        }
+                                    }
+                                    window.alertNavNext = alertNavNext;
+
+                                    // Wire up alert detail overlay buttons
+                                    (function() {
+                                        var closeBtn = document.getElementById('alert-detail-close');
+                                        if (closeBtn) closeBtn.onclick = closeAlertDetail;
+
+                                        var prevBtn = document.getElementById('alert-nav-prev');
+                                        if (prevBtn) prevBtn.onclick = alertNavPrev;
+
+                                        var nextBtn = document.getElementById('alert-nav-next');
+                                        if (nextBtn) nextBtn.onclick = alertNavNext;
+
+                                        // Close overlay when clicking outside the detail box
+                                        var overlay = document.getElementById('alert-detail-overlay');
+                                        if (overlay) {
+                                            overlay.onclick = function(e) {
+                                                if (e.target === overlay) closeAlertDetail();
+                                            };
+                                        }
+                                    })();
+
                                     // Notify Python that map is fully initialized
                                     console.log('[Map Init] Notifying Python that map is ready');
                                     try {
@@ -9135,8 +9369,9 @@ class TCPConnectionViewer(QMainWindow):
                         if item is not None:
                             item.setForeground(Qt.red)
 
-                    self.setStyleSheet("border: 2px solid red;") # Set window border to red
-                
+                    # Trigger blinking on the Alerts tab
+                    self._start_alerts_tab_blink()
+
                 connections_to_show_on_map.append(conn)
 
         self.connection_table.setUpdatesEnabled(True)

@@ -80,6 +80,68 @@ Markers are clickable for details; the map can be panned and zoomed freely.
 
 ---
 
+## IPAnalyzer -- IP reputation analysis
+
+IPAnalyzer is a built-in plugin framework that checks every remote IP observed in live connections against one or more reputation / blocklist backends. Results feed directly into the **Alerts** pane, the map, and the connection table.
+
+### Enabling IPAnalyzer
+
+1. Open **Settings** and tick the **Enable IP Analyze** checkbox.
+2. Optionally tick **Show latest alerts on map** (enabled by default) to display the 10 most recent alerts in a floating panel on the map. Each entry is clickable and opens a detail overlay with navigation arrows.
+
+### How alerts work
+
+* When a plugin reports a suspicious IP (`found = True`) or a plugin failure (`status = False`), an alert is created.
+* All alerts are accumulated across the entire session and shown in the **Alerts** tab, sorted by time (newest first). The table supports the same column filtering and sorting as the main connection table.
+* When new alerts arrive the **Alerts** tab blinks red briefly and its title shows the total count, e.g. **Alerts (5)**.
+* If **Show latest alerts on map** is enabled, the top 10 latest alerts are rendered in a translucent panel on the map. Clicking an entry opens a detail overlay with ◀/▶ navigation and a ✕ close button.
+
+### Plugin result contract
+
+Every plugin returns an `IPAnalyzeResult` with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `found` | `bool` | `True` if the IP was flagged as suspicious. |
+| `status` | `bool` | `True` on success, `False` if the plugin itself failed (timeout, misconfiguration, etc.). |
+| `additional_information` | `str` | Human-readable detail -- match source on a hit, or error description on failure. |
+
+A plugin failure (`status = False`) is surfaced as an alert so operators always know when a reputation check could not complete.
+
+### Built-in IPAnalyzer plugins
+
+The plugin registry is stored in `ipanalyze.json`. Each plugin can be enabled or disabled individually in Settings.
+
+#### HTTP Text / CSV Blocklist (`http_text_csv_plugin`)
+
+Downloads one or more remote text or CSV blocklists over HTTP(S), parses them into an IP set, and checks each observed IP against the cached set. Sources are fetched in parallel using a thread pool and cached for the configured TTL to avoid redundant downloads.
+
+* **Settings:** list of blocklist URLs, cache TTL, request timeout.
+* **Typical use:** community-maintained IP blocklists such as abuse.ch, Emerging Threats, or custom internal feeds.
+
+#### Pi-hole DNS Lookup (`pihole_plugin`)
+
+Queries a Pi-hole DNS resolver to determine whether a remote IP (via PTR lookup) resolves to a domain that Pi-hole has blocked. Useful when Pi-hole is already part of your network and you want its block decisions reflected in the map.
+
+* **Settings:** Pi-hole DNS server address, port, query timeout.
+* **Requires:** a reachable Pi-hole instance on the network.
+
+#### Developer Test Plugin (`dev_test_plugin`)
+
+A diagnostic plugin designed to exercise the alert and UI pipelines without depending on external services. Its behaviour is controlled by a single **Simulate failure** dropdown:
+
+| Mode | Behaviour |
+|------|-----------|
+| **Disabled** *(default)* | Returns no suspicious IP, success. |
+| **Return suspicious IP found** | Returns `found = True` with success. |
+| **Return plugin Failed** | Returns `status = False` with `"Failed on purpose"`. |
+| **Loop through all modes** | Cycles through the three modes above on each call, then repeats. |
+| **Random** | Most calls succeed normally; a configurable **failure rate** (1 – 100 %, default 1 %) determines how often the plugin alternates between returning a suspicious hit and a simulated failure. The rate is persisted in `dev_test_plugin.json`. |
+
+> **Tip:** Use the Developer Test Plugin to verify that alerts appear correctly in the Alerts pane, on the map panel, and that the tab blink / count badge update as expected.
+
+---
+
 ## Features overview
 
 - **Live geo-mapping** -- remote IP locations resolved via MaxMind GeoLite2 plotted on OpenStreetMap at every refresh.
@@ -92,6 +154,7 @@ Markers are clickable for details; the map can be panned and zoomed freely.
 - **Right-click actions** -- per-row context menu to launch Sysinternals Process Monitor (Windows), create process dumps (Windows/Linux), and copy connection details.
 - **Persistent UI state** -- window geometry, settings, column widths, column order, and map position/zoom are all saved to `settings.json` automatically.
 - **Full-screen mode** -- press `F11` to toggle; the map can be expanded to fill the entire window using the two resizable splitters.
+- **IPAnalyzer plugin framework** -- extensible IP reputation analysis with built-in blocklist, Pi-hole, and developer-test plugins; results surface as alerts in a dedicated pane and on the map.
 - **Extensible collector API** -- drop a new `ConnectionCollectorPlugin` subclass into the `plugins/` directory and it appears automatically in the Settings collector combo.
 - **Headless agent mode** -- run as a background agent with no window using `--no_ui` combined with `--enable_agent_mode`.
 
