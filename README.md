@@ -2,8 +2,6 @@
 
 A Python desktop tool that enumerates active TCP and UDP connections per process, resolves geolocation via MaxMind GeoLite2, and displays them on a live Leaflet/OpenStreetMap in a PySide6 Qt GUI. Connection snapshots are collected on a configurable timer, stored in a FIFO replay buffer, and can be replayed at any time using the built-in timeline slider.
 
-> **Warning C2-Tracker notice:** The C2 threat-intelligence check feature (`do_c2_check`) relied on the [montysecurity/C2-Tracker](https://github.com/montysecurity/C2-Tracker) feed. That repository is now **archived and no longer maintained**, meaning no new threat data is available and existing data is stale. The feature remains in the codebase for reference but is **disabled by default** and should not be relied upon for security decisions.
-
 ---
 
 ## Why use tcp_geo_map.py?
@@ -75,7 +73,7 @@ You may need to add a firewall rule to allow inbound TCP on the Flask port.
 |--------|---------|
 | Green | Connection present since the last refresh |
 | Blue | New connection observed this refresh cycle |
-| Red | Public exit-point circle; or a C2-Tracker match *(feature deprecated -- see notice above)* |
+| Red | Public exit-point circle; or a suspicious IP flagged by IPAnalyze |
 | Yellow | Currently selected connection |
 
 Markers are clickable for details; the map can be panned and zoomed freely.
@@ -153,7 +151,6 @@ Usage: python tcp_geo_map.py [OPTIONS]
       to be downloaded and refreshed on startup without prompting. By passing
       this flag you confirm you have read and agree to all licensing terms
       listed in the Contributors & Attribution section.
-      Note: C2-Tracker is no longer downloaded -- that repository is archived.
 
   --enable_server_mode
       Start in server mode. A Flask endpoint is started on the configured
@@ -216,11 +213,6 @@ Marker icons from [leaflet-color-markers](https://github.com/pointhi/leaflet-col
 ### ipify.com
 
 Provides the public IP address lookup when **Resolve public internet IP using ipify.com** is enabled.
-
-### C2-Tracker (archived -- data no longer available)
-
-C2 Tracker was a community-driven IOC feed of suspected malware/botnet/C2 IP addresses maintained by [montysecurity](https://github.com/montysecurity/C2-Tracker).
-**The repository is now archived and no longer updated. No new data will be downloaded.** The C2 check setting (`do_c2_check`) remains in the codebase but is disabled by default and carries no security value.
 
 ### procmon-parser
 
@@ -289,7 +281,6 @@ All settings are persisted in `settings.json` (same directory as the script) and
 | `do_reverse_dns` | boolean | `true` | Perform async reverse DNS lookups on remote IPs. Results populate the **Name** column and map marker pop-ups. |
 | `do_resolve_public_ip` | boolean | `true` | Periodically query [ipify.org](https://api.ipify.org) for the machine's public exit IP and plot it on the map as a red circle. Result is cached for 60 seconds. |
 | `do_pulse_exit_points` | boolean | `true` | Animate a pulsing ring on agent/server exit-point circles on the map. |
-| `do_c2_check` | boolean | `false` | **Deprecated -- no data available.** Compare remote IPs against the C2-Tracker database. The upstream repository is **archived** and no longer updated. This setting has no practical security value and should remain disabled. |
 
 ---
 
@@ -360,8 +351,6 @@ All settings are persisted in `settings.json` (same directory as the script) and
 Pass `--accept_eula` to suppress the GeoLite2 EULA prompt and allow automatic database downloads and refreshes without prompting. By passing this flag you confirm you have read and agree to all licensing terms listed in the Contributors & Attribution section above (MaxMind GeoLite2, OpenStreetMap/Leaflet, leaflet-color-markers).
 
 When `--accept_eula` is passed the Leaflet resource cache (`resources/leaflet/`) is also populated automatically on first run to speed up subsequent startups and reduce external requests.
-
-> **Note:** C2-Tracker is no longer downloaded (automatically or otherwise) because the upstream repository is archived and no longer provides current data.
 
 ---
 

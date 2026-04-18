@@ -1,0 +1,10 @@
+[
+  {
+    "module": "http_text_csv_plugin",
+    "enabled": false
+  },
+  {
+    "module": "pihole_plugin",
+    "enabled": true
+  }
+]

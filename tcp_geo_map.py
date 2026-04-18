@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.7.9" # Current script version
+VERSION = "3.8.0" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -166,7 +166,6 @@ SCREENSHOTS_DIR = "screen_captures"  # Screenshot directory for captured map ima
 
 IPV4_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv4.mmdb")
 IPV6_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv6.mmdb")
-C2_TRACKER_DB_PATH = os.path.join(DB_DIR, "all.txt")
 SETTINGS_FILE_NAME = "settings.json"
 
 # Default logging level — overridden at startup by loggingLevel in settings.json
@@ -214,7 +213,7 @@ _load_logging_level_from_settings()
 
 """ 
     You can pass --accept_eula as a startup parametter to the script to automate download and refresh 
-    the Geolite and c2 tracker databases howver this means you fully agree to their licensing terms
+    the Geolite databases however this means you fully agree to their licensing terms
 """
 # ---------------------------------------------------------------------------
 # Help / usage — must be checked before any other sys.argv processing so that
@@ -227,7 +226,7 @@ Usage: python tcp_geo_map.py [OPTIONS]
 
 Options:
   --accept_eula
-      Automatically accept the EULA for the GeoLite2 and C2-Tracker databases
+      Automatically accept the EULA for the GeoLite2 databases
       and allow them to be downloaded/refreshed on startup. By passing this
       flag you confirm that you have read and agree to their respective
       licensing terms.
@@ -280,12 +279,8 @@ MAP_TABLE_MIN_WIDTH = 800
 MAP_TABLE_MIN_HEIGHT = 500
 GEOLITE2_IPV4_DOWNLOAD_URL = "https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-city-mmdb/geolite2-city-ipv4.mmdb"
 GEOLITE2_IPV6_DOWNLOAD_URL = "https://cdn.jsdelivr.net/npm/@ip-location-db/geolite2-city-mmdb/geolite2-city-ipv6.mmdb"
-C2_TRACKER_DB_DOWNLOAD_URL = "https://github.com//montysecurity/C2-Tracker/raw/refs/heads/main/data/all.txt"
-C2_TRACKER_HEADER = "C2-TRACKER LIST: "
 GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TITLE = GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TITLE = "About GeoLite2 IPv4 Database"
 GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT = GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT= f"GeoLite2 is created by MaxMind. Please carefully read the GeoLite2 GEOLITE2_LICENSE and GEOLITE2_EULA license files available at https://github.com/sapics/ip-location-db/tree/main/geolite2-city if you use these database.\n\n This package comes with certain restrictions and obligations, most notably:\n\n- You cannot prevent the library from updating the databases..\n\n- You cannot use the GeoLite2 data: \n\n   * for FCRA purposes, \n\n   * to identify specific households or individuals."
-C2_TRACKER_DB_DOWNLOAD_ABOUT_TITLE = "C2-TRACKER Database"
-C2_TRACKER_DB_DOWNLOAD_ABOUT_TEXT = f"C2 Tracker is a free-to-use-community-driven IOC feed that uses Shodan and Censys searches to collect IP addresses of known malware/botnet/C2 infrastructure. Check out: https://github.com/montysecurity/C2-Tracker"
 
 # OpenStreetMap tile server configuration
 TILE_OPENSTREETMAP_SERVER = "tile.openstreetmap.org"
@@ -323,7 +318,7 @@ LEAFLET_RESOURCES_ABOUT_TEXT = """Leaflet is an open-source JavaScript library f
 HOSTNAME_ROW_INDEX = 0    # Index of the 'Hostname' column in the table
 PROCESS_ROW_INDEX = 1     # Index of the 'Process' column in the table
 PID_ROW_INDEX = 2         # Index of the 'PID' column in the table
-SUSPECT_ROW_INDEX = 3     # Index of the 'Suspect' column in the table
+SUSPECT_ROW_INDEX = 3     # Index of the 'IPAnalyzer' column in the table
 PROTOCOL_ROW_INDEX = 4    # Index of the 'Protocol' column in the table (TCP/UDP)
 LOCAL_ADDRESS_ROW_INDEX = 5    # Index of the 'Local Address' column in the table
 LOCAL_PORT_ROW_INDEX = 6      # Index of the 'Local Port' column in the table
@@ -337,7 +332,7 @@ LOCATION_LON_ROW_INDEX = 13  # Index of the 'Location' column in the table
 BYTES_SENT_ROW_INDEX = 14    # Index of the 'Sent' column in the table
 BYTES_RECV_ROW_INDEX = 15    # Index of the 'Recv' column in the table
 PID_COLUMN_SIZE = 60
-SUSPECT_COLUMN_SIZE = 30
+SUSPECT_COLUMN_SIZE = 75
 PROTOCOL_COLUMN_SIZE = 55
 PORTS_COLUMN_SIZE = 70
 IP_TYPE_COLUMN_SIZE = 20
@@ -360,7 +355,7 @@ do_reverse_dns = True  # Set to False to disable reverse DNS lookups
 do_resolve_public_ip = True  # Set to True to resolve public IP addresses to hostnames (may slow down refresh)
 do_pulse_exit_points = True  # Set to True to animate a pulsing ring on agent/server exit-point circles
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
-do_c2_check = False
+do_ipanalyze = False  # Master on/off toggle for the IPAnalyze plugin framework
 do_always_supplement_psutil_with_netstat_when_available = True  # When True, psutil connection data is always supplemented with netstat to catch any connections psutil may miss
 _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
 do_capture_screenshots = False  # Set to True to capture screenshots of the map to disk
@@ -376,7 +371,7 @@ summary_table_column_order: list = []     # Visual column order for the summary 
 conn_table_column_widths: list = []       # Persisted per-column widths for the main connection table
 summary_table_column_widths: list = []    # Persisted per-column widths for the summary table
 # Default summary table column order: Count (logical 10) moved to the last visual position.
-# Columns: Hostname(0) Process(1) PID(2) C2(3) Protocol(4) LocalAddr(5) RemoteAddr(6)
+# Columns: Hostname(0) Process(1) PID(2) IPAnalyzer(3) Protocol(4) LocalAddr(5) RemoteAddr(6)
 #          Type(7) Way(8) Name(9) Sent(11) Recv(12) Count(10)
 SUMMARY_TABLE_DEFAULT_COLUMN_ORDER: list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 10]
 USE_LOCAL_LEAFLET_FALLBACK = True  # allow using local resources when CDN fails
@@ -1174,7 +1169,7 @@ def _discover_collector_plugins():
 class TCPConnectionViewer(QMainWindow):
     # Colors available for agent assignment (round-robin).
     # Excluded colors (reserved by the local-host UI):
-    #   blue   = new connections,   red    = suspect/C2,
+    #   blue   = new connections,   red    = suspect/IPAnalyze,
     #   yellow = pinned marker,     gold   = too similar to yellow.
     # green is included but reserved as the default for the local server.
     _AGENT_COLOR_PALETTE = ['green', 'gold', 'yellow', 'orange', 'violet', 'black', 'grey']
@@ -1211,9 +1206,10 @@ class TCPConnectionViewer(QMainWindow):
         # Initialize database readers
         self.reader_ipv4 = None
         self.reader_ipv6 = None
-        self.reader_c2_tracker = None
-        self.reader_c2_tracker_set = None  # Fast O(1) lookup set
+        # IPAnalyze plugin framework
+        self._ipanalyze_plugins = []  # List[IPAnalyzePlugin] loaded from registry
         self._geo_cache = {}  # (ip_address, ip_type) -> (lat, lng) — avoids repeated maxminddb lookups
+        self._current_alerts = []  # alerts from the most recent collection cycle
         self.connections = []
         self._last_map_connections = []  # fully-processed connections for map re-renders
         self._async_collection_in_progress = False  # guard: only one background collection at a time
@@ -1359,6 +1355,9 @@ class TCPConnectionViewer(QMainWindow):
 
         self.init_ui()
 
+        # Flag: live capture timer start is deferred until _verify_map_ready succeeds
+        self._capture_start_pending = False
+
         # Apply UI-dependent settings after UI is created
         self._apply_settings_to_ui()
 
@@ -1414,9 +1413,12 @@ class TCPConnectionViewer(QMainWindow):
             _last_idx = max(0, _n - 1)
             QTimer.singleShot(0, lambda: self.refresh_connections(slider_position=_last_idx))
         else:
-            self.timer.start(map_refresh_interval)  # Refresh every 5 seconds
-            # Start wave animation on stop button (since capture starts automatically)
-            self._start_stop_button_wave()
+            # Do NOT start capture timer immediately — defer until the map is
+            # fully initialised (verified by _verify_map_ready) to avoid
+            # Qt/WebEngine crashes when refresh_connections calls into JS
+            # before the Chromium compositor is ready.
+            self._capture_start_pending = True
+            logging.info("Capture start deferred until map is fully initialized")
 
         # Set up cleanup timer for public IP DNS attempt cache
         self.public_ip_dns_cache_cleanup_timer = QTimer(self)
@@ -1437,6 +1439,12 @@ class TCPConnectionViewer(QMainWindow):
             if is_ready:
                 logging.info("Map verified as ready - window.map exists and has required methods")
                 self.map_initialized = True
+                # If live capture was deferred until the map was ready, start it now
+                if getattr(self, '_capture_start_pending', False):
+                    self._capture_start_pending = False
+                    logging.info("Map ready — starting deferred live capture")
+                    self.timer.start(map_refresh_interval)
+                    self._start_stop_button_wave()
             else:
                 logging.warning("Map not ready yet - retrying in 500ms")
                 # Retry a few times
@@ -1805,11 +1813,11 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size,do_c2_check, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name, do_warn_npcap_not_installed
+        global max_connection_list_filo_buffer_size, do_ipanalyze, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name, do_warn_npcap_not_installed
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
-            'do_c2_check' : do_c2_check,
+            'do_ipanalyze' : do_ipanalyze,
             'do_always_supplement_psutil_with_netstat_when_available': do_always_supplement_psutil_with_netstat_when_available,
             'show_only_new_active_connections': show_only_new_active_connections,
             'show_only_remote_connections': show_only_remote_connections,
@@ -1917,7 +1925,7 @@ class TCPConnectionViewer(QMainWindow):
                 settings = json.load(f)
 
                 # Apply loaded settings to global variables
-                global max_connection_list_filo_buffer_size, do_c2_check, show_only_new_active_connections
+                global max_connection_list_filo_buffer_size, do_ipanalyze, show_only_new_active_connections
                 global show_only_remote_connections, do_reverse_dns, map_refresh_interval
                 global table_column_sort_index, table_column_sort_reverse
                 global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously
@@ -1932,8 +1940,7 @@ class TCPConnectionViewer(QMainWindow):
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
-                #do_c2_check = settings.get('do_c2_check', do_c2_check)
-                do_c2_check = False
+                do_ipanalyze = settings.get('do_ipanalyze', do_ipanalyze)
                 do_always_supplement_psutil_with_netstat_when_available = settings.get('do_always_supplement_psutil_with_netstat_when_available', do_always_supplement_psutil_with_netstat_when_available)
                 _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
                 show_only_new_active_connections = settings.get('show_only_new_active_connections', show_only_new_active_connections)
@@ -2175,7 +2182,9 @@ class TCPConnectionViewer(QMainWindow):
                 self.only_show_new_connections.setChecked(show_only_new_active_connections)
                 self.only_show_remote_connections.setChecked(show_only_remote_connections)
                 self.reverse_dns_check.setChecked(do_reverse_dns)
-                self.c2_check.setChecked(do_c2_check)
+                if hasattr(self, 'ipanalyze_check'):
+                    self.ipanalyze_check.setChecked(do_ipanalyze)
+                    self._toggle_ipanalyze_ui(do_ipanalyze)
                 self.resolve_public_ip.setChecked(do_resolve_public_ip)
                 self.pulse_exit_points_check.setChecked(do_pulse_exit_points)
                 self.capture_screenshots_check.setChecked(do_capture_screenshots)
@@ -4779,22 +4788,115 @@ class TCPConnectionViewer(QMainWindow):
         self.save_settings()
 
     @Slot()
-    def update_c2_check(self):
-        global do_c2_check
-
-        do_c2_check = False
-        self.c2_check.setChecked(False)
-        #C2-Tracker is now archived and no longer maintained, so this setting is effectively deprecated.  We keep it in the UI for now in case users still want to toggle the (now static) C2 check on/off, but it no longer has any functional impact on the app's behavior.
-
-        # new_state = self.c2_check.isChecked()
-        # if new_state == True:
-        #     do_c2_check = True
-        # else:
-        #     do_c2_check = False
-        #     self.setStyleSheet("") # Reset any previous styles
-
-        self.refresh_connections()
+    def _on_ipanalyze_toggled(self):
+        """Toggle the IPAnalyze plugin framework on/off."""
+        global do_ipanalyze
+        do_ipanalyze = self.ipanalyze_check.isChecked()
+        self._toggle_ipanalyze_ui(do_ipanalyze)
+        if do_ipanalyze:
+            self._load_ipanalyze_plugins()
         self.save_settings()
+
+    def _toggle_ipanalyze_ui(self, enabled):
+        """Show or hide the IPAnalyze plugin table in the Settings pane and Alerts tab."""
+        if hasattr(self, '_ipanalyze_plugin_group'):
+            self._ipanalyze_plugin_group.setVisible(enabled)
+        if hasattr(self, '_alerts_tab_index'):
+            self.tab_widget.setTabVisible(self._alerts_tab_index, enabled)
+
+    def _load_ipanalyze_plugins(self):
+        """(Re-)load plugins from ipanalyze.json and refresh the settings table."""
+        try:
+            from ipanalyze import load_registry
+            self._ipanalyze_plugins = load_registry()
+        except Exception as exc:
+            logging.error("IPAnalyze: failed to load plugins: %s", exc)
+            self._ipanalyze_plugins = []
+        self._refresh_ipanalyze_plugin_table()
+
+    def _update_alerts_table(self):
+        """Populate the Alerts tab table from self._current_alerts (newest first)."""
+        if not hasattr(self, 'alerts_table'):
+            return
+        try:
+            alerts = list(reversed(self._current_alerts)) if self._current_alerts else []
+            self.alerts_table.setUpdatesEnabled(False)
+            self.alerts_table.setRowCount(0)
+            for alert in alerts:
+                row = self.alerts_table.rowCount()
+                self.alerts_table.insertRow(row)
+                values = [
+                    alert.get('datetime', ''),
+                    alert.get('hostname', ''),
+                    alert.get('plugin', ''),
+                    alert.get('additional_info', ''),
+                    alert.get('process', ''),
+                    alert.get('pid', ''),
+                    alert.get('protocol', ''),
+                    alert.get('local', ''),
+                    alert.get('localport', ''),
+                    alert.get('remote', ''),
+                    alert.get('remoteport', ''),
+                    alert.get('ip_type', ''),
+                    alert.get('way', ''),
+                    alert.get('name', ''),
+                ]
+                for col, val in enumerate(values):
+                    item = QTableWidgetItem(str(val))
+                    item.setForeground(Qt.red)
+                    self.alerts_table.setItem(row, col, item)
+            self.alerts_table.setUpdatesEnabled(True)
+        except Exception as e:
+            logging.error(f"Error updating alerts table: {e}")
+
+    def _refresh_ipanalyze_plugin_table(self):
+        """Rebuild the IPAnalyze plugin table in Settings from the loaded plugin list."""
+        if not hasattr(self, '_ipanalyze_plugin_table'):
+            return
+        tbl = self._ipanalyze_plugin_table
+        tbl.setUpdatesEnabled(False)
+        tbl.setRowCount(0)
+        for plugin in self._ipanalyze_plugins:
+            row = tbl.rowCount()
+            tbl.insertRow(row)
+            # Column 0: plugin name
+            tbl.setItem(row, 0, QTableWidgetItem(plugin.name))
+            # Column 1: enabled checkbox
+            chk = QCheckBox()
+            chk.setChecked(getattr(plugin, '_enabled', False))
+            chk.stateChanged.connect(lambda state, p=plugin: self._on_ipanalyze_plugin_enabled(p, state))
+            cell_widget = QWidget()
+            cell_layout = QHBoxLayout(cell_widget)
+            cell_layout.addWidget(chk)
+            cell_layout.setAlignment(Qt.AlignCenter)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            tbl.setCellWidget(row, 1, cell_widget)
+            # Column 2: Settings button
+            btn = QPushButton("Settings")
+            btn.clicked.connect(lambda checked=False, p=plugin: self._on_ipanalyze_plugin_settings(p))
+            tbl.setCellWidget(row, 2, btn)
+        tbl.setUpdatesEnabled(True)
+        # Resize the table height to exactly fit its header + all rows
+        header_h = tbl.horizontalHeader().height()
+        row_h = tbl.rowHeight(0) if tbl.rowCount() > 0 else 30
+        tbl.setFixedHeight(header_h + row_h * tbl.rowCount() + 4)
+
+    def _on_ipanalyze_plugin_enabled(self, plugin, state):
+        """Enable/disable an IPAnalyze plugin and persist the registry."""
+        plugin._enabled = bool(state)
+        try:
+            from ipanalyze import save_registry
+            save_registry(self._ipanalyze_plugins)
+        except Exception as exc:
+            logging.error("IPAnalyze: failed to save registry: %s", exc)
+
+    def _on_ipanalyze_plugin_settings(self, plugin):
+        """Delegate settings UI entirely to the plugin's own dialog."""
+        try:
+            plugin.show_settings_dialog(self)
+        except Exception as exc:
+            logging.error("IPAnalyze: settings dialog failed for %s: %s", plugin.name, exc)
+            QMessageBox.warning(self, plugin.name, f"Failed to open settings: {exc}")
 
     @Slot()
     def only_show_new_connections_changed(self):
@@ -5156,7 +5258,7 @@ class TCPConnectionViewer(QMainWindow):
         # Connection table
         self.connection_table = QTableWidget(0, BYTES_RECV_ROW_INDEX+1)
         self._conn_table_base_headers = [
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Way", "Loc lat", "Loc lon", "Sent", "Recv"
+            "Hostname", "Process", "PID", "IPAnalyzer", "Protocol", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "Name", "IP Type", "Way", "Loc lat", "Loc lon", "Sent", "Recv"
         ]
         self.connection_table.setHorizontalHeaderLabels(self._conn_table_base_headers)
 
@@ -5170,7 +5272,7 @@ class TCPConnectionViewer(QMainWindow):
         self.connection_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.connection_table.customContextMenuRequested.connect(self.on_connection_table_context_menu)
 
-        # Ensure header is interactive and enforce a minimum width for the "C2" column (index = SUSPECT_ROW_INDEX)
+        # Ensure header is interactive and enforce a minimum width for the "IPAnalyzer" column (index = SUSPECT_ROW_INDEX)
         self.connection_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
 
         self.connection_table.setColumnWidth(PID_ROW_INDEX, PID_COLUMN_SIZE)
@@ -5185,7 +5287,7 @@ class TCPConnectionViewer(QMainWindow):
 
         # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
         _filter_placeholders = [
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Addr", "Local Port",
+            "Hostname", "Process", "PID", "IPAnalyzer", "Protocol", "Local Addr", "Local Port",
             "Remote Addr", "Remote Port", "Name", "IP Type", "Way", "Lat", "Lon", "Sent", "Recv"
         ]
         self._connection_filter_inner = QWidget()
@@ -5364,7 +5466,7 @@ class TCPConnectionViewer(QMainWindow):
         # Create summary table with 12 columns
         self.summary_table = QTableWidget(0, 13)
         self._summary_table_base_headers = [
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Way", "Name", "Count", "Sent", "Recv"
+            "Hostname", "Process", "PID", "IPAnalyzer", "Protocol", "Local Address", "Remote Address", "Type", "Way", "Name", "Count", "Sent", "Recv"
         ]
         self.summary_table.setHorizontalHeaderLabels(self._summary_table_base_headers)
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -5379,7 +5481,7 @@ class TCPConnectionViewer(QMainWindow):
 
         # Per-column filter bar — one QLineEdit per column, scrolls in sync with the table
         _summary_filter_placeholders = [
-            "Hostname", "Process", "PID", "C2", "Protocol", "Local Address", "Remote Address", "Type", "Way", "Name", "Count", "Sent", "Recv"
+            "Hostname", "Process", "PID", "IPAnalyzer", "Protocol", "Local Address", "Remote Address", "Type", "Way", "Name", "Count", "Sent", "Recv"
         ]
         self._summary_filter_inner = QWidget()
         _summary_filter_inner_layout = QHBoxLayout(self._summary_filter_inner)
@@ -5453,16 +5555,36 @@ class TCPConnectionViewer(QMainWindow):
         settings_tab_layout.addWidget(self.reverse_dns_check)    
         self.reverse_dns_check.stateChanged.connect(self.update_reverse_dns)
 
-        # C2 Check checkbox
-        self.c2_check = QCheckBox("Perform C2 checks against C2-TRACKER database")
-        self.c2_check.setVisible(False)
-        self.c2_check.setToolTip(
-            "https://github.com/montysecurity/C2-Tracker project is now archived and no data is available.\n"
-            "This functionality is no more available until a new feed can be sourced."
-            )
-        self.c2_check.setChecked(False)
-        settings_tab_layout.addWidget(self.c2_check)    
-        #self.c2_check.stateChanged.connect(self.update_c2_check)
+        # IPAnalyze toggle checkbox (replaces deprecated C2-Tracker checkbox)
+        self.ipanalyze_check = QCheckBox("Enable IPAnalyze plugin framework")
+        self.ipanalyze_check.setToolTip(
+            "When enabled, all captured remote IP addresses are checked against\n"
+            "registered IPAnalyze plugins (e.g. blocklist feeds, Pi-hole DNS).\n"
+            "Flagged connections appear red on the map and in the connection table."
+        )
+        self.ipanalyze_check.setChecked(do_ipanalyze)
+        settings_tab_layout.addWidget(self.ipanalyze_check)
+        self.ipanalyze_check.stateChanged.connect(self._on_ipanalyze_toggled)
+
+        # IPAnalyze plugin management group (visible only when enabled)
+        self._ipanalyze_plugin_group = QGroupBox("IPAnalyze Plugins")
+        _ip_plugin_layout = QVBoxLayout(self._ipanalyze_plugin_group)
+        self._ipanalyze_plugin_table = QTableWidget(0, 3)
+        self._ipanalyze_plugin_table.setHorizontalHeaderLabels(["Plugin", "Enabled", ""])
+        self._ipanalyze_plugin_table.horizontalHeader().setStretchLastSection(True)
+        self._ipanalyze_plugin_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._ipanalyze_plugin_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._ipanalyze_plugin_table.setColumnWidth(0, 200)
+        self._ipanalyze_plugin_table.setColumnWidth(1, 70)
+        self._ipanalyze_plugin_table.setSizeAdjustPolicy(QTableWidget.AdjustToContents)
+        self._ipanalyze_plugin_table.setMinimumHeight(80)
+        self._ipanalyze_plugin_table.setMaximumHeight(16777215)  # no cap — fits all plugins
+        _ip_plugin_layout.addWidget(self._ipanalyze_plugin_table)
+        settings_tab_layout.addWidget(self._ipanalyze_plugin_group)
+        self._ipanalyze_plugin_group.setVisible(do_ipanalyze)
+        # Load plugins if IPAnalyze is already enabled at startup
+        if do_ipanalyze:
+            self._load_ipanalyze_plugins()
         
 
         # Only show new connections
@@ -5800,6 +5922,35 @@ class TCPConnectionViewer(QMainWindow):
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(main_tab_widget, "Main")
         self.tab_widget.addTab(summary_tab_widget, "Summary")
+
+        # --- Alerts tab (visible only when IPAnalyze is enabled) ---
+        alerts_tab_widget = QWidget()
+        alerts_tab_layout = QVBoxLayout(alerts_tab_widget)
+        alerts_tab_layout.setContentsMargins(10, 10, 10, 10)
+        alerts_tab_layout.setSpacing(6)
+
+        alerts_title = QLabel("IPAnalyze Alerts")
+        alerts_title.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        alerts_tab_layout.addWidget(alerts_title)
+
+        self._alerts_table_headers = [
+            "Time", "Agent", "Plugin", "Additional Info", "Process", "PID",
+            "Protocol", "Local", "Local Port", "Remote", "Remote Port",
+            "IP Type", "Way", "Name",
+        ]
+        self.alerts_table = QTableWidget(0, len(self._alerts_table_headers))
+        self.alerts_table.setHorizontalHeaderLabels(self._alerts_table_headers)
+        self.alerts_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.alerts_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.alerts_table.horizontalHeader().setStretchLastSection(True)
+        self.alerts_table.verticalHeader().setVisible(False)
+        self.alerts_table.setSelectionMode(QTableWidget.SingleSelection)
+        alerts_tab_layout.addWidget(self.alerts_table)
+
+        self.tab_widget.addTab(alerts_tab_widget, "Alerts")
+        self._alerts_tab_index = self.tab_widget.count() - 1
+        self.tab_widget.setTabVisible(self._alerts_tab_index, do_ipanalyze)
+
         self.tab_widget.addTab(actions_tab_widget, "Actions")
         self.tab_widget.addTab(settings_tab_widget, "Settings")
 
@@ -5876,7 +6027,7 @@ class TCPConnectionViewer(QMainWindow):
             db_entries = [
                 ("GeoLite2 IPv4", IPV4_DB_PATH, GEOLITE2_IPV4_DOWNLOAD_URL),
                 ("GeoLite2 IPv6", IPV6_DB_PATH, GEOLITE2_IPV6_DOWNLOAD_URL),
-                #("C2 Tracker",    C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
+
             ]
 
             self.db_status_table.setRowCount(0)
@@ -5931,21 +6082,7 @@ class TCPConnectionViewer(QMainWindow):
                         self.reader_ipv6.close()
                     self.reader_ipv6 = maxminddb.open_database(IPV6_DB_PATH)
                     self._geo_cache.clear()
-                elif db_path == C2_TRACKER_DB_PATH:
-                    self.reader_c2_tracker = {}
-                    self.reader_c2_tracker_set = set()
-                    if os.path.exists(C2_TRACKER_DB_PATH):
-                        with open(C2_TRACKER_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
-                            for line in f:
-                                line = line.strip()
-                                if not line or line.startswith("#"):
-                                    continue
-                                parts = line.split("\t")
-                                ip = parts[0]
-                                self.reader_c2_tracker_set.add(ip)
-                                typ = parts[1] if len(parts) > 1 else ""
-                                info = parts[2] if len(parts) > 2 else ""
-                                self.reader_c2_tracker[ip] = (typ, info)
+
             except Exception as reload_err:
                 logging.error(f"Failed to reload database {db_path}: {reload_err}")
                 QMessageBox.warning(self, "Reload Error", f"Database downloaded but failed to reload: {reload_err}")
@@ -5965,7 +6102,6 @@ class TCPConnectionViewer(QMainWindow):
         db_entries = [
             (IPV4_DB_PATH, GEOLITE2_IPV4_DOWNLOAD_URL),
             (IPV6_DB_PATH, GEOLITE2_IPV6_DOWNLOAD_URL),
-            (C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
         ]
         was_capturing = hasattr(self, 'timer') and self.timer.isActive()
         if was_capturing:
@@ -5979,7 +6115,7 @@ class TCPConnectionViewer(QMainWindow):
 
     def _is_any_database_expired(self):
         """Return True if any of the tracked databases is missing or older than DATABASE_EXPIRE_AFTER_DAYS."""
-        for db_path in (IPV4_DB_PATH, IPV6_DB_PATH, C2_TRACKER_DB_PATH):
+        for db_path in (IPV4_DB_PATH, IPV6_DB_PATH):
             if not os.path.exists(db_path):
                 return True
             modification_time = os.path.getmtime(db_path)
@@ -6008,7 +6144,6 @@ class TCPConnectionViewer(QMainWindow):
                 for db_path, db_url in [
                     (IPV4_DB_PATH, GEOLITE2_IPV4_DOWNLOAD_URL),
                     (IPV6_DB_PATH, GEOLITE2_IPV6_DOWNLOAD_URL),
-                    (C2_TRACKER_DB_PATH, C2_TRACKER_DB_DOWNLOAD_URL),
                 ]:
                     if not os.path.exists(db_path):
                         self._refresh_single_database(db_path, db_url)
@@ -6042,43 +6177,42 @@ class TCPConnectionViewer(QMainWindow):
             # Check each database file
             self._check_and_download_database(IPV4_DB_PATH, "IPv4", GEOLITE2_IPV4_DOWNLOAD_URL, GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TITLE, GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT)
             self._check_and_download_database(IPV6_DB_PATH, "IPv6", GEOLITE2_IPV6_DOWNLOAD_URL, GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TITLE, GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT)
-            #self._check_and_download_database(C2_TRACKER_DB_PATH, "C2-TRACKER", C2_TRACKER_DB_DOWNLOAD_URL, C2_TRACKER_DB_DOWNLOAD_ABOUT_TITLE, C2_TRACKER_DB_DOWNLOAD_ABOUT_TEXT)
 
             # Open databases
             self.reader_ipv4 = maxminddb.open_database(IPV4_DB_PATH)
             self.reader_ipv6 = maxminddb.open_database(IPV6_DB_PATH)
 
-            # Load C2-TRACKER into both set (fast lookup) and dict (details)
-            # self.reader_c2_tracker = {}
-            # self.reader_c2_tracker_set = set()
-            # if os.path.exists(C2_TRACKER_DB_PATH):
-            #     with open(C2_TRACKER_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            #         for line in f:
-            #             line = line.strip()
-            #             if not line or line.startswith("#"):
-            #                 continue
-            #             parts = line.split("\t")
-            #             ip = parts[0]
-            #             self.reader_c2_tracker_set.add(ip)  # Fast O(1) lookup
-            #             typ = parts[1] if len(parts) > 1 else ""
-            #             info = parts[2] if len(parts) > 2 else ""
-            #             self.reader_c2_tracker[ip] = (typ, info)
-
         except Exception as e:
             QMessageBox.critical(self, "Database Error", f"Failed to load databases: {str(e)}, nothing may show on map.")
     
-    def check_ip_is_present_in_c2_tracker(self, ip_address):
-        """Check if an IP address is present in the C2-TRACKER database (optimized)"""
+    def _run_ipanalyze_check(self, ip_address):
+        """Run all enabled IPAnalyze plugins against *ip_address*.
+
+        Returns a list of :class:`IPAnalyzeResult` where ``found`` is True.
+        Plugins are called concurrently via ``concurrent.futures`` to avoid
+        blocking the collection thread any longer than necessary.
+        """
+        enabled_plugins = [p for p in self._ipanalyze_plugins if getattr(p, '_enabled', False)]
+        if not enabled_plugins:
+            return []
+
+        results = []
         try:
-            # Fast O(1) lookup in set first
-            if self.reader_c2_tracker_set and ip_address in self.reader_c2_tracker_set:
-                # Get details from dict only if found
-                entry = self.reader_c2_tracker.get(ip_address)
-                if entry:
-                    return True, entry[0], entry[1]
-            return False, None, None
-        except Exception:
-            return False, None, None
+            with ThreadPoolExecutor(max_workers=len(enabled_plugins)) as executor:
+                futures = {executor.submit(p.check_ip, ip_address): p for p in enabled_plugins}
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=15)
+                        if result and result.found:
+                            results.append(result)
+                    except Exception as exc:
+                        p = futures[future]
+                        logging.debug("IPAnalyze: plugin %s failed for %s: %s",
+                                      getattr(p, 'name', '?'), ip_address, exc)
+        except Exception as exc:
+            logging.error("IPAnalyze: executor error for %s: %s", ip_address, exc)
+
+        return results
 
     def download_database(self, db_path, url):
         try:
@@ -6309,12 +6443,12 @@ class TCPConnectionViewer(QMainWindow):
 
         Raw connection enumeration is delegated to the active collector plugin
         (default: PsutilCollector).  This method then enriches each raw dict
-        with geolocation, reverse DNS, C2 checks, icon assignment, agent merge,
+        with geolocation, reverse DNS, IPAnalyze checks, icon assignment, agent merge,
         and timeline management.
         """
 
         connections = []
-        c2_connections = []
+        ipanalyze_connections = []  # Connections flagged by IPAnalyze plugins
         global do_capture_screenshots, geo_cache, geo_cache_lock, process_cache, process_cache_lock
 
         # Performance timing
@@ -6324,8 +6458,10 @@ class TCPConnectionViewer(QMainWindow):
         if position_timeline is not None:
             idx = min(position_timeline, len(self.connection_list) - 1)
             if idx >= 0:
+                self._current_alerts = self.connection_list[idx].get('alerts', [])
                 return self.connection_list[idx]['connection_list']
             else:
+                self._current_alerts = []
                 return []
 
         # --- Phase 1: Collect raw connections via the active plugin -----------
@@ -6370,7 +6506,7 @@ class TCPConnectionViewer(QMainWindow):
         # Local references for speed
         reader_ipv4 = self.reader_ipv4
         reader_ipv6 = self.reader_ipv6
-        do_c2 = do_c2_check
+        _do_ipanalyze = do_ipanalyze and bool(self._ipanalyze_plugins)
 
         # Build a set of connection keys from the previous snapshot for O(1)
         # new-connection detection (replaces the old O(n²) is_connection_in_list).
@@ -6391,7 +6527,7 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
-        # --- Phase 3: Enrich each raw connection with geo/DNS/C2/icons -------
+        # --- Phase 3: Enrich each raw connection with geo/DNS/IPAnalyze/icons ---
         # Build a set of (local_addr, local_port, protocol) tuples for LISTEN
         # sockets so we can tag established connections arriving at those ports
         # as "inbound" (rendered with a red line on the map).
@@ -6450,15 +6586,21 @@ class TCPConnectionViewer(QMainWindow):
                             remote_addr = f"{remote_addr}"
                             name = resolved
 
-                    # C2 check
-                    if do_c2 and self.reader_c2_tracker_set is not None:
+                    # IPAnalyze check (replaces legacy C2 check)
+                    if _do_ipanalyze:
                         try:
-                            is_c2, c2_type, c2_info = self.check_ip_is_present_in_c2_tracker(ip_lookup)
-                            if is_c2:
-                                c2_connections.append({
+                            _ip_results = self._run_ipanalyze_check(ip_lookup)
+                            if _ip_results:
+                                _plugin_names = ", ".join(r.plugin_name for r in _ip_results)
+                                _additional = "; ".join(
+                                    f"{r.plugin_name}: {r.additional_information}"
+                                    for r in _ip_results if r.additional_information
+                                )
+                                ipanalyze_connections.append({
                                     'process': process_name,
                                     'pid': pid,
-                                    'suspect': 'Yes',
+                                    'suspect': _plugin_names,
+                                    'suspect_detail': _additional,
                                     'protocol': protocol,
                                     'local': local_addr,
                                     'localport': local_port,
@@ -6516,10 +6658,30 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 continue
 
-        # Merge C2 entries at front if present
-        if c2_connections:
-            c2_connections.extend(connections)
-            connections = c2_connections
+        # Merge IPAnalyze-flagged entries at front if present
+        # Build alerts from flagged connections before merging
+        snap_alerts = []
+        if ipanalyze_connections:
+            alert_ts = datetime.datetime.now()
+            for ac in ipanalyze_connections:
+                snap_alerts.append({
+                    'datetime': alert_ts.strftime('%Y-%m-%d %H:%M:%S'),
+                    'hostname': ac.get('hostname', LOCAL_HOSTNAME),
+                    'plugin': ac.get('suspect', ''),
+                    'additional_info': ac.get('suspect_detail', ''),
+                    'remote': ac.get('remote', ''),
+                    'remoteport': ac.get('remoteport', ''),
+                    'local': ac.get('local', ''),
+                    'localport': ac.get('localport', ''),
+                    'protocol': ac.get('protocol', 'TCP'),
+                    'ip_type': ac.get('ip_type', ''),
+                    'process': ac.get('process', ''),
+                    'pid': ac.get('pid', ''),
+                    'name': ac.get('name', ''),
+                    'way': 'IN' if ac.get('inbound') else 'OUT',
+                })
+            ipanalyze_connections.extend(connections)
+            connections = ipanalyze_connections
 
         # Server mode: drain agent cache and merge remote agent connections
         agent_snapshot = {}
@@ -6557,6 +6719,7 @@ class TCPConnectionViewer(QMainWindow):
                 "datetime": snap_ts,
                 "connection_list": connections,
                 "agent_data": snap_agent,
+                "alerts": snap_alerts,
             }
 
             # append — deque with maxlen auto-evicts the oldest entry
@@ -6587,6 +6750,7 @@ class TCPConnectionViewer(QMainWindow):
             except Exception as e:
                 logging.error(f"Agent POST failed: {e}")
 
+        self._current_alerts = snap_alerts
         return connections
     
     def get_coordinates(self, ip_address, ip_type):
@@ -7191,6 +7355,63 @@ class TCPConnectionViewer(QMainWindow):
                            0%   { transform:translate(-50%,-50%) scale(1);   opacity:0.8; }
                            100% { transform:translate(-50%,-50%) scale(3.5); opacity:0;   }
                        }
+                       /* IPAnalyze alerts summary panel (top-right) */
+                       #alerts-panel {
+                           display:none; position:absolute; top:10px; right:10px; z-index:1000;
+                           width:300px; max-height:320px; overflow-y:auto;
+                           background:rgba(255,255,255,0.93); border:1px solid #cc0000;
+                           border-radius:6px; padding:6px 8px;
+                           font-family:Arial, sans-serif; font-size:11px; color:#333;
+                           box-shadow:0 2px 8px rgba(0,0,0,0.25);
+                       }
+                       #alerts-panel .ap-title {
+                           font-weight:bold; font-size:12px; color:#cc0000; margin-bottom:4px;
+                           border-bottom:1px solid #eee; padding-bottom:3px;
+                       }
+                       #alerts-panel .ap-entry {
+                           padding:3px 4px; cursor:pointer; border-bottom:1px solid #f0f0f0;
+                           transition:background 0.15s;
+                       }
+                       #alerts-panel .ap-entry:hover { background:#fff0f0; }
+                       #alerts-panel .ap-time { color:#888; font-size:10px; }
+                       #alerts-panel .ap-agent { font-weight:bold; }
+                       #alerts-panel .ap-plugin { color:#cc0000; }
+                       /* Alert detail overlay (centered) */
+                       #alert-detail-overlay {
+                           display:none; position:absolute; top:0; left:0; width:100%; height:100%;
+                           z-index:1600; background:rgba(0,0,0,0.45);
+                           justify-content:center; align-items:center;
+                       }
+                       #alert-detail-overlay.active { display:flex; }
+                       #alert-detail-box {
+                           background:#fff; border:2px solid #cc0000; border-radius:10px;
+                           padding:16px 24px; min-width:400px; max-width:600px;
+                           max-height:80vh; overflow-y:auto;
+                           box-shadow:0 4px 24px rgba(0,0,0,0.3);
+                           font-family:Arial, sans-serif; font-size:12px; color:#333;
+                           position:relative;
+                       }
+                       #alert-detail-box .ad-title {
+                           font-size:14px; font-weight:bold; color:#cc0000; margin-bottom:8px;
+                           border-bottom:1px solid #eee; padding-bottom:4px;
+                       }
+                       #alert-detail-box .ad-row { padding:2px 0; }
+                       #alert-detail-box .ad-label { font-weight:bold; display:inline-block; width:120px; }
+                       #alert-detail-nav {
+                           display:flex; justify-content:space-between; align-items:center;
+                           margin-top:10px; padding-top:8px; border-top:1px solid #eee;
+                       }
+                       #alert-detail-nav button {
+                           background:#cc0000; color:#fff; border:none; border-radius:4px;
+                           padding:4px 12px; cursor:pointer; font-size:12px;
+                       }
+                       #alert-detail-nav button:hover { background:#aa0000; }
+                       #alert-detail-nav button:disabled { background:#ccc; cursor:default; }
+                       #alert-detail-close {
+                           position:absolute; top:8px; right:12px; cursor:pointer;
+                           font-size:18px; font-weight:bold; color:#cc0000; line-height:1;
+                       }
+                       #alert-detail-close:hover { color:#aa0000; }
                  </style>
             </head>
             <body>
@@ -7220,6 +7441,22 @@ class TCPConnectionViewer(QMainWindow):
                 <div id="map-datetime">
                     <span id="recording-indicator"></span>
                     <span id="datetime-text"></span>
+                </div>
+                <div id="alerts-panel">
+                    <div class="ap-title">&#9888; IPAnalyze Alerts</div>
+                    <div id="alerts-panel-list"></div>
+                </div>
+                <div id="alert-detail-overlay">
+                    <div id="alert-detail-box">
+                        <span id="alert-detail-close">&times;</span>
+                        <div class="ad-title">Alert Details</div>
+                        <div id="alert-detail-body"></div>
+                        <div id="alert-detail-nav">
+                            <button id="alert-nav-prev">&#9650; Previous</button>
+                            <span id="alert-nav-pos"></span>
+                            <button id="alert-nav-next">&#9660; Next</button>
+                        </div>
+                    </div>
                 </div>
 
                 <script>
@@ -7625,6 +7862,12 @@ class TCPConnectionViewer(QMainWindow):
                                         var isListen = (conn.state === 'LISTEN');
                                         var isInbound = !!conn.inbound;
                                         var html = "<b>" + (conn.process || '') + "</b><br>";
+                                        if (conn.suspect) {
+                                            html += "<span style='background:#d32f2f;color:#fff;padding:1px 6px;border-radius:4px;font-size:11px'>&#9888; " + conn.suspect + "</span><br>";
+                                            if (conn.suspect_detail) {
+                                                html += "<span style='font-size:10px;color:#d32f2f'>" + conn.suspect_detail + "</span><br>";
+                                            }
+                                        }
                                         if (isListen) {
                                             html += "<span style='background:#ff9800;color:#fff;padding:1px 6px;border-radius:4px;font-size:11px'>&#128266; Listening Socket</span><br>";
                                         }
@@ -8583,6 +8826,13 @@ class TCPConnectionViewer(QMainWindow):
             except Exception:
                 pass
 
+            # Refresh the Alerts tab if IPAnalyze is enabled
+            if do_ipanalyze:
+                try:
+                    self._update_alerts_table()
+                except Exception:
+                    pass
+
             # Capture screenshot if enabled (only for live captures, not timeline replay)
             if do_capture_screenshots:
                 try:
@@ -8701,7 +8951,7 @@ class TCPConnectionViewer(QMainWindow):
                 else:
                     local_addresses+=1
                 
-                if conn['suspect'] == "Yes":
+                if conn['suspect']:
                     for col in range(self.connection_table.columnCount()):
                         self.connection_table.item(row, col).setForeground(Qt.red)
 
@@ -9477,7 +9727,7 @@ class TCPConnectionViewer(QMainWindow):
                 self.summary_table.setItem(row, 12, _make_bytes_item(stats['bytes_recv']))
 
                 # Highlight suspect connections in red
-                if suspect == "Yes":
+                if suspect:
                     for col in range(self.summary_table.columnCount()):
                         self.summary_table.item(row, col).setForeground(Qt.red)
 
