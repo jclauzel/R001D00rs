@@ -146,29 +146,30 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
 
         Enabled sources are checked in parallel via ThreadPoolExecutor.
         """
-        cfg = self.load_config()
-        sources = cfg.get("sources", [])
-        enabled_sources = [
-            s for s in sources
-            if s.get("enabled", False) and s.get("url", "").strip()
-        ]
-        if not enabled_sources:
-            return IPAnalyzeResult(found=False, plugin_name=self.name)
-
-        found_sources: List[str] = []
-
-        def _check_source(src):
-            url = src["url"].strip()
-            ttl = int(src.get("ttl_seconds", 86400))
-            fmt = src.get("format", "text").lower()
-            col = int(src.get("csv_ip_column", 0))
-            desc = src.get("description", url) or url
-            ip_set = self._get_ip_set(url, ttl, fmt, col)
-            if ip_address in ip_set:
-                return desc
-            return None
-
         try:
+            cfg = self.load_config()
+            sources = cfg.get("sources", [])
+            enabled_sources = [
+                s for s in sources
+                if s.get("enabled", False) and s.get("url", "").strip()
+            ]
+            if not enabled_sources:
+                return IPAnalyzeResult(found=False, plugin_name=self.name)
+
+            found_sources: List[str] = []
+            source_errors: List[str] = []
+
+            def _check_source(src):
+                url = src["url"].strip()
+                ttl = int(src.get("ttl_seconds", 86400))
+                fmt = src.get("format", "text").lower()
+                col = int(src.get("csv_ip_column", 0))
+                desc = src.get("description", url) or url
+                ip_set = self._get_ip_set(url, ttl, fmt, col)
+                if ip_address in ip_set:
+                    return desc
+                return None
+
             workers = min(len(enabled_sources), 8)
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
@@ -182,23 +183,40 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
                             found_sources.append(result)
                     except Exception as exc:
                         src = futures[future]
+                        source_errors.append(
+                            f"{src.get('url', '?')}: {exc}"
+                        )
                         logging.debug(
                             "HttpTextCsvPlugin: source check failed for %s: %s",
                             src.get("url", "?"), exc,
                         )
+
+            if source_errors:
+                return IPAnalyzeResult(
+                    found=bool(found_sources),
+                    plugin_name=self.name,
+                    additional_information="; ".join(source_errors),
+                    status=False,
+                )
+
+            if found_sources:
+                return IPAnalyzeResult(
+                    found=True,
+                    plugin_name=self.name,
+                    additional_information="; ".join(found_sources),
+                )
+            return IPAnalyzeResult(found=False, plugin_name=self.name)
         except Exception as exc:
             logging.error(
                 "HttpTextCsvPlugin: executor error for %s: %s",
                 ip_address, exc,
             )
-
-        if found_sources:
             return IPAnalyzeResult(
-                found=True,
+                found=False,
                 plugin_name=self.name,
-                additional_information="; ".join(found_sources),
+                additional_information=f"Plugin failed: {exc}",
+                status=False,
             )
-        return IPAnalyzeResult(found=False, plugin_name=self.name)
 
     # --- settings (programmatic accessor) ----------------------------------
 
