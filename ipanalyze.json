@@ -5,6 +5,10 @@
   },
   {
     "module": "pihole_plugin",
+    "enabled": false
+  },
+  {
+    "module": "dev_test_plugin",
     "enabled": true
   }
 ]

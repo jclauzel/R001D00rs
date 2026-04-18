@@ -1,0 +1,4 @@
+{
+  "simulate_failure": "Random",
+  "failure_rate_percent": 1
+}
