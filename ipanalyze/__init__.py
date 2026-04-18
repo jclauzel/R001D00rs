@@ -35,6 +35,7 @@ class IPAnalyzeResult:
     found: bool = False
     plugin_name: str = ""
     additional_information: str = ""
+    status: bool = True
 
 
 # ---------------------------------------------------------------------------

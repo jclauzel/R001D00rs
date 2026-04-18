@@ -249,24 +249,33 @@ class PiHolePlugin(IPAnalyzePlugin):
 
     def check_ip(self, ip_address: str) -> IPAnalyzeResult:
         """Perform a DNS lookup for *ip_address* via the configured Pi-hole."""
-        cfg = self.load_config()
-        dns_server = cfg.get("dns_server", "pi.hole").strip()
-        dns_port = int(cfg.get("dns_port", 53))
-        timeout = float(cfg.get("timeout_seconds", 3))
+        try:
+            cfg = self.load_config()
+            dns_server = cfg.get("dns_server", "pi.hole").strip()
+            dns_port = int(cfg.get("dns_port", 53))
+            timeout = float(cfg.get("timeout_seconds", 3))
 
-        if not dns_server:
-            return IPAnalyzeResult(found=False, plugin_name=self.name,
-                                   additional_information="No DNS server configured")
+            if not dns_server:
+                return IPAnalyzeResult(found=False, plugin_name=self.name,
+                                       additional_information="No DNS server configured",
+                                       status=False)
 
-        # cache_epoch flips every 60 s so stale entries expire automatically
-        cache_epoch = int(time.time()) // 60
-        found, detail = _dns_check_cached(
-            dns_server, dns_port, timeout, ip_address, cache_epoch,
-        )
-        return IPAnalyzeResult(
-            found=found, plugin_name=self.name,
-            additional_information=detail,
-        )
+            # cache_epoch flips every 60 s so stale entries expire automatically
+            cache_epoch = int(time.time()) // 60
+            found, detail = _dns_check_cached(
+                dns_server, dns_port, timeout, ip_address, cache_epoch,
+            )
+            return IPAnalyzeResult(
+                found=found, plugin_name=self.name,
+                additional_information=detail,
+            )
+        except Exception as exc:
+            logging.error("PiHolePlugin: failed for %s: %s", ip_address, exc)
+            return IPAnalyzeResult(
+                found=False, plugin_name=self.name,
+                additional_information=f"Plugin failed: {exc}",
+                status=False,
+            )
 
     # --- settings (programmatic accessor) ----------------------------------
 

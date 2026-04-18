@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.8.0" # Current script version
+VERSION = "3.8.1" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -1916,6 +1916,20 @@ class TCPConnectionViewer(QMainWindow):
             True if settings file was found and loaded successfully
             None if settings file doesn't exist (first run)
         """
+        global max_connection_list_filo_buffer_size, do_ipanalyze, show_only_new_active_connections
+        global show_only_remote_connections, do_reverse_dns, map_refresh_interval
+        global table_column_sort_index, table_column_sort_reverse
+        global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously
+        global db_provider_name, max_connection_list_database_size
+        global logging_level
+        global do_always_supplement_psutil_with_netstat_when_available
+        global do_show_listening_connections
+        global do_scapy_force_use_interface_name
+        global do_warn_npcap_not_installed
+        global conn_table_column_order, summary_table_column_order
+        global conn_table_column_widths, summary_table_column_widths
+        global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
+
         if not os.path.exists(SETTINGS_FILE_NAME):
             logging.info("No settings file found - this appears to be first run")
             return None
@@ -1925,18 +1939,6 @@ class TCPConnectionViewer(QMainWindow):
                 settings = json.load(f)
 
                 # Apply loaded settings to global variables
-                global max_connection_list_filo_buffer_size, do_ipanalyze, show_only_new_active_connections
-                global show_only_remote_connections, do_reverse_dns, map_refresh_interval
-                global table_column_sort_index, table_column_sort_reverse
-                global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously
-                global db_provider_name, max_connection_list_database_size
-                global logging_level
-                global do_always_supplement_psutil_with_netstat_when_available
-                global do_show_listening_connections
-                global do_scapy_force_use_interface_name
-                global do_warn_npcap_not_installed
-                global conn_table_column_order, summary_table_column_order
-                global conn_table_column_widths, summary_table_column_widths
 
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
@@ -1996,7 +1998,6 @@ class TCPConnectionViewer(QMainWindow):
                     logging.info(f"Logging level set to: {logging_level}")
 
                 # Restore server/agent mode settings (CLI args take precedence)
-                global enable_server_mode, enable_agent_mode, agent_server_host, agent_no_ui, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS
                 # Only restore no_ui from settings if neither --no_ui nor --no_ui_off was passed on CLI
                 if not agent_no_ui and not _no_ui_off_requested:
                     agent_no_ui = bool(settings.get('agent_no_ui', False))
@@ -3244,6 +3245,8 @@ class TCPConnectionViewer(QMainWindow):
         - Updates cache from worker threads to minimize post-processing allocations.
         - Returns a dict mapping only resolved IP -> hostname.
         """
+        global ip_cache, cache_lock
+
         if isinstance(ips, str):
             ips = [ips]
 
@@ -3254,7 +3257,6 @@ class TCPConnectionViewer(QMainWindow):
             return {}
 
         # Local references to globals to reduce attribute lookups
-        global ip_cache, cache_lock
 
         results = {}
         to_resolve = []
@@ -4647,7 +4649,7 @@ class TCPConnectionViewer(QMainWindow):
     @Slot()
     def update_buffer_size(self):
         """Validate and update the max_connection_list_filo_buffer_size setting"""
-        global max_connection_list_filo_buffer_size
+        global max_connection_list_filo_buffer_size, do_capture_screenshots
 
         # Store the previous valid value
         previous_value = max_connection_list_filo_buffer_size
@@ -4710,7 +4712,6 @@ class TCPConnectionViewer(QMainWindow):
                 self._stop_stop_button_wave()
 
             # Trigger screenshot cleanup if enabled (to match new buffer size)
-            global do_capture_screenshots
             if do_capture_screenshots:
                 try:
                     logging.info("Triggering screenshot cleanup after buffer size change")
@@ -6188,31 +6189,43 @@ class TCPConnectionViewer(QMainWindow):
     def _run_ipanalyze_check(self, ip_address):
         """Run all enabled IPAnalyze plugins against *ip_address*.
 
-        Returns a list of :class:`IPAnalyzeResult` where ``found`` is True.
+        Returns a tuple of (found_results, failed_results) where:
+        - found_results: list of IPAnalyzeResult where ``found`` is True
+        - failed_results: list of IPAnalyzeResult where ``status`` is False
         Plugins are called concurrently via ``concurrent.futures`` to avoid
         blocking the collection thread any longer than necessary.
         """
         enabled_plugins = [p for p in self._ipanalyze_plugins if getattr(p, '_enabled', False)]
         if not enabled_plugins:
-            return []
+            return [], []
 
-        results = []
+        found_results = []
+        failed_results = []
         try:
             with ThreadPoolExecutor(max_workers=len(enabled_plugins)) as executor:
                 futures = {executor.submit(p.check_ip, ip_address): p for p in enabled_plugins}
                 for future in as_completed(futures):
                     try:
                         result = future.result(timeout=15)
+                        if result and not result.status:
+                            failed_results.append(result)
                         if result and result.found:
-                            results.append(result)
+                            found_results.append(result)
                     except Exception as exc:
                         p = futures[future]
+                        from ipanalyze import IPAnalyzeResult
+                        failed_results.append(IPAnalyzeResult(
+                            found=False,
+                            plugin_name=getattr(p, 'name', '?'),
+                            additional_information=f"Plugin failed: {exc}",
+                            status=False,
+                        ))
                         logging.debug("IPAnalyze: plugin %s failed for %s: %s",
                                       getattr(p, 'name', '?'), ip_address, exc)
         except Exception as exc:
             logging.error("IPAnalyze: executor error for %s: %s", ip_address, exc)
 
-        return results
+        return found_results, failed_results
 
     def download_database(self, db_path, url):
         try:
@@ -6449,7 +6462,9 @@ class TCPConnectionViewer(QMainWindow):
 
         connections = []
         ipanalyze_connections = []  # Connections flagged by IPAnalyze plugins
-        global do_capture_screenshots, geo_cache, geo_cache_lock, process_cache, process_cache_lock
+        ipanalyze_failure_alerts = []  # Alerts from failed IPAnalyze plugins
+        _ipanalyze_failed_plugins = set()  # Dedup failures: one alert per plugin per cycle
+        global do_capture_screenshots, geo_cache, geo_cache_lock, process_cache, process_cache_lock, public_ip_dns_attempts, public_ip_dns_attempts_lock
 
         # Performance timing
         start_time = time.perf_counter()
@@ -6482,7 +6497,6 @@ class TCPConnectionViewer(QMainWindow):
         ip_hostnames = {}
         if do_reverse_dns and ips_to_resolve:
             ips_to_enqueue = set()
-            global public_ip_dns_attempts, public_ip_dns_attempts_lock
 
             with public_ip_dns_attempts_lock:
                 for ip in ips_to_resolve:
@@ -6589,7 +6603,7 @@ class TCPConnectionViewer(QMainWindow):
                     # IPAnalyze check (replaces legacy C2 check)
                     if _do_ipanalyze:
                         try:
-                            _ip_results = self._run_ipanalyze_check(ip_lookup)
+                            _ip_results, _ip_failures = self._run_ipanalyze_check(ip_lookup)
                             if _ip_results:
                                 _plugin_names = ", ".join(r.plugin_name for r in _ip_results)
                                 _additional = "; ".join(
@@ -6615,6 +6629,28 @@ class TCPConnectionViewer(QMainWindow):
                                     'bytes_sent': bytes_sent,
                                     'bytes_recv': bytes_recv,
                                 })
+                            if _ip_failures:
+                                _fail_ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                for fr in _ip_failures:
+                                    if fr.plugin_name in _ipanalyze_failed_plugins:
+                                        continue
+                                    _ipanalyze_failed_plugins.add(fr.plugin_name)
+                                    ipanalyze_failure_alerts.append({
+                                        'datetime': _fail_ts,
+                                        'hostname': hostname,
+                                        'plugin': fr.plugin_name,
+                                        'additional_info': fr.additional_information,
+                                        'remote': remote_addr,
+                                        'remoteport': remote_port,
+                                        'local': local_addr,
+                                        'localport': local_port,
+                                        'protocol': protocol,
+                                        'ip_type': ip_type,
+                                        'process': process_name,
+                                        'pid': pid,
+                                        'name': name,
+                                        'way': '',
+                                    })
                         except Exception:
                             pass
 
@@ -6682,6 +6718,10 @@ class TCPConnectionViewer(QMainWindow):
                 })
             ipanalyze_connections.extend(connections)
             connections = ipanalyze_connections
+
+        # Add plugin failure alerts
+        if ipanalyze_failure_alerts:
+            snap_alerts.extend(ipanalyze_failure_alerts)
 
         # Server mode: drain agent cache and merge remote agent connections
         agent_snapshot = {}
@@ -6916,6 +6956,8 @@ class TCPConnectionViewer(QMainWindow):
         Load map HTML once and afterwards update markers via injected JavaScript.
         Use `_call_update_js` to avoid calling `updateConnections` before the JS function exists.
         """
+        global cache_lock, ip_cache, public_ip_dns_attempts, public_ip_dns_attempts_lock
+
         display_name = ""
 
         if do_resolve_public_ip:
@@ -6934,7 +6976,6 @@ class TCPConnectionViewer(QMainWindow):
                     if do_reverse_dns:
 
                         # Try to get from cache immediately
-                        global cache_lock, ip_cache, public_ip_dns_attempts, public_ip_dns_attempts_lock
 
                         if not ip_cache.get(public_ip):
                             # Check if we've already attempted to resolve this IP
@@ -9071,6 +9112,14 @@ class TCPConnectionViewer(QMainWindow):
         except Exception:
             pass
 
+        # Bootstrap the map: load the real map HTML so the Leaflet engine
+        # initialises.  Connection collection is deferred (_capture_start_pending)
+        # until _verify_map_ready succeeds, which only happens after this HTML
+        # has loaded.  Without this call update_map() would never be reached
+        # because refresh_connections() only runs when the capture timer fires.
+        if not getattr(self, 'map_initialized', False) and not getattr(self, '_map_loading_in_progress', False):
+            QTimer.singleShot(0, lambda: self.update_map([]))
+
         # Sync filter bar widths once the layout geometry is finalised.
         # The earlier QTimer.singleShot(0) in init_ui fires before the window
         # is painted, so column widths may not yet reflect the real layout.
@@ -9703,6 +9752,8 @@ class TCPConnectionViewer(QMainWindow):
     @Slot(object, int, int)
     def _on_summary_aggregation_ready(self, sorted_stats, total_unique, total_connections):
         """Populate the summary QTableWidget from pre-aggregated stats (GUI thread)."""
+        global summary_table_column_sort_index, summary_table_column_sort_reverse
+
         try:
             self.summary_table.setUpdatesEnabled(False)
             self.summary_table.setRowCount(0)
@@ -9743,7 +9794,6 @@ class TCPConnectionViewer(QMainWindow):
                         break
 
             # Apply sorting if a column was previously sorted
-            global summary_table_column_sort_index, summary_table_column_sort_reverse
             if summary_table_column_sort_index >= 0:
                 self.sort_summary_table_by_column(summary_table_column_sort_index, summary_table_column_sort_reverse)
                 self._update_sort_indicator(self.summary_table, self._summary_table_base_headers,
