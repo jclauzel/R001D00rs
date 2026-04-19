@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.8.3" # Current script version
+VERSION = "3.8.4" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -356,6 +356,7 @@ do_resolve_public_ip = True  # Set to True to resolve public IP addresses to hos
 do_pulse_exit_points = True  # Set to True to animate a pulsing ring on agent/server exit-point circles
 do_drawlines_between_local_and_remote = True  # Set to True to draw lines between local and remote endpoints on the map
 do_ipanalyze = False  # Master on/off toggle for the IPAnalyze plugin framework
+do_ipanalyze_agents = True  # When True and in server mode, run IPAnalyze checks on remote agent connections too
 do_show_alerts_on_map = True  # Show latest IPAnalyze alerts panel on the map (top-right corner)
 do_always_supplement_psutil_with_netstat_when_available = True  # When True, psutil connection data is always supplemented with netstat to catch any connections psutil may miss
 _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
@@ -1820,11 +1821,12 @@ class TCPConnectionViewer(QMainWindow):
         """Save current settings to a JSON file"""
 
         # Apply loaded settings
-        global max_connection_list_filo_buffer_size, do_ipanalyze, do_show_alerts_on_map, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name, do_warn_npcap_not_installed
+        global max_connection_list_filo_buffer_size, do_ipanalyze, do_ipanalyze_agents, do_show_alerts_on_map, do_always_supplement_psutil_with_netstat_when_available, show_only_new_active_connections, show_only_remote_connections, do_reverse_dns, map_refresh_interval, table_column_sort_index, table_column_sort_reverse, summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously, agent_no_ui, agent_server_host, FLASK_SERVER_PORT, FLASK_AGENT_PORT, MAX_SERVER_AGENTS, db_provider_name, max_connection_list_database_size, logging_level, do_show_listening_connections, conn_table_column_order, summary_table_column_order, conn_table_column_widths, summary_table_column_widths, do_scapy_force_use_interface_name, do_warn_npcap_not_installed
 
         settings = {
             'max_connection_list_filo_buffer_size' : max_connection_list_filo_buffer_size,
             'do_ipanalyze' : do_ipanalyze,
+            'do_ipanalyze_agents': do_ipanalyze_agents,
             'do_show_alerts_on_map': do_show_alerts_on_map,
             'do_always_supplement_psutil_with_netstat_when_available': do_always_supplement_psutil_with_netstat_when_available,
             'show_only_new_active_connections': show_only_new_active_connections,
@@ -1924,7 +1926,7 @@ class TCPConnectionViewer(QMainWindow):
             True if settings file was found and loaded successfully
             None if settings file doesn't exist (first run)
         """
-        global max_connection_list_filo_buffer_size, do_ipanalyze, do_show_alerts_on_map, show_only_new_active_connections
+        global max_connection_list_filo_buffer_size, do_ipanalyze, do_ipanalyze_agents, do_show_alerts_on_map, show_only_new_active_connections
         global show_only_remote_connections, do_reverse_dns, map_refresh_interval
         global table_column_sort_index, table_column_sort_reverse
         global summary_table_column_sort_index, summary_table_column_sort_reverse, do_resolve_public_ip, do_pulse_exit_points, do_capture_screenshots, do_pause_table_sorting, do_show_traffic_gauge, do_show_traffic_histogram, do_collect_connections_asynchronously
@@ -1951,6 +1953,7 @@ class TCPConnectionViewer(QMainWindow):
                 max_connection_list_filo_buffer_size = settings.get('max_connection_list_filo_buffer_size', max_connection_list_filo_buffer_size)
 
                 do_ipanalyze = settings.get('do_ipanalyze', do_ipanalyze)
+                do_ipanalyze_agents = settings.get('do_ipanalyze_agents', do_ipanalyze_agents)
                 do_show_alerts_on_map = settings.get('do_show_alerts_on_map', do_show_alerts_on_map)
                 do_always_supplement_psutil_with_netstat_when_available = settings.get('do_always_supplement_psutil_with_netstat_when_available', do_always_supplement_psutil_with_netstat_when_available)
                 _set_supplement_psutil(do_always_supplement_psutil_with_netstat_when_available)
@@ -2197,6 +2200,8 @@ class TCPConnectionViewer(QMainWindow):
                     self._toggle_ipanalyze_ui(do_ipanalyze)
                 if hasattr(self, 'show_alerts_on_map_check'):
                     self.show_alerts_on_map_check.setChecked(do_show_alerts_on_map)
+                if hasattr(self, 'ipanalyze_agents_check'):
+                    self.ipanalyze_agents_check.setChecked(do_ipanalyze_agents)
                 self.resolve_public_ip.setChecked(do_resolve_public_ip)
                 self.pulse_exit_points_check.setChecked(do_pulse_exit_points)
                 self.capture_screenshots_check.setChecked(do_capture_screenshots)
@@ -4890,6 +4895,12 @@ class TCPConnectionViewer(QMainWindow):
         do_show_alerts_on_map = self.show_alerts_on_map_check.isChecked()
         self.save_settings()
 
+    def _on_ipanalyze_agents_toggled(self):
+        """Toggle IPAnalyze checking of remote agent connections."""
+        global do_ipanalyze_agents
+        do_ipanalyze_agents = self.ipanalyze_agents_check.isChecked()
+        self.save_settings()
+
     def _start_alerts_tab_blink(self):
         """Start blinking the Alerts tab in red to draw attention to new alerts."""
         if not hasattr(self, '_alerts_tab_index'):
@@ -4947,6 +4958,8 @@ class TCPConnectionViewer(QMainWindow):
             self._ipanalyze_plugin_group.setVisible(enabled)
         if hasattr(self, '_alerts_tab_index'):
             self.tab_widget.setTabVisible(self._alerts_tab_index, enabled)
+        if hasattr(self, 'ipanalyze_agents_check'):
+            self.ipanalyze_agents_check.setVisible(enabled)
 
     def _load_ipanalyze_plugins(self):
         """(Re-)load plugins from ipanalyze.json and refresh the settings table."""
@@ -5747,6 +5760,17 @@ class TCPConnectionViewer(QMainWindow):
         settings_tab_layout.addWidget(self.show_alerts_on_map_check)
         self.show_alerts_on_map_check.stateChanged.connect(self._on_show_alerts_on_map_toggled)
 
+        # Verify agents using IPAnalyze plugins (child of IPAnalyze, server mode)
+        self.ipanalyze_agents_check = QCheckBox("Verify also agents using IPAnalyze plugins")
+        self.ipanalyze_agents_check.setToolTip(
+            "When enabled and running in server mode, remote agent connections\n"
+            "are also checked against IPAnalyze plugins. Suspicious agent IPs\n"
+            "will raise alerts on the server."
+        )
+        self.ipanalyze_agents_check.setChecked(do_ipanalyze_agents)
+        settings_tab_layout.addWidget(self.ipanalyze_agents_check)
+        self.ipanalyze_agents_check.stateChanged.connect(self._on_ipanalyze_agents_toggled)
+
         # IPAnalyze plugin management group (visible only when enabled)
         self._ipanalyze_plugin_group = QGroupBox("IPAnalyze Plugins")
         _ip_plugin_layout = QVBoxLayout(self._ipanalyze_plugin_group)
@@ -5763,6 +5787,7 @@ class TCPConnectionViewer(QMainWindow):
         _ip_plugin_layout.addWidget(self._ipanalyze_plugin_table)
         settings_tab_layout.addWidget(self._ipanalyze_plugin_group)
         self._ipanalyze_plugin_group.setVisible(do_ipanalyze)
+        self.ipanalyze_agents_check.setVisible(do_ipanalyze)
         # Load plugins if IPAnalyze is already enabled at startup
         if do_ipanalyze:
             self._load_ipanalyze_plugins()
@@ -6943,12 +6968,27 @@ class TCPConnectionViewer(QMainWindow):
                 agent_origin_lat = agent_data.get('lat')
                 agent_origin_lng = agent_data.get('lng')
                 agent_public_ip = agent_data.get('public_ip', '')
+                # Server-side fallback: if the agent did not send geolocation
+                # (e.g. do_resolve_public_ip is disabled on the agent), try to
+                # geolocate the agent's public IP on the server side so the
+                # exit-point circle still appears on the map.
+                if (agent_origin_lat is None or agent_origin_lng is None) and agent_public_ip:
+                    try:
+                        _fb_lat, _fb_lng = self._get_local_geolocation_for_ip(agent_public_ip)
+                        if _fb_lat is not None and _fb_lng is not None:
+                            agent_origin_lat = _fb_lat
+                            agent_origin_lng = _fb_lng
+                            agent_data['lat'] = _fb_lat
+                            agent_data['lng'] = _fb_lng
+                    except Exception:
+                        pass
                 # Assign a persistent color to this agent on first encounter
                 if hostname not in self._agent_colors:
                     palette = self._AGENT_COLOR_PALETTE
                     self._agent_colors[hostname] = palette[self._agent_color_index % len(palette)]
                     self._agent_color_index += 1
                 agent_color = self._agent_colors[hostname]
+                _do_ipanalyze_agents = _do_ipanalyze and do_ipanalyze_agents and bool(self._ipanalyze_plugins)
                 for agent_conn in agent_data.get('connections', []):
                     agent_conn['hostname'] = hostname
                     # Inject the agent's exit-point origin so the map can draw
@@ -6958,6 +6998,64 @@ class TCPConnectionViewer(QMainWindow):
                     agent_conn['origin_hostname'] = hostname
                     agent_conn['origin_public_ip'] = agent_public_ip
                     agent_conn['agent_color'] = agent_color
+                    # IPAnalyze check on remote agent connections
+                    if _do_ipanalyze_agents:
+                        try:
+                            _agent_remote = agent_conn.get('remote', '')
+                            _agent_ip = _agent_remote.split(' ')[0].split(':')[0]
+                            if _agent_ip and _agent_ip not in ('127.0.0.1', '::1', 'N/A', '*', '0.0.0.0', '::'):
+                                _agent_ip_results, _agent_ip_failures = self._run_ipanalyze_check(_agent_ip)
+                                if _agent_ip_results:
+                                    _plugin_names = ", ".join(r.plugin_name for r in _agent_ip_results)
+                                    _additional = "; ".join(
+                                        f"{r.plugin_name}: {r.additional_information}"
+                                        for r in _agent_ip_results if r.additional_information
+                                    )
+                                    agent_conn['suspect'] = _plugin_names
+                                    agent_conn['suspect_detail'] = _additional
+                                    agent_conn['icon'] = 'redIcon'
+                                    _alert_ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    for ar in _agent_ip_results:
+                                        snap_alerts.append({
+                                            'datetime': _alert_ts,
+                                            'hostname': hostname,
+                                            'plugin': ar.plugin_name,
+                                            'additional_info': ar.additional_information,
+                                            'remote': _agent_remote,
+                                            'remoteport': agent_conn.get('remoteport', ''),
+                                            'local': agent_conn.get('local', ''),
+                                            'localport': agent_conn.get('localport', ''),
+                                            'protocol': agent_conn.get('protocol', 'TCP'),
+                                            'ip_type': agent_conn.get('ip_type', ''),
+                                            'process': agent_conn.get('process', ''),
+                                            'pid': agent_conn.get('pid', ''),
+                                            'name': agent_conn.get('name', ''),
+                                            'way': '',
+                                        })
+                                if _agent_ip_failures:
+                                    _fail_ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    for fr in _agent_ip_failures:
+                                        if fr.plugin_name in _ipanalyze_failed_plugins:
+                                            continue
+                                        _ipanalyze_failed_plugins.add(fr.plugin_name)
+                                        snap_alerts.append({
+                                            'datetime': _fail_ts,
+                                            'hostname': hostname,
+                                            'plugin': fr.plugin_name,
+                                            'additional_info': fr.additional_information,
+                                            'remote': _agent_remote,
+                                            'remoteport': agent_conn.get('remoteport', ''),
+                                            'local': agent_conn.get('local', ''),
+                                            'localport': agent_conn.get('localport', ''),
+                                            'protocol': agent_conn.get('protocol', 'TCP'),
+                                            'ip_type': agent_conn.get('ip_type', ''),
+                                            'process': agent_conn.get('process', ''),
+                                            'pid': agent_conn.get('pid', ''),
+                                            'name': agent_conn.get('name', ''),
+                                            'way': '',
+                                        })
+                        except Exception:
+                            pass
                     # Use the agent's assigned color icon (fall back if not suspect)
                     if agent_conn.get('icon') not in ('redIcon',):
                         agent_conn['icon'] = agent_color + 'Icon'

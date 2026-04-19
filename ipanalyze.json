@@ -5,7 +5,7 @@
   },
   {
     "module": "pihole_plugin",
-    "enabled": false
+    "enabled": true
   },
   {
     "module": "dev_test_plugin",
