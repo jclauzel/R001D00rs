@@ -69,6 +69,12 @@ class SqliteProvider(ConnectionDatabaseProvider):
             CREATE INDEX IF NOT EXISTS idx_snapshots_ts
             ON connection_snapshots (timestamp)
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ipanalyze_alerts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_json  TEXT NOT NULL
+            )
+        """)
         self._conn.commit()
 
     # ------------------------------------------------------------------ #
@@ -130,6 +136,35 @@ class SqliteProvider(ConnectionDatabaseProvider):
             return cur.fetchone()[0]
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------ #
+    # Alerts
+    # ------------------------------------------------------------------ #
+    def save_alerts(self, alerts: List[Dict]) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.execute("DELETE FROM ipanalyze_alerts")
+            for alert in alerts:
+                self._conn.execute(
+                    "INSERT INTO ipanalyze_alerts (alert_json) VALUES (?)",
+                    (json.dumps(alert, default=str),),
+                )
+            self._conn.commit()
+        except Exception as e:
+            logging.error(f"SQLite save_alerts error: {e}")
+
+    def load_alerts(self) -> List[Dict]:
+        if self._conn is None:
+            return []
+        try:
+            cur = self._conn.execute(
+                "SELECT alert_json FROM ipanalyze_alerts ORDER BY id ASC"
+            )
+            return [json.loads(row[0]) for row in cur.fetchall()]
+        except Exception as e:
+            logging.error(f"SQLite load_alerts error: {e}")
+            return []
 
     # ------------------------------------------------------------------ #
     # Maintenance

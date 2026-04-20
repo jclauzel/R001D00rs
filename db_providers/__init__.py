@@ -78,6 +78,18 @@ class ConnectionDatabaseProvider(abc.ABC):
         Returns the number of rows actually deleted.
         """
 
+    # ------------------------------------------------------------------ #
+    # Alerts
+    # ------------------------------------------------------------------ #
+    @abc.abstractmethod
+    def save_alerts(self, alerts: List[Dict]) -> None:
+        """Persist the full list of IPAnalyze alerts, replacing any
+        previously stored alerts."""
+
+    @abc.abstractmethod
+    def load_alerts(self) -> List[Dict]:
+        """Return all previously persisted IPAnalyze alerts."""
+
 
 # --------------------------------------------------------------------- #
 # Provider registry – discovers concrete providers in this package.

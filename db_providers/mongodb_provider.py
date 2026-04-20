@@ -30,6 +30,7 @@ class MongodbProvider(ConnectionDatabaseProvider):
         self._client = None
         self._db = None
         self._col = None
+        self._alerts_col = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -45,6 +46,7 @@ class MongodbProvider(ConnectionDatabaseProvider):
         self._client.admin.command("ping")
         self._db = self._client[DB_NAME]
         self._col = self._db[COLLECTION_NAME]
+        self._alerts_col = self._db["ipanalyze_alerts"]
         self._ensure_schema()
 
     def close(self) -> None:
@@ -56,6 +58,7 @@ class MongodbProvider(ConnectionDatabaseProvider):
             self._client = None
             self._db = None
             self._col = None
+            self._alerts_col = None
 
     def is_connected(self) -> bool:
         if self._client is None:
@@ -122,6 +125,34 @@ class MongodbProvider(ConnectionDatabaseProvider):
             return self._col.count_documents({})
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------ #
+    # Alerts
+    # ------------------------------------------------------------------ #
+    def save_alerts(self, alerts: List[Dict]) -> None:
+        if self._alerts_col is None:
+            return
+        try:
+            self._alerts_col.delete_many({})
+            if alerts:
+                docs = [json.loads(json.dumps(a, default=str)) for a in alerts]
+                self._alerts_col.insert_many(docs)
+        except Exception as e:
+            logging.error(f"MongoDB save_alerts error: {e}")
+
+    def load_alerts(self) -> List[Dict]:
+        if self._alerts_col is None:
+            return []
+        try:
+            cursor = self._alerts_col.find().sort("_id", pymongo.ASCENDING)
+            result = []
+            for doc in cursor:
+                doc.pop("_id", None)
+                result.append(doc)
+            return result
+        except Exception as e:
+            logging.error(f"MongoDB load_alerts error: {e}")
+            return []
 
     # ------------------------------------------------------------------ #
     # Maintenance
