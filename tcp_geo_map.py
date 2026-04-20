@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.8.4" # Current script version
+VERSION = "3.8.5" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -505,6 +505,18 @@ class MapBridge(QObject):
             self.viewer.bring_to_top_layer(hostname)
         except Exception as e:
             logging.error(f"Error in setForegroundHost: {e}")
+
+    @Slot()
+    def hideAlerts(self):
+        """Called from JavaScript when the user clicks 'Hide previous alerts' on the map panel."""
+        try:
+            self.viewer._all_alerts.clear()
+            self.viewer._current_alerts = []
+            self.viewer._update_alerts_table()
+            self.viewer._update_alerts_tab_title()
+            self.viewer.update_map()
+        except Exception as e:
+            logging.error(f"Error hiding alerts from map panel: {e}")
 
 class VideoGeneratorSignals(QObject):
     """Signals for video generation worker"""
@@ -2317,12 +2329,17 @@ class TCPConnectionViewer(QMainWindow):
             self._start_flask_server()
         else:
             enable_server_mode = False
-            # Flask cannot be gracefully stopped mid-process; it will die with the app.
+            self._stop_flask_server()
         # Show or hide the Agent Management tab to match current mode
         if hasattr(self, 'tab_widget') and hasattr(self, '_agent_mgmt_tab_index'):
             self.tab_widget.setTabVisible(self._agent_mgmt_tab_index, enable_server_mode)
             if enable_server_mode:
                 self._refresh_agent_management_table(force_rebuild=True)
+        # Show or hide the IPAnalyze agents checkbox depending on combined state
+        if hasattr(self, 'ipanalyze_agents_check') and hasattr(self, 'ipanalyze_check'):
+            self.ipanalyze_agents_check.setVisible(
+                enable_server_mode and self.ipanalyze_check.isChecked()
+            )
         logging.info(f"Server mode {'enabled' if enable_server_mode else 'disabled'}")
 
     def _refresh_agent_management_table(self, force_rebuild=False):
@@ -2930,6 +2947,22 @@ class TCPConnectionViewer(QMainWindow):
         layout.addWidget(btns)
         dlg.exec()
 
+    def _stop_flask_server(self) -> None:
+        """Gracefully stop the Werkzeug server and wait for the thread to exit."""
+        srv = getattr(self, '_werkzeug_server', None)
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception as e:
+                logging.warning(f"Error shutting down Flask server: {e}")
+            self._werkzeug_server = None
+
+        t = getattr(self, '_flask_thread', None)
+        if t is not None and t.is_alive():
+            t.join(timeout=3)
+        self._flask_thread = None
+        logging.info("Flask server stopped.")
+
     def _restart_flask_server(self, previous_port: int):
         """Stop the running Werkzeug server and restart on FLASK_SERVER_PORT.
 
@@ -2941,17 +2974,7 @@ class TCPConnectionViewer(QMainWindow):
         global FLASK_SERVER_PORT
 
         # --- Stop the current server first ---------------------------------------
-        srv = getattr(self, '_werkzeug_server', None)
-        if srv is not None:
-            try:
-                srv.shutdown()
-            except Exception as e:
-                logging.warning(f"Error shutting down Flask server: {e}")
-            self._werkzeug_server = None
-
-        if self._flask_thread is not None:
-            self._flask_thread.join(timeout=3)
-            self._flask_thread = None
+        self._stop_flask_server()
         # -------------------------------------------------------------------------
 
         # Now that our port is released, probe for external conflicts
@@ -4641,10 +4664,21 @@ class TCPConnectionViewer(QMainWindow):
                 self.setWindowTitle(
                     f"TCP/UDP Geo Map - R001D00rs - v {VERSION}  "
                     f"[Database Replay — {len(self.connection_list)} snapshots loaded]")
+
+            # Restore persisted IPAnalyze alerts
+            try:
+                restored_alerts = self._db_provider.load_alerts()
+                if restored_alerts:
+                    self._all_alerts = restored_alerts
+                    self._update_alerts_table()
+                    self._update_alerts_tab_title()
+                    logging.info(f"Restored {len(restored_alerts)} IPAnalyze alerts from database.")
+            except Exception as e:
+                logging.error(f"Error restoring alerts from database: {e}")
         except Exception as e:
             logging.error(f"Error restoring snapshots from database: {e}")
 
-    def _db_save_snapshot(self, timestamp, connections, agent_data) -> None:
+    def _db_save_snapshot(self, timestamp, connections, agent_data, alerts=None) -> None:
         """Enqueue a snapshot for the background DB worker thread.
 
         Called at the end of each connection cycle.  The connections list
@@ -4656,7 +4690,8 @@ class TCPConnectionViewer(QMainWindow):
         try:
             import copy
             self._db_queue.put_nowait(
-                (timestamp, copy.deepcopy(connections), agent_data))
+                (timestamp, copy.deepcopy(connections), agent_data,
+                 copy.deepcopy(alerts) if alerts else None))
         except Exception as e:
             logging.error(f"Database snapshot enqueue error: {e}")
 
@@ -4681,10 +4716,12 @@ class TCPConnectionViewer(QMainWindow):
 
     def _db_process_item(self, item) -> None:
         """Process a single queued snapshot write + purge."""
-        timestamp, connections, agent_data = item
+        timestamp, connections, agent_data, alerts = item
         try:
             self._db_provider.save_snapshot(timestamp, connections, agent_data)
             self._db_provider.purge_oldest(max_connection_list_database_size)
+            if alerts is not None:
+                self._db_provider.save_alerts(alerts)
         except Exception as e:
             logging.error(f"Database snapshot save error: {e}")
 
@@ -4959,7 +4996,7 @@ class TCPConnectionViewer(QMainWindow):
         if hasattr(self, '_alerts_tab_index'):
             self.tab_widget.setTabVisible(self._alerts_tab_index, enabled)
         if hasattr(self, 'ipanalyze_agents_check'):
-            self.ipanalyze_agents_check.setVisible(enabled)
+            self.ipanalyze_agents_check.setVisible(enabled and enable_server_mode)
 
     def _load_ipanalyze_plugins(self):
         """(Re-)load plugins from ipanalyze.json and refresh the settings table."""
@@ -4970,6 +5007,26 @@ class TCPConnectionViewer(QMainWindow):
             logging.error("IPAnalyze: failed to load plugins: %s", exc)
             self._ipanalyze_plugins = []
         self._refresh_ipanalyze_plugin_table()
+
+    def _on_alerts_table_context_menu(self, pos):
+        """Show a right-click context menu for the alerts table to copy a cell value."""
+        index = self.alerts_table.indexAt(pos)
+        if not index.isValid():
+            return
+        cell_item = self.alerts_table.item(index.row(), index.column())
+        cell_text = cell_item.text() if cell_item else ""
+        menu = QMenu(self)
+        action_copy = menu.addAction("Copy")
+        menu.addSeparator()
+        action_hide_all = menu.addAction("Hide all previously thrown alerts")
+        action = menu.exec(self.alerts_table.viewport().mapToGlobal(pos))
+        if action == action_copy:
+            QApplication.clipboard().setText(cell_text)
+        elif action == action_hide_all:
+            self._all_alerts.clear()
+            self._current_alerts = []
+            self._update_alerts_table()
+            self._update_alerts_tab_title()
 
     def _update_alerts_table(self):
         """Populate the Alerts tab table from self._all_alerts (accumulated across cycles).
@@ -5709,6 +5766,14 @@ class TCPConnectionViewer(QMainWindow):
         summary_tab_layout.addWidget(_summary_table_container)
 
         # Create Settings tab with all checkboxes
+        # The entire settings content lives inside a QScrollArea so that on
+        # smaller screens every setting is always reachable by scrolling —
+        # both vertically and horizontally.
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
         settings_tab_widget = QWidget()
         settings_tab_layout = QVBoxLayout(settings_tab_widget)
         settings_tab_layout.setContentsMargins(10, 10, 10, 10)
@@ -5761,7 +5826,7 @@ class TCPConnectionViewer(QMainWindow):
         self.show_alerts_on_map_check.stateChanged.connect(self._on_show_alerts_on_map_toggled)
 
         # Verify agents using IPAnalyze plugins (child of IPAnalyze, server mode)
-        self.ipanalyze_agents_check = QCheckBox("Verify also agents using IPAnalyze plugins")
+        self.ipanalyze_agents_check = QCheckBox("Run IPAnalyze plugins on agents as well")
         self.ipanalyze_agents_check.setToolTip(
             "When enabled and running in server mode, remote agent connections\n"
             "are also checked against IPAnalyze plugins. Suspicious agent IPs\n"
@@ -5782,12 +5847,12 @@ class TCPConnectionViewer(QMainWindow):
         self._ipanalyze_plugin_table.setColumnWidth(0, 200)
         self._ipanalyze_plugin_table.setColumnWidth(1, 70)
         self._ipanalyze_plugin_table.setSizeAdjustPolicy(QTableWidget.AdjustToContents)
-        self._ipanalyze_plugin_table.setMinimumHeight(80)
+        self._ipanalyze_plugin_table.setMinimumHeight(120)
         self._ipanalyze_plugin_table.setMaximumHeight(16777215)  # no cap — fits all plugins
         _ip_plugin_layout.addWidget(self._ipanalyze_plugin_table)
         settings_tab_layout.addWidget(self._ipanalyze_plugin_group)
         self._ipanalyze_plugin_group.setVisible(do_ipanalyze)
-        self.ipanalyze_agents_check.setVisible(do_ipanalyze)
+        self.ipanalyze_agents_check.setVisible(do_ipanalyze and enable_server_mode)
         # Load plugins if IPAnalyze is already enabled at startup
         if do_ipanalyze:
             self._load_ipanalyze_plugins()
@@ -6081,6 +6146,10 @@ class TCPConnectionViewer(QMainWindow):
         # Add stretch to push settings to the top
         settings_tab_layout.addStretch()
 
+        # Mount the settings widget inside the scroll area, then add the
+        # scroll area as the actual tab page.
+        settings_scroll.setWidget(settings_tab_widget)
+
         # Actions tab
         actions_tab_widget = QWidget()
         actions_tab_layout = QVBoxLayout()
@@ -6153,6 +6222,8 @@ class TCPConnectionViewer(QMainWindow):
         self.alerts_table.setSelectionMode(QTableWidget.SingleSelection)
         self.alerts_table.setSortingEnabled(False)  # We handle sorting manually
         self.alerts_table.horizontalHeader().sectionClicked.connect(self._on_alerts_header_clicked)
+        self.alerts_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.alerts_table.customContextMenuRequested.connect(self._on_alerts_table_context_menu)
 
         # Per-column filter bar for alerts table
         self._alerts_filter_inner = QWidget()
@@ -6190,7 +6261,7 @@ class TCPConnectionViewer(QMainWindow):
         self.tab_widget.setTabVisible(self._alerts_tab_index, do_ipanalyze)
 
         self.tab_widget.addTab(actions_tab_widget, "Actions")
-        self.tab_widget.addTab(settings_tab_widget, "Settings")
+        self.tab_widget.addTab(settings_scroll, "Settings")
 
         # --- Agent Management tab (only shown when server mode is active) ---
         agent_mgmt_tab_widget = QWidget()
@@ -6459,6 +6530,16 @@ class TCPConnectionViewer(QMainWindow):
                         ))
                         logging.debug("IPAnalyze: plugin %s failed for %s: %s",
                                       getattr(p, 'name', '?'), ip_address, exc)
+        except RuntimeError as exc:
+            # Raised by concurrent.futures when futures are submitted during
+            # interpreter shutdown ("cannot schedule new futures after
+            # interpreter shutdown").  This is expected on exit — suppress.
+            msg = str(exc)
+            if "interpreter shutdown" in msg or "cannot schedule" in msg:
+                logging.debug("IPAnalyze: suppressed shutdown-time executor error for %s: %s",
+                              ip_address, exc)
+            else:
+                logging.error("IPAnalyze: executor error for %s: %s", ip_address, exc)
         except Exception as exc:
             logging.error("IPAnalyze: executor error for %s: %s", ip_address, exc)
 
@@ -7076,9 +7157,6 @@ class TCPConnectionViewer(QMainWindow):
             self.connection_list.append(another_connection)
             self.connection_list_counter = len(self.connection_list)
 
-            # Persist to database if enabled
-            self._db_save_snapshot(snap_ts, connections, snap_agent)
-
             # Mark summary as needing update (simple bool, safe from any thread)
             self._summary_needs_update = True
 
@@ -7104,6 +7182,12 @@ class TCPConnectionViewer(QMainWindow):
         # Accumulate alerts across all cycles for the Alerts tab (newest last)
         if snap_alerts and position_timeline is None:
             self._all_alerts.extend(snap_alerts)
+
+        # Persist to database if enabled (after alerts accumulation so the
+        # full _all_alerts list is available for the worker thread)
+        if position_timeline is None:
+            self._db_save_snapshot(snap_ts, connections, snap_agent,
+                                   list(self._all_alerts) if self._all_alerts else None)
         return connections
     
     def get_coordinates(self, ip_address, ip_type):
@@ -7741,6 +7825,12 @@ class TCPConnectionViewer(QMainWindow):
                        #alerts-panel .ap-time { color:#888; font-size:10px; }
                        #alerts-panel .ap-agent { font-weight:bold; }
                        #alerts-panel .ap-plugin { color:#cc0000; }
+                       #ap-hide-btn {
+                           float:right; font-size:10px; padding:1px 7px;
+                           background:#fff; color:#cc0000; border:1px solid #cc0000;
+                           border-radius:3px; cursor:pointer; margin-top:-2px;
+                       }
+                       #ap-hide-btn:hover { background:#cc0000; color:#fff; }
                        /* Alert detail overlay (centered) */
                        #alert-detail-overlay {
                            display:none; position:absolute; top:0; left:0; width:100%; height:100%;
@@ -7808,7 +7898,7 @@ class TCPConnectionViewer(QMainWindow):
                     <span id="datetime-text"></span>
                 </div>
                 <div id="alerts-panel">
-                    <div class="ap-title">&#9888; IPAnalyze Alerts</div>
+                    <div class="ap-title">&#9888; IPAnalyze Alerts<button id="ap-hide-btn" title="Hide all previously thrown alerts">Hide previous alerts</button></div>
                     <div id="alerts-panel-list"></div>
                 </div>
                 <div id="alert-detail-overlay">
@@ -8888,6 +8978,15 @@ class TCPConnectionViewer(QMainWindow):
                                         } catch(e) { console.error('[AlertsPanel]', e); }
                                     }
                                     window.updateAlertsPanel = updateAlertsPanel;
+
+                                    // Wire hide-previous-alerts button through the bridge
+                                    var hideBtn = document.getElementById('ap-hide-btn');
+                                    if (hideBtn) {
+                                        hideBtn.onclick = function(e) {
+                                            e.stopPropagation();
+                                            if (mapBridge && typeof mapBridge.hideAlerts === 'function') { mapBridge.hideAlerts(); }
+                                        };
+                                    }
 
                                     function openAlertDetail(idx) {
                                         try {

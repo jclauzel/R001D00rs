@@ -82,6 +82,18 @@ class OracleProvider(ConnectionDatabaseProvider):
                 CREATE INDEX idx_snapshots_ts ON connection_snapshots (timestamp)
             """)
             self._conn.commit()
+        # Alerts table
+        cur.execute(
+            "SELECT COUNT(*) FROM user_tables WHERE table_name = 'IPANALYZE_ALERTS'"
+        )
+        if cur.fetchone()[0] == 0:
+            cur.execute("""
+                CREATE TABLE ipanalyze_alerts (
+                    id         NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    alert_json CLOB NOT NULL
+                )
+            """)
+            self._conn.commit()
         cur.close()
 
     # ------------------------------------------------------------------ #
@@ -152,6 +164,43 @@ class OracleProvider(ConnectionDatabaseProvider):
             return val
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------ #
+    # Alerts
+    # ------------------------------------------------------------------ #
+    def save_alerts(self, alerts: List[Dict]) -> None:
+        if self._conn is None:
+            return
+        try:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM ipanalyze_alerts")
+            for alert in alerts:
+                cur.execute(
+                    "INSERT INTO ipanalyze_alerts (alert_json) VALUES (:1)",
+                    (json.dumps(alert, default=str),),
+                )
+            self._conn.commit()
+            cur.close()
+        except Exception as e:
+            logging.error(f"Oracle save_alerts error: {e}")
+
+    def load_alerts(self) -> List[Dict]:
+        if self._conn is None:
+            return []
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT alert_json FROM ipanalyze_alerts ORDER BY id ASC")
+            rows = cur.fetchall()
+            cur.close()
+            result = []
+            for (alert_json,) in rows:
+                if hasattr(alert_json, 'read'):
+                    alert_json = alert_json.read()
+                result.append(json.loads(alert_json))
+            return result
+        except Exception as e:
+            logging.error(f"Oracle load_alerts error: {e}")
+            return []
 
     # ------------------------------------------------------------------ #
     # Maintenance

@@ -87,6 +87,15 @@ class SqlserverProvider(ConnectionDatabaseProvider):
             CREATE INDEX idx_snapshots_ts
             ON connection_snapshots (timestamp)
         """)
+        cur.execute("""
+            IF NOT EXISTS (
+                SELECT * FROM sys.tables WHERE name = 'ipanalyze_alerts'
+            )
+            CREATE TABLE ipanalyze_alerts (
+                id         INT IDENTITY(1,1) PRIMARY KEY,
+                alert_json NVARCHAR(MAX) NOT NULL
+            )
+        """)
         cur.close()
 
     # ------------------------------------------------------------------ #
@@ -144,6 +153,34 @@ class SqlserverProvider(ConnectionDatabaseProvider):
             return cur.fetchone()[0]
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------ #
+    # Alerts
+    # ------------------------------------------------------------------ #
+    def save_alerts(self, alerts: List[Dict]) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.execute("DELETE FROM ipanalyze_alerts")
+            for alert in alerts:
+                self._conn.execute(
+                    "INSERT INTO ipanalyze_alerts (alert_json) VALUES (?)",
+                    json.dumps(alert, default=str),
+                )
+        except Exception as e:
+            logging.error(f"SQL Server save_alerts error: {e}")
+
+    def load_alerts(self) -> List[Dict]:
+        if self._conn is None:
+            return []
+        try:
+            cur = self._conn.execute(
+                "SELECT alert_json FROM ipanalyze_alerts ORDER BY id ASC"
+            )
+            return [json.loads(row[0]) for row in cur.fetchall()]
+        except Exception as e:
+            logging.error(f"SQL Server load_alerts error: {e}")
+            return []
 
     # ------------------------------------------------------------------ #
     # Maintenance

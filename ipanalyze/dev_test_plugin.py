@@ -189,7 +189,7 @@ class DevTestPlugin(IPAnalyzePlugin):
             return IPAnalyzeResult(
                 found=False,
                 plugin_name="Dev Test Plugin",
-                additional_information="Failed on purpose",
+                additional_information="Simulated plugin failure",
                 status=False,
             )
         else:
