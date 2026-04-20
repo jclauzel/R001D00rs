@@ -180,7 +180,8 @@ def _parse_ptr_response(data: bytes) -> tuple[int, str | None]:
 # cache_epoch is time.time() // 60 so entries auto-expire every 60 s.
 @functools.lru_cache(maxsize=1024)
 def _dns_check_cached(dns_server: str, dns_port: int, timeout: float,
-                      ip_address: str, cache_epoch: int):
+                      ip_address: str, cache_epoch: int,
+                      suspicious_rcodes: str = "refused_only"):
     """Perform the actual DNS check.  Returns (found: bool, detail: str)."""
     try:
         packet, _rev = _build_ptr_query(ip_address)
@@ -198,8 +199,12 @@ def _dns_check_cached(dns_server: str, dns_port: int, timeout: float,
         if rcode == 3:
             return False, ""
 
-        # REFUSED (5) or SERVFAIL (2) typically mean Pi-hole is blocking
-        if rcode in (2, 5):
+        # Determine which rcodes indicate a suspicious/blocked IP
+        if suspicious_rcodes == "refused_and_servfail":
+            _sus_codes = (2, 5)  # SERVFAIL + REFUSED
+        else:
+            _sus_codes = (5,)    # REFUSED only (default)
+        if rcode in _sus_codes:
             return True, f"Pi-hole ({dns_server}): DNS rcode {rcode}"
 
         # NOERROR with a PTR answer means the name resolved normally
@@ -260,10 +265,13 @@ class PiHolePlugin(IPAnalyzePlugin):
                                        additional_information="No DNS server configured",
                                        status=False)
 
+            suspicious_rcodes = cfg.get("suspicious_rcodes", "refused_only")
+
             # cache_epoch flips every 60 s so stale entries expire automatically
             cache_epoch = int(time.time()) // 60
             found, detail = _dns_check_cached(
                 dns_server, dns_port, timeout, ip_address, cache_epoch,
+                suspicious_rcodes,
             )
             return IPAnalyzeResult(
                 found=found, plugin_name=self.name,
@@ -302,6 +310,13 @@ class PiHolePlugin(IPAnalyzePlugin):
                 "type": "str",
                 "description": "Plugin description",
             },
+            "suspicious_rcodes": {
+                "value": cfg.get("suspicious_rcodes", "refused_only"),
+                "type": "choice",
+                "choices": ["refused_only", "refused_and_servfail"],
+                "labels": ["REFUSED (5)", "REFUSED (5) and SERVFAIL (2)"],
+                "description": "Consider suspicious",
+            },
         }
 
     # --- settings dialog (plugin-owned UI) ---------------------------------
@@ -314,9 +329,9 @@ class PiHolePlugin(IPAnalyzePlugin):
         """
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import (
-            QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView, QLabel,
-            QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-            QVBoxLayout,
+            QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
+            QLabel, QMessageBox, QPushButton, QTableWidget,
+            QTableWidgetItem, QVBoxLayout,
         )
 
         settings = self.get_settings()
@@ -328,7 +343,7 @@ class PiHolePlugin(IPAnalyzePlugin):
         dialog.setMinimumWidth(500)
         root_layout = QVBoxLayout(dialog)
 
-        keys = list(settings.keys())
+        keys = [k for k in settings.keys() if settings[k].get("type") != "choice"]
         tbl = QTableWidget(len(keys), 3)
         tbl.setHorizontalHeaderLabels(["Setting", "Value", "Description"])
         tbl.horizontalHeader().setStretchLastSection(True)
@@ -345,6 +360,20 @@ class PiHolePlugin(IPAnalyzePlugin):
             tbl.setItem(i, 2, desc_item)
 
         root_layout.addWidget(tbl)
+
+        # --- "Consider suspicious" dropdown ---------------------------------
+        sus_row = QHBoxLayout()
+        sus_row.addWidget(QLabel("Consider suspicious:"))
+        sus_combo = QComboBox()
+        sus_combo.addItem("REFUSED (5)", "refused_only")
+        sus_combo.addItem("REFUSED (5) and SERVFAIL (2)", "refused_and_servfail")
+        current_sus = self.load_config().get("suspicious_rcodes", "refused_only")
+        idx = sus_combo.findData(current_sus)
+        if idx >= 0:
+            sus_combo.setCurrentIndex(idx)
+        sus_row.addWidget(sus_combo)
+        sus_row.addStretch()
+        root_layout.addLayout(sus_row)
 
         # --- Test connection row -------------------------------------------
         test_btn = QPushButton("Test dns/PiHole server connection")
@@ -414,8 +443,10 @@ class PiHolePlugin(IPAnalyzePlugin):
         if dialog.exec() == QDialog.Accepted:
             cfg = self.load_config()
             for i, key in enumerate(keys):
-                raw_value = tbl.item(i, 1).text()
                 entry = settings[key]
+                if entry.get("type") == "choice":
+                    continue  # handled separately below
+                raw_value = tbl.item(i, 1).text()
                 val_type = entry.get("type", "str")
                 try:
                     if val_type == "bool":
@@ -429,6 +460,8 @@ class PiHolePlugin(IPAnalyzePlugin):
                 except Exception:
                     parsed = raw_value
                 cfg[key] = parsed
+            # Save the suspicious_rcodes dropdown selection
+            cfg["suspicious_rcodes"] = sus_combo.currentData()
             self.save_config(cfg)
             # Clear DNS cache so new server config takes effect immediately
             _dns_check_cached.cache_clear()

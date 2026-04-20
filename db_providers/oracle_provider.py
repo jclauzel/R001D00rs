@@ -202,6 +202,21 @@ class OracleProvider(ConnectionDatabaseProvider):
             logging.error(f"Oracle load_alerts error: {e}")
             return []
 
+    def purge_alerts(self) -> int:
+        if self._conn is None:
+            return 0
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM ipanalyze_alerts")
+            count = cur.fetchone()[0]
+            cur.execute("DELETE FROM ipanalyze_alerts")
+            self._conn.commit()
+            cur.close()
+            return count
+        except Exception as e:
+            logging.error(f"Oracle purge_alerts error: {e}")
+            return 0
+
     # ------------------------------------------------------------------ #
     # Maintenance
     # ------------------------------------------------------------------ #

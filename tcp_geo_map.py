@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.8.5" # Current script version
+VERSION = "3.8.7" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -4760,6 +4760,39 @@ class TCPConnectionViewer(QMainWindow):
             self.db_provider_combo.blockSignals(True)
             self._set_db_combo_by_name(db_provider_name)
             self.db_provider_combo.blockSignals(False)
+        self._update_purge_alerts_btn_visibility()
+
+    def _update_purge_alerts_btn_visibility(self):
+        """Show the purge-alerts button only when both DB and IPAnalyze are enabled."""
+        if not hasattr(self, 'purge_alerts_btn'):
+            return
+        db_active = (self.db_provider_combo.currentData() or "Disabled") != "Disabled"
+        ipanalyze_on = self.ipanalyze_check.isChecked() if hasattr(self, 'ipanalyze_check') else False
+        self.purge_alerts_btn.setVisible(db_active and ipanalyze_on)
+
+    def _on_purge_stored_alerts(self):
+        """Prompt the user then delete all stored alerts from the database."""
+        reply = QMessageBox.question(
+            self, "Purge Stored Alerts",
+            "This will permanently delete all stored alerts, are you sure?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if self._db_provider is not None:
+            try:
+                count = self._db_provider.purge_alerts()
+                logging.info(f"Purged {count} alert(s) from database.")
+            except Exception as e:
+                logging.error(f"Failed to purge alerts: {e}")
+                QMessageBox.warning(self, "Error", f"Failed to purge alerts:\n{e}")
+                return
+        # Clear in-memory alerts and refresh UI
+        self._all_alerts.clear()
+        self._update_alerts_table()
+        self._update_alerts_tab_title()
+        self.update_map()
 
     @Slot()
     def _on_db_buffer_size_changed(self) -> None:
@@ -4997,6 +5030,7 @@ class TCPConnectionViewer(QMainWindow):
             self.tab_widget.setTabVisible(self._alerts_tab_index, enabled)
         if hasattr(self, 'ipanalyze_agents_check'):
             self.ipanalyze_agents_check.setVisible(enabled and enable_server_mode)
+        self._update_purge_alerts_btn_visibility()
 
     def _load_ipanalyze_plugins(self):
         """(Re-)load plugins from ipanalyze.json and refresh the settings table."""
@@ -5968,6 +6002,16 @@ class TCPConnectionViewer(QMainWindow):
         db_size_layout.addWidget(self.db_buffer_size_input)
         db_size_layout.addStretch()
         settings_tab_layout.addLayout(db_size_layout)
+
+        # Purge stored alerts button
+        self.purge_alerts_btn = QPushButton("Purge stored alerts from database")
+        self.purge_alerts_btn.setToolTip(
+            "Permanently delete all IPAnalyze alerts stored in the selected database."
+        )
+        self.purge_alerts_btn.clicked.connect(self._on_purge_stored_alerts)
+        self.purge_alerts_btn.setVisible(False)
+        settings_tab_layout.addWidget(self.purge_alerts_btn)
+        self._update_purge_alerts_btn_visibility()
 
         # Pause table sorting checkbox
         self.pause_table_sorting_check = QCheckBox("Pause main tab connection table sorting")
@@ -7806,7 +7850,7 @@ class TCPConnectionViewer(QMainWindow):
                        }
                        /* IPAnalyze alerts summary panel (top-right) */
                        #alerts-panel {
-                           display:none; position:absolute; top:10px; right:10px; z-index:1000;
+                           display:none; position:absolute; top:36px; right:10px; z-index:999;
                            width:300px; max-height:320px; overflow-y:auto;
                            background:rgba(255,255,255,0.93); border:1px solid #cc0000;
                            border-radius:6px; padding:6px 8px;
