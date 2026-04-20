@@ -154,6 +154,17 @@ class MongodbProvider(ConnectionDatabaseProvider):
             logging.error(f"MongoDB load_alerts error: {e}")
             return []
 
+    def purge_alerts(self) -> int:
+        if self._alerts_col is None:
+            return 0
+        try:
+            count = self._alerts_col.count_documents({})
+            self._alerts_col.delete_many({})
+            return count
+        except Exception as e:
+            logging.error(f"MongoDB purge_alerts error: {e}")
+            return 0
+
     # ------------------------------------------------------------------ #
     # Maintenance
     # ------------------------------------------------------------------ #

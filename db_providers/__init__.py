@@ -90,6 +90,10 @@ class ConnectionDatabaseProvider(abc.ABC):
     def load_alerts(self) -> List[Dict]:
         """Return all previously persisted IPAnalyze alerts."""
 
+    @abc.abstractmethod
+    def purge_alerts(self) -> int:
+        """Delete all stored alerts. Returns the number of alerts deleted."""
+
 
 # --------------------------------------------------------------------- #
 # Provider registry – discovers concrete providers in this package.

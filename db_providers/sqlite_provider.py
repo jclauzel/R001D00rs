@@ -166,6 +166,19 @@ class SqliteProvider(ConnectionDatabaseProvider):
             logging.error(f"SQLite load_alerts error: {e}")
             return []
 
+    def purge_alerts(self) -> int:
+        if self._conn is None:
+            return 0
+        try:
+            cur = self._conn.execute("SELECT COUNT(*) FROM ipanalyze_alerts")
+            count = cur.fetchone()[0]
+            self._conn.execute("DELETE FROM ipanalyze_alerts")
+            self._conn.commit()
+            return count
+        except Exception as e:
+            logging.error(f"SQLite purge_alerts error: {e}")
+            return 0
+
     # ------------------------------------------------------------------ #
     # Maintenance
     # ------------------------------------------------------------------ #
