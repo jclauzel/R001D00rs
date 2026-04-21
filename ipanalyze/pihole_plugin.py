@@ -178,53 +178,83 @@ def _parse_ptr_response(data: bytes) -> tuple[int, str | None]:
 # Module-level LRU cache for DNS results.
 # Keyed by (dns_server, dns_port, ip_address, cache_epoch).
 # cache_epoch is time.time() // 60 so entries auto-expire every 60 s.
+
+def _perform_dns_query(dns_server: str, dns_port: int, timeout: float,
+                       ip_address: str) -> tuple[int, str | None]:
+    """Perform a single DNS PTR query. Returns (rcode, ptr_name | None).
+    Raises socket.timeout, socket.gaierror, or OSError on failure."""
+    packet, _rev = _build_ptr_query(ip_address)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (dns_server, dns_port))
+        data, _ = sock.recvfrom(1024)
+    finally:
+        sock.close()
+    return _parse_ptr_response(data)
+
+
 @functools.lru_cache(maxsize=1024)
 def _dns_check_cached(dns_server: str, dns_port: int, timeout: float,
                       ip_address: str, cache_epoch: int,
-                      suspicious_flags: tuple = ("refused",)):
+                      suspicious_flags: tuple = ("refused",),
+                      timeout_strategy: str = "fail"):
     """Perform the actual DNS check.  Returns (found: bool, detail: str)."""
-    try:
-        packet, _rev = _build_ptr_query(ip_address)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
+    # Determine retry parameters based on strategy
+    if timeout_strategy == "retry_immediate":
+        max_attempts = 3
+        retry_pause = 0
+    elif timeout_strategy == "retry_with_pause":
+        max_attempts = 3
+        retry_pause = 1.0
+    else:  # "fail"
+        max_attempts = 1
+        retry_pause = 0
+
+    last_exception = None
+    for attempt in range(max_attempts):
+        if attempt > 0 and retry_pause > 0:
+            time.sleep(retry_pause)
         try:
-            sock.sendto(packet, (dns_server, dns_port))
-            data, _ = sock.recvfrom(1024)
-        finally:
-            sock.close()
+            rcode, ptr_name = _perform_dns_query(dns_server, dns_port, timeout, ip_address)
 
-        rcode, ptr_name = _parse_ptr_response(data)
+            # NXDOMAIN (3) = normal "no PTR record", NOT a Pi-hole block
+            if rcode == 3:
+                return False, ""
 
-        # NXDOMAIN (3) = normal "no PTR record", NOT a Pi-hole block
-        if rcode == 3:
+            # REFUSED (5)
+            if rcode == 5 and "refused" in suspicious_flags:
+                return True, f"Pi-hole ({dns_server}): DNS rcode {rcode} (REFUSED)"
+
+            # SERVFAIL (2)
+            if rcode == 2 and "servfail" in suspicious_flags:
+                return True, f"Pi-hole ({dns_server}): DNS rcode {rcode} (SERVFAIL)"
+
+            # NOERROR with a PTR answer means the name resolved normally
+            if rcode == 0 and ptr_name:
+                return False, f"DNS resolved: {ptr_name}"
+
+            # NOERROR but no answer data
+            if "empty_response" in suspicious_flags:
+                return True, f"Pi-hole ({dns_server}): empty DNS response"
+
             return False, ""
 
-        # REFUSED (5)
-        if rcode == 5 and "refused" in suspicious_flags:
-            return True, f"Pi-hole ({dns_server}): DNS rcode {rcode} (REFUSED)"
+        except (socket.timeout, TimeoutError) as exc:
+            last_exception = exc
+            if attempt < max_attempts - 1:
+                continue  # retry
+            # final attempt failed
+            return True, f"Pi-hole ({dns_server}): timeout (tried {max_attempts}x)"
+        except (ConnectionResetError, ConnectionRefusedError, OSError) as exc:
+            return True, f"Pi-hole ({dns_server}): {type(exc).__name__}"
+        except Exception as exc:
+            logging.error("PiHolePlugin: unexpected error checking %s: %s",
+                          ip_address, exc)
+            return False, f"Error: {exc}"
 
-        # SERVFAIL (2)
-        if rcode == 2 and "servfail" in suspicious_flags:
-            return True, f"Pi-hole ({dns_server}): DNS rcode {rcode} (SERVFAIL)"
-
-        # NOERROR with a PTR answer means the name resolved normally
-        if rcode == 0 and ptr_name:
-            return False, f"DNS resolved: {ptr_name}"
-
-        # NOERROR but no answer data
-        if "empty_response" in suspicious_flags:
-            return True, f"Pi-hole ({dns_server}): empty DNS response"
-
-        return False, ""
-
-    except (socket.timeout, TimeoutError):
-        return True, f"Pi-hole ({dns_server}): timeout"
-    except (ConnectionResetError, ConnectionRefusedError, OSError) as exc:
-        return True, f"Pi-hole ({dns_server}): {type(exc).__name__}"
-    except Exception as exc:
-        logging.error("PiHolePlugin: unexpected error checking %s: %s",
-                      ip_address, exc)
-        return False, f"Error: {exc}"
+    # Should not reach here
+    return True, f"Pi-hole ({dns_server}): timeout"
 
 
 class PiHolePlugin(IPAnalyzePlugin):
@@ -278,11 +308,13 @@ class PiHolePlugin(IPAnalyzePlugin):
                     raw_sus = ["refused"]
             suspicious_flags = tuple(sorted(raw_sus))
 
+            timeout_strategy = cfg.get("timeout_strategy", "fail")
+
             # cache_epoch flips every 60 s so stale entries expire automatically
             cache_epoch = int(time.time()) // 60
             found, detail = _dns_check_cached(
                 dns_server, dns_port, timeout, ip_address, cache_epoch,
-                suspicious_flags,
+                suspicious_flags, timeout_strategy,
             )
             return IPAnalyzeResult(
                 found=found, plugin_name=self.name,
@@ -330,6 +362,13 @@ class PiHolePlugin(IPAnalyzePlugin):
                     {"key": "empty_response", "label": "Empty DNS response"},
                 ],
                 "description": "Consider suspicious",
+            },
+            "timeout_strategy": {
+                "value": cfg.get("timeout_strategy", "fail"),
+                "type": "choice",
+                "choices": ["fail", "retry_immediate", "retry_with_pause"],
+                "labels": ["Fail", "Retry immediately 3 times", "Retry immediately 3 times with a pause of one second"],
+                "description": "On DNS timeout",
             },
         }
 
@@ -396,6 +435,22 @@ class PiHolePlugin(IPAnalyzePlugin):
             sus_layout.addWidget(cb)
             sus_checks.append((key, cb))
         root_layout.addWidget(sus_group)
+
+        # --- "On DNS timeout" dropdown ----------------------------------------
+        from PySide6.QtWidgets import QComboBox
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(QLabel("On DNS timeout:"))
+        timeout_combo = QComboBox()
+        timeout_combo.addItem("Fail", "fail")
+        timeout_combo.addItem("Retry immediately 3 times", "retry_immediate")
+        timeout_combo.addItem("Retry immediately 3 times with a pause of one second", "retry_with_pause")
+        current_timeout = self.load_config().get("timeout_strategy", "fail")
+        idx = timeout_combo.findData(current_timeout)
+        if idx >= 0:
+            timeout_combo.setCurrentIndex(idx)
+        timeout_row.addWidget(timeout_combo)
+        timeout_row.addStretch()
+        root_layout.addLayout(timeout_row)
 
         # --- Test connection row -------------------------------------------
         test_btn = QPushButton("Test dns/PiHole server connection")
@@ -485,6 +540,8 @@ class PiHolePlugin(IPAnalyzePlugin):
             # Save the suspicious flags checkboxes
             cfg.pop("suspicious_rcodes", None)  # remove legacy key
             cfg["suspicious_flags"] = [k for k, cb in sus_checks if cb.isChecked()]
+            # Save the timeout strategy dropdown
+            cfg["timeout_strategy"] = timeout_combo.currentData()
             self.save_config(cfg)
             # Clear DNS cache so new server config takes effect immediately
             _dns_check_cached.cache_clear()

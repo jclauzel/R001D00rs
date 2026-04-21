@@ -42,7 +42,7 @@ from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 DB_DIR = "databases"
 CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.8.8" # Current script version
+VERSION = "3.8.9" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -4792,7 +4792,7 @@ class TCPConnectionViewer(QMainWindow):
         self._all_alerts.clear()
         self._update_alerts_table()
         self._update_alerts_tab_title()
-        self.update_map()
+        self.update_map(self.connections)
 
     @Slot()
     def _on_db_buffer_size_changed(self) -> None:
@@ -7212,7 +7212,7 @@ class TCPConnectionViewer(QMainWindow):
 
             # Performance logging
             elapsed = time.perf_counter() - start_time
-            if elapsed > 1.0:  # Log if took more than 1 second
+            if elapsed > 4.0:  # Log if took more than 1 second
                 logging.warning(f"get_active_tcp_connections took {elapsed:.2f}s to process {len(connections)} connections")
 
         # Agent mode: POST local connections to the server
