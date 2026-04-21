@@ -282,7 +282,8 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
         dialog.setMinimumHeight(350)
         root_layout = QVBoxLayout(dialog)
         root_layout.addWidget(
-            QLabel("Configure HTTP text/CSV blocklist sources:")
+            QLabel("Configure HTTP text/CSV blocklist sources:"
+                   "\nEach source is a blocklist of suspicious IP addresses checked against every captured connection.")
         )
 
         # Column indices
@@ -422,6 +423,10 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
             # Source type combo
             source_combo = QComboBox()
             source_combo.addItems(["Http download", "File"])
+            source_combo.setToolTip(
+                "Http download: fetch the blocklist from a URL on the internet.\n"
+                "File: use a local file placed in the ipanalyze/custom_files/ folder."
+            )
             src_type = src.get("source_type", "http")
             source_combo.setCurrentText(
                 "File" if src_type == "file" else "Http download"
@@ -441,6 +446,10 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
             ttl_spin.setRange(60, 999999999)
             ttl_spin.setValue(int(src.get("ttl_seconds", 86400)))
             ttl_spin.setSuffix(" s")
+            ttl_spin.setToolTip(
+                "How long (in seconds) the downloaded blocklist is cached before being re-fetched.\n"
+                "Default is 86400 s (24 hours). Does not apply to File sources."
+            )
             tbl.setCellWidget(row, COL_TTL, ttl_spin)
             # Format combo
             fmt_combo = QComboBox()
@@ -448,12 +457,21 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
             fmt_combo.setCurrentText(
                 src.get("format", "text").lower()
             )
+            fmt_combo.setToolTip(
+                "text: one IP address per line (comments starting with # are ignored).\n"
+                "csv: a CSV file where one column contains IP addresses — set the column\n"
+                "index with the 'CSV Col' spinner (0 = first column)."
+            )
             tbl.setCellWidget(row, COL_FMT, fmt_combo)
             # CSV column spinbox
             csv_col_spin = QSpinBox()
             csv_col_spin.setRange(0, 999)
             csv_col_spin.setValue(int(src.get("csv_ip_column", 0)))
             csv_col_spin.setEnabled(fmt_combo.currentText() == "csv")
+            csv_col_spin.setToolTip(
+                "Zero-based column index that contains IP addresses in the CSV file.\n"
+                "0 = first column, 1 = second column, etc. Only used when Format is 'csv'."
+            )
             tbl.setCellWidget(row, COL_CSVCOL, csv_col_spin)
             # Wire format combo to toggle CSV col
             fmt_combo.currentTextChanged.connect(
@@ -462,6 +480,10 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
             # Enabled checkbox (centred in cell)
             chk = QCheckBox()
             chk.setChecked(bool(src.get("enabled", False)))
+            chk.setToolTip(
+                "When checked, this source is actively used when checking IPs.\n"
+                "Uncheck to temporarily disable a source without removing it."
+            )
             chk_container = QWidget()
             chk_layout = QHBoxLayout(chk_container)
             chk_layout.addWidget(chk)
@@ -495,6 +517,11 @@ class HttpTextCsvPlugin(IPAnalyzePlugin):
 
         # "+ Add source" button
         add_btn = QPushButton("+ Add source")
+        add_btn.setToolTip(
+            "Add a new blocklist source row to the table.\n"
+            "Set the source type (Http download or File), enter the URL or filename,\n"
+            "choose the format, then enable it when ready."
+        )
         add_btn.clicked.connect(lambda: _add_source_row())
         root_layout.addWidget(add_btn)
 
