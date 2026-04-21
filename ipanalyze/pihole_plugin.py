@@ -399,6 +399,12 @@ class PiHolePlugin(IPAnalyzePlugin):
         keys = [k for k in settings.keys() if settings[k].get("type") not in ("choice", "multi_check")]
         tbl = QTableWidget(len(keys), 3)
         tbl.setHorizontalHeaderLabels(["Setting", "Value", "Description"])
+        tbl.setToolTip(
+            "dns_server: hostname or IP of your Pi-hole DNS server.\n"
+            "dns_port: UDP port to query (default 53).\n"
+            "timeout_seconds: how long to wait for a DNS reply before timing out.\n"
+            "description: a label shown in the IPAnalyze plugin table."
+        )
         tbl.horizontalHeader().setStretchLastSection(True)
         tbl.setEditTriggers(QTableWidget.AllEditTriggers)
 
@@ -417,12 +423,21 @@ class PiHolePlugin(IPAnalyzePlugin):
         # --- "Consider suspicious" checkboxes --------------------------------
         from PySide6.QtWidgets import QCheckBox, QGroupBox
         sus_group = QGroupBox("Consider suspicious:")
+        sus_group.setToolTip(
+            "Select which DNS response conditions should be treated as evidence\n"
+            "that an IP address is blocked or flagged by Pi-hole."
+        )
         sus_layout = QVBoxLayout(sus_group)
         _sus_options = [
             ("refused",        "REFUSED (5)"),
             ("servfail",       "SERVFAIL (2)"),
             ("empty_response", "Empty DNS response"),
         ]
+        _sus_tips = {
+            "refused":        "DNS REFUSED (rcode 5): Pi-hole actively refused the query — strong indicator of a blocked/flagged IP.",
+            "servfail":       "DNS SERVFAIL (rcode 2): the server failed to process the query — may indicate blocking but can also be a transient error.",
+            "empty_response": "NOERROR reply with no answer records — Pi-hole returned an empty response, which is a common sinkhole pattern.",
+        }
         raw_sus = self.load_config().get("suspicious_flags",
                       self.load_config().get("suspicious_rcodes", ["refused"]))
         if isinstance(raw_sus, str):
@@ -432,6 +447,7 @@ class PiHolePlugin(IPAnalyzePlugin):
         for key, label in _sus_options:
             cb = QCheckBox(label)
             cb.setChecked(key in current_flags)
+            cb.setToolTip(_sus_tips.get(key, ""))
             sus_layout.addWidget(cb)
             sus_checks.append((key, cb))
         root_layout.addWidget(sus_group)
@@ -439,8 +455,18 @@ class PiHolePlugin(IPAnalyzePlugin):
         # --- "On DNS timeout" dropdown ----------------------------------------
         from PySide6.QtWidgets import QComboBox
         timeout_row = QHBoxLayout()
-        timeout_row.addWidget(QLabel("On DNS timeout:"))
+        timeout_label = QLabel("On DNS timeout:")
+        timeout_label.setToolTip(
+            "What to do when the Pi-hole DNS server does not reply within\n"
+            "the configured timeout_seconds window."
+        )
+        timeout_row.addWidget(timeout_label)
         timeout_combo = QComboBox()
+        timeout_combo.setToolTip(
+            "Fail: report a timeout alert immediately after a single unanswered query.\n"
+            "Retry immediately 3 times: repeat the query up to 3 times before reporting a timeout.\n"
+            "Retry 3 times with pause: same as above but waits 1 second between each attempt."
+        )
         timeout_combo.addItem("Fail", "fail")
         timeout_combo.addItem("Retry immediately 3 times", "retry_immediate")
         timeout_combo.addItem("Retry immediately 3 times with a pause of one second", "retry_with_pause")
@@ -454,6 +480,11 @@ class PiHolePlugin(IPAnalyzePlugin):
 
         # --- Test connection row -------------------------------------------
         test_btn = QPushButton("Test dns/PiHole server connection")
+        test_btn.setToolTip(
+            "Send a test DNS A-record query for 'dns.google' to the configured\n"
+            "Pi-hole server to verify it is reachable and responding correctly.\n"
+            "A green ✔ Reachable result is required before saving."
+        )
         root_layout.addWidget(test_btn)
 
         test_label = QLabel("")

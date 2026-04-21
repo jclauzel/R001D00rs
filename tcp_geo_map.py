@@ -5139,6 +5139,11 @@ class TCPConnectionViewer(QMainWindow):
             # Column 1: enabled checkbox
             chk = QCheckBox()
             chk.setChecked(getattr(plugin, '_enabled', False))
+            chk.setToolTip(
+                f"Enable or disable the '{plugin.name}' plugin.\n"
+                "When enabled, this plugin will be queried for every captured IP address\n"
+                "and will raise alerts when a suspicious IP is detected."
+            )
             chk.stateChanged.connect(lambda state, p=plugin: self._on_ipanalyze_plugin_enabled(p, state))
             cell_widget = QWidget()
             cell_layout = QHBoxLayout(cell_widget)
@@ -5148,6 +5153,10 @@ class TCPConnectionViewer(QMainWindow):
             tbl.setCellWidget(row, 1, cell_widget)
             # Column 2: Settings button
             btn = QPushButton("Settings")
+            btn.setToolTip(
+                f"Open the configuration dialog for the '{plugin.name}' plugin.\n"
+                f"{plugin.description}"
+            )
             btn.clicked.connect(lambda checked=False, p=plugin: self._on_ipanalyze_plugin_settings(p))
             tbl.setCellWidget(row, 2, btn)
         tbl.setUpdatesEnabled(True)
@@ -5502,6 +5511,11 @@ class TCPConnectionViewer(QMainWindow):
         
         # Save Button
         self.save_connections_btn = QPushButton("Save connection list to CSV file")
+        self.save_connections_btn.setToolTip(
+            "Export all currently captured connections to a CSV file on disk.\n"
+            "Opens a save dialog to choose the output path and filename.\n"
+            "The CSV includes all visible columns from the connection table."
+        )
         self.save_connections_btn.clicked.connect(self.save_all_connection_list_to_csv)
 
         self.save_connections_btn.setVisible(True)
@@ -5689,6 +5703,11 @@ class TCPConnectionViewer(QMainWindow):
 
         # Generate video button
         self.generate_video_btn = QPushButton("Generate .mp4 video file")
+        self.generate_video_btn.setToolTip(
+            "Compile all saved map screenshots into a time-lapse .mp4 video file.\n"
+            "Screenshots must first be enabled via 'Capture screenshots of the map to disk'\n"
+            "in the Settings tab. The output file will be saved to the screenshots folder."
+        )
         self.generate_video_btn.clicked.connect(self.generate_video_from_screenshots)
         self.generate_video_btn.setVisible(False)  # Hidden by default, shown when screenshots exist
 
@@ -5834,6 +5853,11 @@ class TCPConnectionViewer(QMainWindow):
 
         # Reverse DNS checkbox
         self.reverse_dns_check = QCheckBox("Perform Reverse DNS Lookup on captured IPs")
+        self.reverse_dns_check.setToolTip(
+            "Attempt to resolve each remote IP address to a hostname using reverse DNS.\n"
+            "Results appear in the 'Name' column of the connection table.\n"
+            "Disabling this speeds up capture but loses hostname labels."
+        )
         self.reverse_dns_check.setChecked(True)
         settings_tab_layout.addWidget(self.reverse_dns_check)    
         self.reverse_dns_check.stateChanged.connect(self.update_reverse_dns)
@@ -5872,6 +5896,11 @@ class TCPConnectionViewer(QMainWindow):
 
         # IPAnalyze plugin management group (visible only when enabled)
         self._ipanalyze_plugin_group = QGroupBox("IPAnalyze Plugins")
+        self._ipanalyze_plugin_group.setToolTip(
+            "Manage IP threat-intelligence plugins. Each plugin checks captured IPs\n"
+            "against a different data source (blocklists, DNS sinkholes, etc.).\n"
+            "Enable plugins individually and configure them with the Settings button."
+        )
         _ip_plugin_layout = QVBoxLayout(self._ipanalyze_plugin_group)
         self._ipanalyze_plugin_table = QTableWidget(0, 3)
         self._ipanalyze_plugin_table.setHorizontalHeaderLabels(["Plugin", "Enabled", ""])
@@ -5894,42 +5923,78 @@ class TCPConnectionViewer(QMainWindow):
 
         # Only show new connections
         self.only_show_new_connections = QCheckBox("Only show new connections")
+        self.only_show_new_connections.setToolTip(
+            "When checked, only connections first seen in the current refresh cycle\n"
+            "are shown in the connection table and on the map.\n"
+            "Useful for spotting new activity without the noise of persistent connections."
+        )
         self.only_show_new_connections.setChecked(False)
         settings_tab_layout.addWidget(self.only_show_new_connections)    
         self.only_show_new_connections.stateChanged.connect(self.only_show_new_connections_changed)
 
         # Hide remote local connections
         self.only_show_remote_connections = QCheckBox("Hide local connections and local network traffic on tables")
+        self.only_show_remote_connections.setToolTip(
+            "When checked, connections to private/LAN IP ranges (10.x, 172.16–31.x, 192.168.x)\n"
+            "and loopback addresses are hidden from the connection table and map.\n"
+            "Useful to focus on internet-facing traffic only."
+        )
         self.only_show_remote_connections.setChecked(False)
         settings_tab_layout.addWidget(self.only_show_remote_connections)    
         self.only_show_remote_connections.stateChanged.connect(self.only_show_remote_connections_changed)
 
         # Show listening connections
         self.show_listening_connections_check = QCheckBox("Show listening sockets (LISTEN state)")
+        self.show_listening_connections_check.setToolTip(
+            "When checked, sockets in the LISTEN state (bound local ports waiting for\n"
+            "incoming connections) are included in the connection table.\n"
+            "Uncheck to hide server-side listening ports and reduce table noise."
+        )
         self.show_listening_connections_check.setChecked(do_show_listening_connections)
         settings_tab_layout.addWidget(self.show_listening_connections_check)
         self.show_listening_connections_check.stateChanged.connect(self.update_show_listening_connections)
 
         # Resolve public IP using ipfy checkbox
         self.resolve_public_ip = QCheckBox("Resolve public internet IP using ipfy.com")
+        self.resolve_public_ip.setToolTip(
+            "Query ipify.org to discover the machine's current public (WAN) IP address.\n"
+            "The resolved IP is shown on the map as the local exit point.\n"
+            "Disable if outbound internet access is restricted or unwanted."
+        )
         self.resolve_public_ip.setChecked(False)
         settings_tab_layout.addWidget(self.resolve_public_ip)    
         self.resolve_public_ip.stateChanged.connect(self.update_resolve_public_ip)
 
         # Pulse exit points checkbox
         self.pulse_exit_points_check = QCheckBox("Pulse ipify.com exit points")
+        self.pulse_exit_points_check.setToolTip(
+            "Animate a pulsing ring around the public exit-point markers on the map\n"
+            "(your WAN IP and remote agent WAN IPs in server mode).\n"
+            "Useful to visually distinguish exit points from regular connection markers."
+        )
         self.pulse_exit_points_check.setChecked(do_pulse_exit_points)
         settings_tab_layout.addWidget(self.pulse_exit_points_check)
         self.pulse_exit_points_check.stateChanged.connect(self.update_pulse_exit_points)
 
         # Show traffic histogram on map checkbox
         self.show_traffic_histogram_check = QCheckBox("Show network traffic histogram on map")
+        self.show_traffic_histogram_check.setToolTip(
+            "Display a live mini bar chart in the top-left of the map showing\n"
+            "sent (red) and received (green) traffic volumes over recent cycles.\n"
+            "Requires the Scapy Live Capture or PCAP collector to be active."
+        )
         self.show_traffic_histogram_check.setChecked(do_show_traffic_histogram)
         settings_tab_layout.addWidget(self.show_traffic_histogram_check)
         self.show_traffic_histogram_check.stateChanged.connect(self.update_show_traffic_histogram)
 
         # Capture screenshots checkbox
         self.capture_screenshots_check = QCheckBox("Capture screenshots of the map to disk")
+        self.capture_screenshots_check.setToolTip(
+            "Save a PNG screenshot of the map to disk on every refresh cycle.\n"
+            "Screenshots accumulate up to the 'Maximum connection snapshots' limit,\n"
+            "after which the oldest files are deleted. These can later be compiled\n"
+            "into a video using the 'Generate .mp4 video file' button in the Actions tab."
+        )
         self.capture_screenshots_check.setChecked(False)
         settings_tab_layout.addWidget(self.capture_screenshots_check)
         self.capture_screenshots_check.stateChanged.connect(self.update_capture_screenshots)
@@ -6015,18 +6080,33 @@ class TCPConnectionViewer(QMainWindow):
 
         # Pause table sorting checkbox
         self.pause_table_sorting_check = QCheckBox("Pause main tab connection table sorting")
+        self.pause_table_sorting_check.setToolTip(
+            "Freeze the sort order of the main connection table.\n"
+            "Useful when watching specific rows without the table re-sorting\n"
+            "on every refresh cycle."
+        )
         self.pause_table_sorting_check.setChecked(False)
         self.pause_table_sorting_check.stateChanged.connect(self.update_pause_table_sorrting)
         settings_tab_layout.addWidget(self.pause_table_sorting_check)
 
         # Async connection collection checkbox
         self.collect_connections_async_check = QCheckBox("Collect connections asynchronously (prevents UI hangs during VPN switches etc.)")
+        self.collect_connections_async_check.setToolTip(
+            "Run the connection collector in a background thread so the UI stays\n"
+            "responsive during slow collection cycles (e.g. VPN reconnects, DNS delays).\n"
+            "Disable only if you experience ordering issues with connection data."
+        )
         self.collect_connections_async_check.setChecked(do_collect_connections_asynchronously)
         self.collect_connections_async_check.stateChanged.connect(self.update_collect_connections_asynchronously)
         settings_tab_layout.addWidget(self.collect_connections_async_check)
 
         # Show traffic gauge on markers checkbox
         self.show_traffic_gauge_check = QCheckBox("Show traffic gauge on map markers (sent/recv — requires Scapy or PCAP collector)")
+        self.show_traffic_gauge_check.setToolTip(
+            "Render a small vertical bar gauge on each map connection marker showing\n"
+            "the relative sent (red) and received (green) byte volumes for that connection.\n"
+            "Only available when the Scapy Live Capture or PCAP File Collector is active."
+        )
         self.show_traffic_gauge_check.setChecked(do_show_traffic_gauge)
         self.show_traffic_gauge_check.stateChanged.connect(self.update_show_traffic_gauge)
         settings_tab_layout.addWidget(self.show_traffic_gauge_check)
@@ -6038,8 +6118,15 @@ class TCPConnectionViewer(QMainWindow):
 
         collector_row = QHBoxLayout()
         collector_label = QLabel("Active collector:")
+        collector_label.setToolTip("Choose which plugin is used to collect active network connections.")
         collector_row.addWidget(collector_label)
         self._collector_combo = QComboBox()
+        self._collector_combo.setToolTip(
+            "The active connection collector plugin determines how network connections\n"
+            "are gathered. 'Scapy Live Capture' captures packets in real time (recommended).\n"
+            "'PCAP File Collector' replays a saved .pcap file. Other plugins may be\n"
+            "available depending on what is installed in the plugins/ directory."
+        )
         for plugin in self._collector_plugins:
             display_name = f"{plugin.name} (Recommended)" if plugin.name == "Scapy Live Capture" else plugin.name
             self._collector_combo.addItem(display_name)
@@ -6058,11 +6145,17 @@ class TCPConnectionViewer(QMainWindow):
         pcap_path_layout.addWidget(QLabel("PCAP file:"))
         self._pcap_path_input = QLineEdit()
         self._pcap_path_input.setPlaceholderText("Path to .pcap / .pcapng file…")
+        self._pcap_path_input.setToolTip(
+            "Full path to a Wireshark-compatible .pcap or .pcapng capture file.\n"
+            "The PCAP File Collector will replay connections from this file.\n"
+            "Use the Browse button to pick the file from a dialog."
+        )
         self._pcap_path_input.setText(getattr(self, '_pcap_file_path', ''))
         self._pcap_path_input.editingFinished.connect(self._on_pcap_path_changed)
         pcap_path_layout.addWidget(self._pcap_path_input, 1)
         pcap_browse_btn = QPushButton("Browse…")
         pcap_browse_btn.setFixedWidth(80)
+        pcap_browse_btn.setToolTip("Open a file picker to select a .pcap or .pcapng capture file")
         pcap_browse_btn.clicked.connect(self._on_pcap_browse)
         pcap_path_layout.addWidget(pcap_browse_btn)
         settings_tab_layout.addWidget(self._pcap_path_row)
@@ -6112,6 +6205,11 @@ class TCPConnectionViewer(QMainWindow):
 
         server_mode_layout = QHBoxLayout()
         self.server_mode_check = QCheckBox("Enable server mode (listen for agent connections)")
+        self.server_mode_check.setToolTip(
+            "Start a Flask HTTP server that remote agent instances can POST their\n"
+            "connection data to. The server aggregates all agent connections onto\n"
+            "a single map view. Requires a unique port that is reachable by agents."
+        )
         self.server_mode_check.setChecked(enable_server_mode)
         self.server_mode_check.stateChanged.connect(self._on_server_mode_changed)
         server_mode_layout.addWidget(self.server_mode_check)
@@ -6120,7 +6218,11 @@ class TCPConnectionViewer(QMainWindow):
         self.flask_server_port_input.setPlaceholderText("5000")
         self.flask_server_port_input.setText(str(FLASK_SERVER_PORT))
         self.flask_server_port_input.setFixedWidth(60)
-        self.flask_server_port_input.setToolTip("High port (1024–65535)")
+        self.flask_server_port_input.setToolTip(
+            "TCP port the server listens on for incoming agent connections.\n"
+            "Must be a high port between 1024 and 65535.\n"
+            "Agents must be configured to POST to the same port."
+        )
         self.flask_server_port_input.textChanged.connect(
             lambda t: self.flask_server_port_input.setStyleSheet(
                 "" if (t.isdigit() and 1024 <= int(t) <= 65535) else "border: 1px solid red;"
@@ -6133,6 +6235,11 @@ class TCPConnectionViewer(QMainWindow):
 
         agent_mode_layout = QHBoxLayout()
         self.agent_mode_check = QCheckBox("Enable agent mode:")
+        self.agent_mode_check.setToolTip(
+            "Run as an agent that periodically POSTs connection data to a remote\n"
+            "R001D00rs server. Enter the server hostname/IP and port below.\n"
+            "Agent mode and server mode can both be active simultaneously."
+        )
         self.agent_mode_check.setChecked(enable_agent_mode)
         self.agent_mode_check.stateChanged.connect(self._on_agent_mode_changed)
         agent_mode_layout.addWidget(self.agent_mode_check)
@@ -6140,6 +6247,10 @@ class TCPConnectionViewer(QMainWindow):
         # Hostname / IP of the server (no scheme, no port)
         self.agent_server_input = QLineEdit()
         self.agent_server_input.setPlaceholderText("Server hostname or IP (e.g. 192.168.1.10)")
+        self.agent_server_input.setToolTip(
+            "Hostname or IP address of the R001D00rs server to send connection data to.\n"
+            "Do not include http:// or a port number here — use the Port field instead."
+        )
         self.agent_server_input.setText(agent_server_host)
         self.agent_server_input.setMinimumWidth(220)
         self.agent_server_input.editingFinished.connect(self._on_agent_server_address_changed)
@@ -6151,7 +6262,11 @@ class TCPConnectionViewer(QMainWindow):
         self.flask_agent_port_input.setPlaceholderText("5000")
         self.flask_agent_port_input.setText(str(FLASK_AGENT_PORT))
         self.flask_agent_port_input.setFixedWidth(60)
-        self.flask_agent_port_input.setToolTip("High port (1024–65535)")
+        self.flask_agent_port_input.setToolTip(
+            "TCP port of the remote R001D00rs server this agent will POST to.\n"
+            "Must match the port configured in server mode on the receiving server.\n"
+            "Must be a high port between 1024 and 65535."
+        )
         self.flask_agent_port_input.textChanged.connect(
             lambda t: self.flask_agent_port_input.setStyleSheet(
                 "" if (t.isdigit() and 1024 <= int(t) <= 65535) else "border: 1px solid red;"
@@ -6200,6 +6315,11 @@ class TCPConnectionViewer(QMainWindow):
         actions_tab_widget.setLayout(actions_tab_layout)
 
         self.reset_connections_btn = QPushButton("Clear existing captured live connections")
+        self.reset_connections_btn.setToolTip(
+            "Discard all currently captured connection data from memory.\n"
+            "The map and tables will be empty until the next refresh cycle.\n"
+            "This does not affect any data already saved to the database."
+        )
         self.reset_connections_btn.clicked.connect(self.reset_connections)
         actions_tab_layout.addWidget(self.reset_connections_btn)
 
@@ -6228,6 +6348,11 @@ class TCPConnectionViewer(QMainWindow):
         db_group_layout.addWidget(self.db_status_table)
 
         self.refresh_all_db_btn = QPushButton("Refresh All Databases")
+        self.refresh_all_db_btn.setToolTip(
+            "Download the latest versions of all GeoIP databases from MaxMind.\n"
+            "The existing local files are replaced. An internet connection is required.\n"
+            "Databases expire after a set number of days and should be refreshed regularly."
+        )
         self.refresh_all_db_btn.clicked.connect(self._refresh_all_databases)
         db_group_layout.addWidget(self.refresh_all_db_btn)
 
@@ -6408,6 +6533,10 @@ class TCPConnectionViewer(QMainWindow):
                 self.db_status_table.setItem(row, 2, expires_item)
 
                 refresh_btn = QPushButton("Refresh")
+                refresh_btn.setToolTip(
+                    "Download the latest version of this specific database from MaxMind.\n"
+                    "Requires an internet connection. The local file will be replaced."
+                )
                 refresh_btn.clicked.connect(lambda checked=False, p=db_path, u=db_url: self._refresh_single_database(p, u))
                 self.db_status_table.setCellWidget(row, 3, refresh_btn)
 
