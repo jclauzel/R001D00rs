@@ -1,5 +1,6 @@
 __pycache__/
 plugins/__pycache__/
+ipanalyze/cache/
 connection_databases/
 pictures/
 *.pyc
