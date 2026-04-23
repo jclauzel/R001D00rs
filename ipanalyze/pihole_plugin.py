@@ -244,8 +244,10 @@ def _dns_check_cached(dns_server: str, dns_port: int, timeout: float,
             last_exception = exc
             if attempt < max_attempts - 1:
                 continue  # retry
-            # final attempt failed
-            return True, f"Pi-hole ({dns_server}): timeout (tried {max_attempts}x)"
+            # final attempt — whether it is suspicious depends on the flag
+            if "timeout" in suspicious_flags:
+                return True, f"Pi-hole ({dns_server}): timeout (tried {max_attempts}x)"
+            return False, f"Pi-hole ({dns_server}): timeout (not flagged)"
         except (ConnectionResetError, ConnectionRefusedError, OSError) as exc:
             return True, f"Pi-hole ({dns_server}): {type(exc).__name__}"
         except Exception as exc:
@@ -253,8 +255,10 @@ def _dns_check_cached(dns_server: str, dns_port: int, timeout: float,
                           ip_address, exc)
             return False, f"Error: {exc}"
 
-    # Should not reach here
-    return True, f"Pi-hole ({dns_server}): timeout"
+    # Should not reach here — treat same as timeout flag
+    if "timeout" in suspicious_flags:
+        return True, f"Pi-hole ({dns_server}): timeout"
+    return False, f"Pi-hole ({dns_server}): timeout (not flagged)"
 
 
 class PiHolePlugin(IPAnalyzePlugin):
@@ -278,6 +282,7 @@ class PiHolePlugin(IPAnalyzePlugin):
     def __init__(self):
         super().__init__()
         self._ensure_config()
+        self._first_check_time: float | None = None  # set on first check_ip call
 
     def _ensure_config(self):
         if not os.path.exists(self._config_path()):
@@ -309,6 +314,29 @@ class PiHolePlugin(IPAnalyzePlugin):
             suspicious_flags = tuple(sorted(raw_sus))
 
             timeout_strategy = cfg.get("timeout_strategy", "fail")
+
+            # --- Progressive plugin start ------------------------------------
+            warmup_str = cfg.get("progressive_start", "5")
+            if warmup_str != "disabled":
+                try:
+                    warmup_minutes = int(warmup_str)
+                except (ValueError, TypeError):
+                    warmup_minutes = 5
+                now = time.time()
+                if self._first_check_time is None:
+                    self._first_check_time = now
+                elapsed = now - self._first_check_time
+                warmup_seconds = warmup_minutes * 60
+                if elapsed < warmup_seconds:
+                    # fraction of queries to actually send: ramps 0 → 1 linearly
+                    fraction = elapsed / warmup_seconds
+                    if random.random() > fraction:
+                        # Skip this query — return clean result so no alert is raised
+                        return IPAnalyzeResult(
+                            found=False, plugin_name=self.name,
+                            additional_information="",
+                        )
+            # -----------------------------------------------------------------
 
             # cache_epoch flips every 60 s so stale entries expire automatically
             cache_epoch = int(time.time()) // 60
@@ -360,6 +388,7 @@ class PiHolePlugin(IPAnalyzePlugin):
                     {"key": "refused",        "label": "REFUSED (5)"},
                     {"key": "servfail",       "label": "SERVFAIL (2)"},
                     {"key": "empty_response", "label": "Empty DNS response"},
+                    {"key": "timeout",        "label": "Timeout"},
                 ],
                 "description": "Consider suspicious",
             },
@@ -369,6 +398,13 @@ class PiHolePlugin(IPAnalyzePlugin):
                 "choices": ["fail", "retry_immediate", "retry_with_pause"],
                 "labels": ["Fail", "Retry immediately 3 times", "Retry immediately 3 times with a pause of one second"],
                 "description": "On DNS timeout",
+            },
+            "progressive_start": {
+                "value": cfg.get("progressive_start", "5"),
+                "type": "choice",
+                "choices": ["5", "10", "30", "disabled"],
+                "labels": ["5 minutes", "10 minutes", "30 minutes", "Disabled"],
+                "description": "Progressive plugin start",
             },
         }
 
@@ -432,11 +468,36 @@ class PiHolePlugin(IPAnalyzePlugin):
             ("refused",        "REFUSED (5)"),
             ("servfail",       "SERVFAIL (2)"),
             ("empty_response", "Empty DNS response"),
+            ("timeout",        "Timeout"),
         ]
         _sus_tips = {
-            "refused":        "DNS REFUSED (rcode 5): Pi-hole actively refused the query — strong indicator of a blocked/flagged IP.",
-            "servfail":       "DNS SERVFAIL (rcode 2): the server failed to process the query — may indicate blocking but can also be a transient error.",
-            "empty_response": "NOERROR reply with no answer records — Pi-hole returned an empty response, which is a common sinkhole pattern.",
+            "refused":        (
+                "DNS REFUSED (rcode 5): Pi-hole actively refused the PTR query.\n"
+                "This is the strongest indicator that the IP is blocked by Pi-hole.\n"
+                "Recommended: keep checked."
+            ),
+            "servfail":       (
+                "DNS SERVFAIL (rcode 2): the server encountered an internal failure.\n"
+                "May indicate blocking but can also be a transient DNS server error.\n"
+                "Consider enabling only if your Pi-hole consistently returns SERVFAIL\n"
+                "for blocked domains rather than REFUSED."
+            ),
+            "empty_response": (
+                "NOERROR reply with no answer records — Pi-hole returned a sinkhole\n"
+                "empty response (common pattern for some blocklist configurations).\n"
+                "Enable if your Pi-hole is configured to return NOERROR with no data\n"
+                "instead of REFUSED for blocked IPs."
+            ),
+            "timeout":        (
+                "DNS query timed out — no reply received within timeout_seconds.\n\n"
+                "By default this is NOT checked, so timeouts are silently ignored\n"
+                "and never raise alerts. This is the safest setting for slow DNS\n"
+                "servers or during startup warm-up (see Progressive plugin start below).\n\n"
+                "Enable only if you want unanswered queries to be treated as suspicious\n"
+                "(e.g. your Pi-hole drops queries to blocked IPs instead of replying).\n"
+                "Combine with 'Retry' options above to avoid false positives from\n"
+                "transient network glitches."
+            ),
         }
         raw_sus = self.load_config().get("suspicious_flags",
                       self.load_config().get("suspicious_rcodes", ["refused"]))
@@ -477,6 +538,38 @@ class PiHolePlugin(IPAnalyzePlugin):
         timeout_row.addWidget(timeout_combo)
         timeout_row.addStretch()
         root_layout.addLayout(timeout_row)
+
+        # --- "Progressive plugin start" combo ---------------------------------
+        progressive_row = QHBoxLayout()
+        progressive_label = QLabel("Progressive plugin start:")
+        progressive_label.setToolTip(
+            "Gradually ramp up the number of DNS queries sent to Pi-hole after startup,\n"
+            "allowing the DNS server to build its cache smoothly without being overwhelmed.\n\n"
+            "During the warmup period, only a small fraction of queries are actually sent\n"
+            "(starting near 0% and reaching 100% at the end of the selected time).\n"
+            "Queries that are skipped return a clean 'not found' result so no false alerts\n"
+            "are raised. Once the warmup period ends, all queries are sent normally.\n\n"
+            "Set to 'Disabled' to always send every query from the moment the plugin starts."
+        )
+        progressive_row.addWidget(progressive_label)
+        progressive_combo = QComboBox()
+        progressive_combo.setToolTip(
+            "5 minutes: ramp from 0% to 100% queries over 5 minutes after startup.\n"
+            "10 minutes: ramp over 10 minutes.\n"
+            "30 minutes: ramp over 30 minutes (recommended for large networks).\n"
+            "Disabled: send all queries immediately from startup."
+        )
+        progressive_combo.addItem("5 minutes",  "5")
+        progressive_combo.addItem("10 minutes", "10")
+        progressive_combo.addItem("30 minutes", "30")
+        progressive_combo.addItem("Disabled",   "disabled")
+        current_progressive = self.load_config().get("progressive_start", "5")
+        p_idx = progressive_combo.findData(current_progressive)
+        if p_idx >= 0:
+            progressive_combo.setCurrentIndex(p_idx)
+        progressive_row.addWidget(progressive_combo)
+        progressive_row.addStretch()
+        root_layout.addLayout(progressive_row)
 
         # --- Test connection row -------------------------------------------
         test_btn = QPushButton("Test dns/PiHole server connection")
@@ -573,6 +666,8 @@ class PiHolePlugin(IPAnalyzePlugin):
             cfg["suspicious_flags"] = [k for k, cb in sus_checks if cb.isChecked()]
             # Save the timeout strategy dropdown
             cfg["timeout_strategy"] = timeout_combo.currentData()
+            # Save the progressive start dropdown
+            cfg["progressive_start"] = progressive_combo.currentData()
             self.save_config(cfg)
             # Clear DNS cache so new server config takes effect immediately
             _dns_check_cached.cache_clear()
