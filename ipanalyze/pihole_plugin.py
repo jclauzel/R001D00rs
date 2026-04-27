@@ -248,6 +248,10 @@ def _dns_check_cached(dns_server: str, dns_port: int, timeout: float,
             if "timeout" in suspicious_flags:
                 return True, f"Pi-hole ({dns_server}): timeout (tried {max_attempts}x)"
             return False, f"Pi-hole ({dns_server}): timeout (not flagged)"
+        except socket.gaierror as exc:
+            if "gaierror" in suspicious_flags:
+                return True, f"Pi-hole ({dns_server}): gaierror (cannot resolve DNS server address)"
+            return False, f"Pi-hole ({dns_server}): gaierror (not flagged)"
         except (ConnectionResetError, ConnectionRefusedError, OSError) as exc:
             return True, f"Pi-hole ({dns_server}): {type(exc).__name__}"
         except Exception as exc:
@@ -389,6 +393,7 @@ class PiHolePlugin(IPAnalyzePlugin):
                     {"key": "servfail",       "label": "SERVFAIL (2)"},
                     {"key": "empty_response", "label": "Empty DNS response"},
                     {"key": "timeout",        "label": "Timeout"},
+                    {"key": "gaierror",       "label": "Address resolution error (gaierror)"},
                 ],
                 "description": "Consider suspicious",
             },
@@ -469,6 +474,7 @@ class PiHolePlugin(IPAnalyzePlugin):
             ("servfail",       "SERVFAIL (2)"),
             ("empty_response", "Empty DNS response"),
             ("timeout",        "Timeout"),
+            ("gaierror",       "Address resolution error (gaierror)"),
         ]
         _sus_tips = {
             "refused":        (
@@ -497,6 +503,14 @@ class PiHolePlugin(IPAnalyzePlugin):
                 "(e.g. your Pi-hole drops queries to blocked IPs instead of replying).\n"
                 "Combine with 'Retry' options above to avoid false positives from\n"
                 "transient network glitches."
+            ),
+            "gaierror":       (
+                "socket.gaierror: the DNS server hostname could not be resolved\n"
+                "(e.g. 'pi.hole' is not resolvable on this network).\n\n"
+                "By default this is NOT checked, so address-resolution failures are\n"
+                "silently ignored and never raise alerts.\n\n"
+                "Enable only if you want an unresolvable Pi-hole address to be\n"
+                "treated as suspicious and raise an alert."
             ),
         }
         raw_sus = self.load_config().get("suspicious_flags",
