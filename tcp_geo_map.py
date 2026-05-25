@@ -10707,6 +10707,9 @@ class TCPConnectionViewer(QMainWindow):
             logging.error(f"on_table_cell_clicked error: {e}")
 
 def main():
+    # QtWebEngine (Chromium) refuses to run as root without --no-sandbox.
+    if hasattr(os, "getuid") and os.getuid() == 0 and "--no-sandbox" not in sys.argv:
+        sys.argv.append("--no-sandbox")
     app = QApplication(sys.argv)
     _app_font = QFont("Consolas")
     _app_font.setStyleHint(QFont.StyleHint.Monospace)
