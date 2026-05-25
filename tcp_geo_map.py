@@ -10708,6 +10708,14 @@ class TCPConnectionViewer(QMainWindow):
 
 def main():
     # QtWebEngine (Chromium) refuses to run as root without --no-sandbox.
+    # Must be set via the environment variable before QApplication is created;
+    # sys.argv injection is not picked up reliably by the embedded Chromium.
+    if hasattr(os, "getuid") and os.getuid() == 0:
+        existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+        if "--no-sandbox" not in existing:
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+                (existing + " --no-sandbox").strip()
+            )
     if hasattr(os, "getuid") and os.getuid() == 0 and "--no-sandbox" not in sys.argv:
         sys.argv.append("--no-sandbox")
     app = QApplication(sys.argv)
