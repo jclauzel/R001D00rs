@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {
+      "url": "",
+      "description": "Add a URL to a text/CSV IP blocklist",
+      "ttl_seconds": 86400,
+      "enabled": false
+    }
+  ]
+}
