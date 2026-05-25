@@ -23,6 +23,8 @@ Ever wondered what endpoints a machine is connecting to, or whether it is sendin
 
 On Windows it is recommended to install [Npcap](https://npcap.com/) for full Layer 2 capture; without it the collector falls back to Layer 3. Administrative/root privileges are required for raw socket access regardless of Npcap presence.²
 
+For full network capture on linux using the recommended scapy collector (by default) you may use: ./run_as_root.sh to start the application from your virtual env to run as root otherwise sent/recv byte gauges will not apear for example.
+
 ---
 
 ## Built-in connection collector plugins
