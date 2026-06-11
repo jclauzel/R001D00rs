@@ -6566,8 +6566,11 @@ class TCPConnectionViewer(QMainWindow):
                     self._geo_cache.clear()
 
             except Exception as reload_err:
+                # When --accept_eula is passed we should not block the UI with a modal dialog.
+                # Instead log the error and allow the application to continue running.
                 logging.error(f"Failed to reload database {db_path}: {reload_err}")
-                QMessageBox.warning(self, "Reload Error", f"Database downloaded but failed to reload: {reload_err}")
+                if not ACCEPT_EULA:
+                    QMessageBox.warning(self, "Reload Error", f"Database downloaded but failed to reload: {reload_err}")
 
             # Refresh the status table display
             self._populate_db_status_table()
