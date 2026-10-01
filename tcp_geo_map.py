@@ -23,7 +23,7 @@ import ipaddress
 from collections import deque
 
 # --- PySide6 imports (for Qt integration) ---
-from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QSize, Qt, QThreadPool
+from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QRect, QSize, Qt, QThreadPool
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
 from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics
@@ -39,10 +39,15 @@ from plugins.os_conn_table import get_os_connections as _get_os_connections
 from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 
 # --- Constants that must be defined early ---
-DB_DIR = "databases"
-CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
+# Everything the application reads or writes (settings.json, databases/,
+# connection_databases/, screen_captures/, resources/) lives next to this
+# script, whatever working directory it was launched from.  Anchor every
+# data path on APP_DIR rather than on the process cwd.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.join(APP_DIR, "databases")
+CONNECTION_DATABASES_DIR = os.path.join(APP_DIR, "connection_databases")  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.9.0" # Current script version
+VERSION = "3.10.0" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -53,7 +58,7 @@ import json
 import logging
 
 # --- PySide6 imports (for Qt integration) ---
-from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QSize
+from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QRect, QSize
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
 from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics
@@ -162,11 +167,29 @@ class AsyncDNSWorker:
                 self.queue.task_done()
             except Exception:
                 pass
-SCREENSHOTS_DIR = "screen_captures"  # Screenshot directory for captured map images
+SCREENSHOTS_DIR = os.path.join(APP_DIR, "screen_captures")  # Screenshot directory for captured map images
 
 IPV4_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv4.mmdb")
 IPV6_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv6.mmdb")
-SETTINGS_FILE_NAME = "settings.json"
+SETTINGS_FILE_NAME = os.path.join(APP_DIR, "settings.json")
+
+
+def _write_settings_file(settings):
+    """Write settings.json atomically (temp file + os.replace) so that a crash
+    or power loss mid-write cannot leave a truncated file behind.  Falls back
+    to an in-place write if the rename is refused (e.g. the file is locked)."""
+    tmp_name = SETTINGS_FILE_NAME + ".tmp"
+    try:
+        with open(tmp_name, 'w') as f:
+            json.dump(settings, f, indent=4)
+        os.replace(tmp_name, SETTINGS_FILE_NAME)
+    except OSError:
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
+        with open(SETTINGS_FILE_NAME, 'w') as f:
+            json.dump(settings, f, indent=4)
 
 # Default logging level — overridden at startup by loggingLevel in settings.json
 logging_level = "WARNING"  # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -247,6 +270,9 @@ Options:
   --no_ui
       Run as a headless background agent — no window is shown and no taskbar
       button is created. Only meaningful when combined with --enable_agent_mode.
+      Stop it with Ctrl-C or Ctrl-Break (Windows) or kill <pid> / SIGTERM /
+      SIGHUP (Linux, unless started with nohup): the agent stops its collector,
+      closes the database provider and saves settings.json before exiting.
 
   --no_ui_off
       Explicitly disable agent headless mode and persist that choice to settings.json
@@ -286,7 +312,7 @@ GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT = GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT=
 TILE_OPENSTREETMAP_SERVER = "tile.openstreetmap.org"
 
 # Leaflet resources configuration
-RESOURCES_DIR = "resources"
+RESOURCES_DIR = os.path.join(APP_DIR, "resources")
 LEAFLET_DIR = os.path.join(RESOURCES_DIR, "leaflet")
 LEAFLET_CSS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
 LEAFLET_JS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -420,7 +446,7 @@ if "--no_ui" in sys.argv:
 _no_ui_off_requested = "--no_ui_off" in sys.argv
 if _no_ui_off_requested:
     agent_no_ui = False
-    _settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
+    _settings_path = SETTINGS_FILE_NAME
     try:
         _s = {}
         if os.path.exists(_settings_path):
@@ -1209,10 +1235,19 @@ class TCPConnectionViewer(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"TCP/UDP Geo Map - R001D00rs - v {VERSION}")
         self.setGeometry(100, 100, 1200, 800)
-        # pending restore info will be applied on first showEvent to avoid races
-        self._pending_restore = None
+        # Last known window placement (state / normal geometry / monitor).
+        # Seeded from settings.json by _load_settings_early(), refreshed by
+        # _capture_window_placement() whenever the window is really on screen
+        # and applied before the first show() by _restore_window_placement().
+        self._window_placement = None
+        self._window_placement_save_timer = None
+        self._pending_placement = None  # placement waiting for its monitor to be connected
+        self._shutdown_done = False     # _shutdown() runs once, from closeEvent or aboutToQuit
 
-        # Initialize saved map state (will be loaded from settings if available)
+        # Last known map position (centre / zoom).  Seeded from settings.json
+        # by _load_settings_early(), refreshed by _capture_map_state() whenever
+        # the live Leaflet map answers, injected into the map HTML by update_map()
+        # and always written back by save_settings().
         self.saved_map_center_lat = None
         self.saved_map_center_lng = None
         self.saved_map_zoom = None
@@ -1381,6 +1416,10 @@ class TCPConnectionViewer(QMainWindow):
         # Apply UI-dependent settings after UI is created
         self._apply_settings_to_ui()
 
+        # Put the window on its saved monitor / geometry / state now, before
+        # main() shows it, so that it appears directly in place.
+        self._restore_window_placement()
+
         # Start background threads now that QWebEngineView / Chromium heap is
         # fully initialised.  Starting them earlier races with PartitionAlloc
         # and causes intermittent STATUS_HEAP_CORRUPTION (0xC0000374) crashes.
@@ -1523,72 +1562,258 @@ class TCPConnectionViewer(QMainWindow):
             logging.error(f"Error showing map init error: {e}")
 
     def _toggle_fullscreen(self):
-        """Toggle between fullscreen and normal state (defensive)."""
+        """Toggle fullscreen on/off (defensive).
+
+        Only the FullScreen bit is flipped so that a window that was maximized
+        before F11 comes back maximized afterwards (showFullScreen()/showNormal()
+        would both discard the Maximized state).
+        """
         try:
             win_state = self.windowState()
             is_fs = bool(win_state & Qt.WindowFullScreen) or self.isFullScreen()
             if is_fs:
-                # leave fullscreen -> restore normal / maximized as appropriate
-                self.showNormal()
+                self.setWindowState(win_state & ~Qt.WindowFullScreen)
             else:
-                self.showFullScreen()
+                self.setWindowState(win_state | Qt.WindowFullScreen)
         except Exception:
             pass
 
-    def _go_fullscreen_on_screen(self, screen):
-        """Move window to `screen` and enter fullscreen (defensive)."""
+    # ------------------------------------------------------------------
+    # Window placement (monitor / position / state) persistence
+    # ------------------------------------------------------------------
+    _WINDOW_PLACEMENT_SAVE_DELAY_MS = 750       # debounce for move/resize bursts
+    _WINDOW_PLACEMENT_SCREEN_WAIT_MS = 30000    # how long to wait for a missing monitor
+
+    def _capture_window_placement(self):
+        """Snapshot the window state, normal geometry and monitor into
+        self._window_placement and return it.
+
+        Returns None (leaving the previous snapshot untouched) while the window
+        is not on screen yet or in headless agent mode: save_settings() runs
+        many times during start-up and must not replace the placement loaded
+        from settings.json with the default geometry.
+        """
+        if agent_no_ui and enable_agent_mode:
+            return None
         try:
-            # set the QWindow's screen if possible so fullscreen happens on the target monitor
+            wh = self.windowHandle()
+            if wh is None or not self.isVisible():
+                return None
+            win_state = self.windowState()
+            if win_state & Qt.WindowFullScreen:
+                state = 'fullscreen'
+            elif win_state & Qt.WindowMaximized:
+                state = 'maximized'
+            else:
+                state = 'normal'
+            # normalGeometry() is the un-maximized rectangle; geometry() is only
+            # meaningful in the normal state (both stay valid while minimized).
+            rect = self.geometry() if state == 'normal' else self.normalGeometry()
+            if rect.width() < 100 or rect.height() < 100:
+                return None
+            screen = wh.screen()
+            placement = {
+                'state': state,
+                'geometry': [rect.x(), rect.y(), rect.width(), rect.height()],
+                'screen_name': screen.name() if screen is not None else None,
+                'screen_serial': screen.serialNumber() if screen is not None else None,
+                'screen_geometry': list(screen.geometry().getRect()) if screen is not None else None,
+            }
+        except Exception as e:
+            logging.debug(f"Could not capture window placement: {e}")
+            return None
+        self._window_placement = placement
+        return placement
+
+    def _window_placement_settings(self):
+        """settings.json entries describing the window placement.  The legacy
+        is_fullscreen / is_maximized / fullscreen_screen_name keys are kept in
+        sync so that older versions of this script still restore the state."""
+        wp = self._window_placement
+        return {
+            'window_placement': wp,
+            'is_fullscreen': bool(wp and wp.get('state') == 'fullscreen'),
+            'is_maximized': bool(wp and wp.get('state') == 'maximized'),
+            'fullscreen_screen_name': wp.get('screen_name') if wp else None,
+        }
+
+    @staticmethod
+    def _window_placement_from_settings(settings):
+        """Parse the window placement out of a loaded settings dict.
+
+        Understands the 'window_placement' dict and, for files written by
+        versions <= 3.9.0, the legacy state / monitor-name keys (no geometry).
+        Returns None when nothing usable is stored.
+        """
+        def _rect(value):
+            if (isinstance(value, (list, tuple)) and len(value) == 4
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
+                return [int(v) for v in value]
+            return None
+
+        wp = settings.get('window_placement')
+        if isinstance(wp, dict) and wp.get('state') in ('normal', 'maximized', 'fullscreen'):
+            return {
+                'state': wp['state'],
+                'geometry': _rect(wp.get('geometry')),
+                'screen_name': wp.get('screen_name') or None,
+                'screen_serial': wp.get('screen_serial') or None,
+                'screen_geometry': _rect(wp.get('screen_geometry')),
+            }
+        if settings.get('is_fullscreen'):
+            state = 'fullscreen'
+        elif settings.get('is_maximized'):
+            state = 'maximized'
+        else:
+            return None
+        return {'state': state, 'geometry': None,
+                'screen_name': settings.get('fullscreen_screen_name') or None,
+                'screen_serial': None, 'screen_geometry': None}
+
+    def _schedule_window_placement_save(self):
+        """Persist the placement shortly after the last move / resize / state change."""
+        if agent_no_ui and enable_agent_mode:
+            return
+        timer = getattr(self, '_window_placement_save_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self._WINDOW_PLACEMENT_SAVE_DELAY_MS)
+            timer.timeout.connect(self._save_window_placement)
+            self._window_placement_save_timer = timer
+        timer.start()
+
+    def _save_window_placement(self):
+        """Write only the window placement keys into settings.json.
+
+        Much lighter than save_settings() (no synchronous JavaScript round-trip
+        for the map state, no widget introspection), so it can run after every
+        move / resize.  Keeping the file current is what makes the placement
+        survive Ctrl-C, a killed process or a crash, none of which reach
+        closeEvent().
+        """
+        try:
+            timer = getattr(self, '_window_placement_save_timer', None)
+            if timer is not None:
+                timer.stop()
+            if self._capture_window_placement() is None:
+                return
+            if not os.path.exists(SETTINGS_FILE_NAME):
+                # First run: save_settings() creates the file on close, which
+                # keeps the first-run detection in _load_settings_early() intact.
+                return
+            with open(SETTINGS_FILE_NAME, 'r') as f:
+                settings = json.load(f)
+            if not isinstance(settings, dict):
+                return
+            settings.update(self._window_placement_settings())
+            _write_settings_file(settings)
+        except Exception as e:
+            logging.debug(f"Could not persist window placement: {e}")
+
+    def _restore_window_placement(self):
+        """Put the window on its saved monitor, geometry and state before it is
+        first shown.
+
+        Doing this before main() calls show() means the native window is
+        created directly in place: no jump from the default (100, 100)
+        rectangle on the primary monitor and no timer racing the window
+        system (the former showEvent + QTimer.singleShot(50) approach).
+        If the saved monitor is not connected right now (docking station,
+        monitor still waking up after sleep) the window is shown on the best
+        remaining screen and moved over as soon as that monitor appears,
+        within _WINDOW_PLACEMENT_SCREEN_WAIT_MS.
+        """
+        if agent_no_ui and enable_agent_mode:
+            return
+        wp = self._window_placement
+        if not wp:
+            return
+        try:
+            screens = QApplication.screens()
+            screen = _match_screen(screens, wp)
+            if screen is None:
+                screen = _fallback_screen(screens, wp)
+                if screen is None:
+                    return
+                logging.info(f"Saved monitor {wp.get('screen_name')!r} is not connected; "
+                             f"showing the window on {screen.name()!r} meanwhile")
+                if wp.get('screen_name') or wp.get('screen_serial'):
+                    self._wait_for_saved_screen(wp)
+            self._apply_window_placement(screen, wp)
+        except Exception as e:
+            logging.warning(f"Could not restore window placement: {e}")
+
+    def _apply_window_placement(self, screen, wp):
+        """Move the window onto `screen` using the geometry / state in `wp`.
+        Works both before the first show() and on an already visible window."""
+        state = wp.get('state', 'normal')
+        avail = screen.availableGeometry()
+        geom = wp.get('geometry')
+        if geom:
+            rect = QRect(*geom)
+        else:
+            # legacy settings carried no geometry: default size, centred on the monitor
+            rect = QRect(0, 0, 1200, 800)
+            rect.moveCenter(avail.center())
+        areas = [s.availableGeometry() for s in QApplication.screens()]
+        if not avail.intersects(rect) or not _rect_is_reachable(rect, areas):
+            rect = _fit_rect_to_area(rect, avail)
+        try:
+            # Qt >= 6.1: lets Windows resolve maximized / fullscreen on that monitor
+            self.setScreen(screen)
+        except Exception:
+            pass
+        if self.isVisible() and (self.windowState() & (Qt.WindowMaximized | Qt.WindowFullScreen)):
+            # late move: leave maximized / fullscreen so the new geometry sticks
+            self.setWindowState(Qt.WindowNoState)
+        self.setGeometry(rect)
+        if state == 'fullscreen':
+            self.setWindowState(Qt.WindowFullScreen)
+        elif state == 'maximized':
+            self.setWindowState(Qt.WindowMaximized)
+        logging.info(f"Window placement restored: {state} on {screen.name()!r} at {rect.getRect()}")
+
+    def _wait_for_saved_screen(self, wp):
+        """The saved monitor is absent: watch QGuiApplication.screenAdded for a
+        while and move the window there once it shows up."""
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._pending_placement = dict(wp)
+
+        def _on_screen_added(_screen):
+            pending = self._pending_placement
+            if not pending or _match_screen(QApplication.screens(), pending) is None:
+                return
+            self._pending_placement = None
             try:
-                wh = self.windowHandle()
-                if wh is not None:
-                    wh.setScreen(screen)
+                app.screenAdded.disconnect(_on_screen_added)
             except Exception:
                 pass
+            # give the window system a moment to finish adding the screen,
+            # then look the monitor up again rather than holding a QScreen reference
+            QTimer.singleShot(250, lambda: self._apply_pending_placement(pending))
 
-            # move the window top-left to the target screen origin (helps some WM/OS combos)
-            try:
-                geom = screen.geometry()
-                self.move(geom.x(), geom.y())
-            except Exception:
-                pass
-
-            # finally request fullscreen; fall back to show() if it fails
-            try:
-                self.showFullScreen()
-            except Exception:
+        def _give_up():
+            if self._pending_placement is not None:
+                self._pending_placement = None
                 try:
-                    self.show()
+                    app.screenAdded.disconnect(_on_screen_added)
                 except Exception:
                     pass
-        except Exception:
-            pass
 
-    def _go_maximized_on_screen(self, screen):
-        """Move window to `screen` and enter maximized state (defensive)."""
+        app.screenAdded.connect(_on_screen_added)
+        QTimer.singleShot(self._WINDOW_PLACEMENT_SCREEN_WAIT_MS, _give_up)
+
+    def _apply_pending_placement(self, pending):
         try:
-            try:
-                wh = self.windowHandle()
-                if wh is not None:
-                    wh.setScreen(screen)
-            except Exception:
-                pass
-
-            try:
-                geom = screen.geometry()
-                self.move(geom.x(), geom.y())
-            except Exception:
-                pass
-
-            try:
-                self.showMaximized()
-            except Exception:
-                try:
-                    self.show()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            screen = _match_screen(QApplication.screens(), pending)
+            if screen is not None:
+                logging.info(f"Saved monitor {screen.name()!r} connected; moving the window there")
+                self._apply_window_placement(screen, pending)
+        except Exception as e:
+            logging.debug(f"Could not move the window to its saved monitor: {e}")
 
     def get_map_state(self):
         """Get current map center and zoom from JavaScript (synchronous via QEventLoop with timeout)"""
@@ -1700,6 +1925,45 @@ class TCPConnectionViewer(QMainWindow):
             logging.warning("get_map_state: No valid center in result")
             return None
 
+    def _capture_map_state(self):
+        """Refresh the cached map position (self.saved_map_center_lat / _lng /
+        saved_map_zoom) from the live Leaflet map and return the new state.
+
+        Returns None (leaving the cached values untouched) while the map is
+        not initialised yet, when the synchronous JavaScript round-trip times
+        out or when the answer is incomplete: save_settings() runs many times
+        during start-up and must not drop the position loaded from
+        settings.json.
+        """
+        map_state = self.get_map_state()
+        if not map_state:
+            return None
+        center = map_state.get('center')
+        if not isinstance(center, dict):
+            return None
+        lat, lng, zoom = center.get('lat'), center.get('lng'), map_state.get('zoom')
+        if lat is None or lng is None or zoom is None:
+            logging.debug(f"Ignoring incomplete map state: {map_state}")
+            return None
+        self.saved_map_center_lat = lat
+        self.saved_map_center_lng = lng
+        self.saved_map_zoom = zoom
+        return map_state
+
+    def _map_state_settings(self):
+        """settings.json entries describing the map position, taken from the
+        cached values so that a save before the map is ready (or after a
+        JavaScript timeout) keeps the previously stored position.  Empty when
+        no position is known yet."""
+        if (self.saved_map_center_lat is None or self.saved_map_center_lng is None
+                or self.saved_map_zoom is None):
+            return {}
+        return {
+            'map_center_lat': self.saved_map_center_lat,
+            'map_center_lng': self.saved_map_center_lng,
+            'map_zoom': self.saved_map_zoom,
+        }
+
     def changeEvent(self, event):
         """Handle window state changes (fullscreen, maximize, minimize, etc.)"""
         try:
@@ -1717,6 +1981,7 @@ class TCPConnectionViewer(QMainWindow):
                 # Schedule a delayed layout update to ensure proper rendering
                 # This fixes the map overlapping issue when entering fullscreen via double-click
                 QTimer.singleShot(100, self._update_layout_after_state_change)
+                self._schedule_window_placement_save()
         except Exception:
             pass
 
@@ -1829,6 +2094,16 @@ class TCPConnectionViewer(QMainWindow):
         QTimer.singleShot(0, self._sync_filter_widths)
         QTimer.singleShot(0, self._sync_summary_filter_widths)
 
+        self._schedule_window_placement_save()
+
+    def moveEvent(self, event):
+        """Persist the window position (debounced) so it is restored on the next start"""
+        try:
+            super().moveEvent(event)
+        except Exception:
+            pass
+        self._schedule_window_placement_save()
+
     def save_settings(self):
         """Save current settings to a JSON file"""
 
@@ -1879,14 +2154,21 @@ class TCPConnectionViewer(QMainWindow):
             'loggingLevel': logging_level,
         }
 
-        # Save current map position and zoom
+        # Save current map position and zoom.  The cached position only
+        # refreshes when the live map answers; before the map is initialised
+        # (or after a JavaScript timeout) the position loaded from
+        # settings.json is written back unchanged.
+        map_state = None
         try:
-            map_state = self.get_map_state()
-            if map_state and map_state['center']:
-                settings['map_center_lat'] = map_state['center']['lat']
-                settings['map_center_lng'] = map_state['center']['lng']
-                settings['map_zoom'] = map_state['zoom']
+            map_state = self._capture_map_state()
+        except Exception as e:
+            logging.warning(f"Failed to read map state: {e}")
+        try:
+            settings.update(self._map_state_settings())
+            if map_state:
                 logging.info(f"Saved map state: center=({settings['map_center_lat']}, {settings['map_center_lng']}), zoom={settings['map_zoom']}")
+            elif 'map_zoom' in settings:
+                logging.debug(f"Map state not available; keeping saved map state: center=({settings['map_center_lat']}, {settings['map_center_lng']}), zoom={settings['map_zoom']}")
             else:
                 logging.debug("No map state to save (map not initialized or no valid state)")
         except Exception as e:
@@ -1904,31 +2186,24 @@ class TCPConnectionViewer(QMainWindow):
             # don't fail saving other settings for splitter issues
             pass
 
+        # Window placement (monitor / normal geometry / state).  The snapshot
+        # only refreshes while the window is really on screen; before that the
+        # placement loaded from settings.json is written back unchanged.
         try:
-            # record fullscreen / maximized info so we can restore on the same monitor
-            # prefer explicit window state bitmask check over isFullScreen() alone
-            win_state = self.windowState()
-            is_fs = bool(win_state & Qt.WindowFullScreen) or self.isFullScreen()
-            is_max = bool(win_state & Qt.WindowMaximized) or self.isMaximized()
-
-            settings['is_fullscreen'] = is_fs
-            settings['is_maximized'] = is_max
-            settings['fullscreen_screen_name'] = None
-            try:
-                wh = self.windowHandle()
-                if wh is not None and wh.screen() is not None:
-                    settings['fullscreen_screen_name'] = wh.screen().name()
-            except Exception:
-                # ignore if windowHandle not available
-                pass
+            self._capture_window_placement()
+            settings.update(self._window_placement_settings())
         except Exception:
             pass
 
         try:
-            with open(SETTINGS_FILE_NAME, 'w') as f:
-                json.dump(settings, f, indent=4)
+            _write_settings_file(settings)
         except Exception as e:
-            QMessageBox.critical(self, "Error saving settings", f"Error: {e}")
+            if (agent_no_ui and enable_agent_mode) or not self.isVisible():
+                # Headless agent or window already gone (quit via signal): a modal
+                # dialog would stall the shutdown with nobody to dismiss it.
+                logging.error(f"Error saving settings: {e}")
+            else:
+                QMessageBox.critical(self, "Error saving settings", f"Error: {e}")
             
 
     def _load_settings_early(self):
@@ -2133,49 +2408,13 @@ class TCPConnectionViewer(QMainWindow):
                 except Exception as e:
                     logging.warning(f"Error loading map state: {e}")
 
-                # Store fullscreen/maximize info for later application
+                # Window placement (monitor / geometry / state); applied by
+                # _restore_window_placement() once the UI exists, before show().
                 try:
-                    is_fs = settings.get('is_fullscreen', False)
-                    is_max = settings.get('is_maximized', False)
-                    screen_name = settings.get('fullscreen_screen_name')
-
-                    restored = False
-
-                    if is_fs:
-                        if screen_name:
-                            target = None
-                            for s in QApplication.screens():
-                                try:
-                                    if s.name() == screen_name:
-                                        target = s
-                                        break
-                                except Exception:
-                                    continue
-                            if target:
-                                self._pending_restore = {'type': 'fullscreen', 'screen_name': target.name()}
-                                restored = True
-                        else:
-                            self._pending_restore = {'type': 'fullscreen', 'screen_name': None}
-                            restored = True
-
-                    if not restored and is_max:
-                        if screen_name:
-                            target = None
-                            for s in QApplication.screens():
-                                try:
-                                    if s.name() == screen_name:
-                                        target = s
-                                        break
-                                except Exception:
-                                    continue
-                            if target:
-                                self._pending_restore = {'type': 'maximized', 'screen_name': target.name()}
-                            else:
-                                self._pending_restore = {'type': 'maximized', 'screen_name': None}
-                        else:
-                            self._pending_restore = {'type': 'maximized', 'screen_name': None}
-                except Exception:
-                    pass
+                    self._window_placement = self._window_placement_from_settings(settings)
+                except Exception as e:
+                    logging.debug(f"Ignoring invalid window placement in settings: {e}")
+                    self._window_placement = None
 
                 # Store splitter states for later restoration (after UI is created)
                 self._saved_splitter_state = settings.get('splitter_state')
@@ -3181,7 +3420,24 @@ class TCPConnectionViewer(QMainWindow):
                 self._agent_server_unreachable = True
 
     def closeEvent(self, event):
-        """Save settings when closing the application"""
+        """Run the shutdown cleanup when the window is closed"""
+        self._shutdown()
+        event.accept()
+
+    def _shutdown(self):
+        """Stop background work and persist state, exactly once.
+
+        Called from closeEvent() and from QApplication.aboutToQuit (see
+        main()): a quit that bypasses the window - Ctrl-C / SIGTERM via
+        app.quit(), or the headless --no_ui agent whose window is never shown
+        and therefore never receives closeEvent - must still stop the
+        collector, close the database provider and save settings (and the IP
+        cache when PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is on).
+        """
+        if getattr(self, '_shutdown_done', False):
+            return
+        self._shutdown_done = True
+
         try:
             if getattr(self, "dns_worker", None) is not None:
                 self.dns_worker.stop()
@@ -3212,7 +3468,7 @@ class TCPConnectionViewer(QMainWindow):
         if self.reader_ipv6 is not None:
             self.reader_ipv6.close()
         self.save_ip_cache()
-        event.accept()
+        logging.info("Shutdown cleanup done")
 
     def load_ip_cache(self):
         """
@@ -3535,6 +3791,7 @@ class TCPConnectionViewer(QMainWindow):
                     CREATE_NEW_CONSOLE = 0x00000010
                     subprocess.Popen(
                         ["procdump", "-ma", pid],
+                        cwd=APP_DIR,  # dump file lands next to the script, whatever our cwd is
                         creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
                         close_fds=True,
                     )
@@ -3557,7 +3814,7 @@ class TCPConnectionViewer(QMainWindow):
                                                 "See: https://github.com/eronnen/procmon-parser")
                             return
 
-                        procmon_dir = "procmon"
+                        procmon_dir = os.path.join(APP_DIR, "procmon")
                         os.makedirs(procmon_dir, exist_ok=True)
 
                         timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -3617,7 +3874,7 @@ class TCPConnectionViewer(QMainWindow):
             elif chosen == action_memory:
                 try:
                     # gcore dumps the full process memory to core.<pid>
-                    subprocess.Popen(["gcore", pid])
+                    subprocess.Popen(["gcore", pid], cwd=APP_DIR)  # core.<pid> lands next to the script
                 except FileNotFoundError:
                     QMessageBox.warning(self, "gcore not found",
                                         "gcore was not found on PATH.\n"
@@ -3739,6 +3996,7 @@ class TCPConnectionViewer(QMainWindow):
                     CREATE_NEW_CONSOLE = 0x00000010
                     subprocess.Popen(
                         ["procdump", "-ma", pid],
+                        cwd=APP_DIR,  # dump file lands next to the script, whatever our cwd is
                         creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
                         close_fds=True,
                     )
@@ -3759,7 +4017,7 @@ class TCPConnectionViewer(QMainWindow):
                                             "See: https://github.com/eronnen/procmon-parser")
                         return
 
-                    procmon_dir = "procmon"
+                    procmon_dir = os.path.join(APP_DIR, "procmon")
                     os.makedirs(procmon_dir, exist_ok=True)
 
                     timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -3817,7 +4075,7 @@ class TCPConnectionViewer(QMainWindow):
                     QMessageBox.critical(self, "Error", str(e))
             elif chosen == action_memory:
                 try:
-                    subprocess.Popen(["gcore", pid])
+                    subprocess.Popen(["gcore", pid], cwd=APP_DIR)  # core.<pid> lands next to the script
                 except FileNotFoundError:
                     QMessageBox.warning(self, "gcore not found",
                                         "gcore was not found on PATH.\n"
@@ -5297,13 +5555,14 @@ class TCPConnectionViewer(QMainWindow):
             self._start_capture_button_flash()
 
     @Slot()
-    def save_connection_list_to_csv(self):
+    def save_connection_list_to_csv(self, timeline_index=0, filename=None):
         """
         Saves the connection list for a specific timeline index into a CSV file.
-        
+
         Parameters:
             self: The instance containing the connection data.
-            timeline_index (int): The index of the timeline to save.
+            timeline_index (int): The index of the timeline to save (default: the
+                                  first snapshot, as when triggered from the button).
             filename (str, optional): Name of the output CSV file. If not provided,
                                     a default name is generated based on the timeline index.
         """
@@ -5312,8 +5571,8 @@ class TCPConnectionViewer(QMainWindow):
                 return
 
             # Access the connection list for the specified timeline index
-            connection_data = self.connection_list[0]['connection_list']
-            timeline_time = self.connection_list[0]['datetime'].strftime('%Y-%m-%d-%H-%M-%S') 
+            connection_data = self.connection_list[timeline_index]['connection_list']
+            timeline_time = self.connection_list[timeline_index]['datetime'].strftime('%Y-%m-%d-%H-%M-%S')
             
             
             # Determine headers from the keys of the first item in the connection list
@@ -5324,7 +5583,7 @@ class TCPConnectionViewer(QMainWindow):
                 filename = f"connection_list_at_{timeline_time}.csv"
             
             # Ensure the output directory exists
-            output_dir = "output"
+            output_dir = os.path.join(APP_DIR, "output")
             os.makedirs(output_dir, exist_ok=True)
             full_path = os.path.join(output_dir, filename)
             
@@ -5371,7 +5630,7 @@ class TCPConnectionViewer(QMainWindow):
                 return
 
             # Ensure output directory exists
-            output_dir = "output"
+            output_dir = os.path.join(APP_DIR, "output")
             os.makedirs(output_dir, exist_ok=True)
 
             if not filename:
@@ -5512,9 +5771,9 @@ class TCPConnectionViewer(QMainWindow):
         # Save Button
         self.save_connections_btn = QPushButton("Save connection list to CSV file")
         self.save_connections_btn.setToolTip(
-            "Export all currently captured connections to a CSV file on disk.\n"
-            "Opens a save dialog to choose the output path and filename.\n"
-            "The CSV includes all visible columns from the connection table."
+            "Export all captured connection snapshots to a CSV file on disk.\n"
+            "The file is written as output/connection_timelines_<timestamp>.csv\n"
+            "next to the script; one row per connection, first column is the snapshot time."
         )
         self.save_connections_btn.clicked.connect(self.save_all_connection_list_to_csv)
 
@@ -6323,7 +6582,9 @@ class TCPConnectionViewer(QMainWindow):
         self.reset_connections_btn.clicked.connect(self.reset_connections)
         actions_tab_layout.addWidget(self.reset_connections_btn)
 
-        self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
+        # (clicked is already connected to save_all_connection_list_to_csv where
+        # the button is created; a second connection here used to fire the
+        # single-snapshot exporter as well, producing two files per click.)
         actions_tab_layout.addWidget(self.save_connections_btn)
 
         actions_tab_layout.addWidget(self.generate_video_btn)
@@ -6488,7 +6749,8 @@ class TCPConnectionViewer(QMainWindow):
             act_escape = QAction(self)
             act_escape.setShortcut("Escape")
             act_escape.setShortcutContext(Qt.ApplicationShortcut)
-            act_escape.triggered.connect(lambda: (self.showNormal() if (bool(self.windowState() & Qt.WindowFullScreen) or self.isFullScreen()) else None))
+            # clear only the FullScreen bit so a previously maximized window stays maximized
+            act_escape.triggered.connect(lambda: (self.setWindowState(self.windowState() & ~Qt.WindowFullScreen) if (bool(self.windowState() & Qt.WindowFullScreen) or self.isFullScreen()) else None))
             self.addAction(act_escape)
         except Exception:
             pass
@@ -9315,14 +9577,15 @@ class TCPConnectionViewer(QMainWindow):
             </body>
             </html>
             """
-            # Inject the script directory path into the HTML so JS can build absolute file:// URLs
+            # Inject the absolute Leaflet resources path into the HTML so JS can build file:// URLs
             # Use "about:blank" as base URL to allow external HTTPS resources (OSM tiles, CDN)
             import pathlib
             from PySide6.QtCore import QUrl
 
-            script_dir = pathlib.Path(__file__).parent.resolve()
+            # Same LEAFLET_DIR the downloader writes to (anchored on APP_DIR, not the cwd)
+            leaflet_dir = pathlib.Path(LEAFLET_DIR).resolve()
             # Convert Windows backslashes to forward slashes and build file:// URL
-            local_resources_path = str(script_dir / "resources" / "leaflet").replace("\\", "/")
+            local_resources_path = str(leaflet_dir).replace("\\", "/")
 
             # Debug: log the path being injected
             logging.debug(f"Injecting local resources path: file:///{local_resources_path}/")
@@ -9385,7 +9648,7 @@ class TCPConnectionViewer(QMainWindow):
 
             try:
                 # Read local Leaflet JavaScript
-                leaflet_js_path = script_dir / "resources" / "leaflet" / "leaflet.js"
+                leaflet_js_path = leaflet_dir / "leaflet.js"
                 if leaflet_js_path.exists():
                     with open(leaflet_js_path, 'r', encoding='utf-8') as f:
                         leaflet_js_content = f.read()
@@ -9397,7 +9660,7 @@ class TCPConnectionViewer(QMainWindow):
 
             try:
                 # Read local Leaflet CSS
-                leaflet_css_path = script_dir / "resources" / "leaflet" / "leaflet.css"
+                leaflet_css_path = leaflet_dir / "leaflet.css"
                 if leaflet_css_path.exists():
                     with open(leaflet_css_path, 'r', encoding='utf-8') as f:
                         leaflet_css_content = f.read()
@@ -9848,11 +10111,10 @@ class TCPConnectionViewer(QMainWindow):
             logging.debug("Map page loaded successfully")
 
     def showEvent(self, event):
-        """Apply pending fullscreen/maximize restore on first real show.
+        """First-show bootstrap: load the map, sync filter widths, first-run message.
 
-        This avoids races where windowHandle() or native windowing hasn't associated
-        the QWindow with a QScreen yet. We perform a single-shot deferred apply
-        to give the window system a moment to finish mapping.
+        The window's monitor / geometry / state are already in place by now
+        (see _restore_window_placement, which runs before show()).
         """
         try:
             super().showEvent(event)
@@ -9883,42 +10145,6 @@ class TCPConnectionViewer(QMainWindow):
                 QTimer.singleShot(500, self._show_first_run_message)
             except Exception:
                 pass
-
-        try:
-            pr = getattr(self, '_pending_restore', None)
-            if not pr:
-                return
-
-            # clear pending to avoid repeat
-            self._pending_restore = None
-
-            stype = pr.get('type')
-            sname = pr.get('screen_name')
-
-            target = None
-            if sname:
-                for s in QApplication.screens():
-                    try:
-                        if s.name() == sname:
-                            target = s
-                            break
-                    except Exception:
-                        continue
-
-            # schedule shortly to ensure native mapping done
-            if stype == 'fullscreen':
-                if target:
-                    QTimer.singleShot(50, lambda t=target: self._go_fullscreen_on_screen(t))
-                else:
-                    QTimer.singleShot(50, self.showFullScreen)
-
-            elif stype == 'maximized':
-                if target:
-                    QTimer.singleShot(50, lambda t=target: self._go_maximized_on_screen(t))
-                else:
-                    QTimer.singleShot(50, self.showMaximized)
-        except Exception:
-            pass
 
     def _show_first_run_message(self):
         """Show welcome message for first-time users"""
@@ -9956,7 +10182,10 @@ class TCPConnectionViewer(QMainWindow):
                 # Make window fully transparent so the restore is invisible
                 original_opacity = self.windowOpacity()
                 self.setWindowOpacity(0.0)
-                self.showNormal()
+                # Clear only the Minimized bit: showNormal() would also drop a
+                # Maximized / FullScreen state, which the user (and the saved
+                # window placement) would then lose.
+                self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
                 QApplication.processEvents()
                 QTimer.singleShot(500, lambda: self._finish_capture_screenshot(filepath, True, original_opacity))
             else:
@@ -10709,6 +10938,101 @@ class TCPConnectionViewer(QMainWindow):
         except Exception as e:
             logging.error(f"on_table_cell_clicked error: {e}")
 
+# ---------------------------------------------------------------------------
+# Window placement helpers (see TCPConnectionViewer._restore_window_placement)
+# ---------------------------------------------------------------------------
+_WINDOW_TITLE_BAR_ALLOWANCE = 40  # px kept free above the client rect so the title bar stays grabbable
+
+
+def _match_screen(screens, placement):
+    """Return the QScreen a placement was saved on, or None if it is not connected.
+
+    Matched by EDID serial number first, then by name (several monitors can
+    share a name such as "HDMI", so ties are broken with the saved screen
+    geometry), then by exact screen geometry.  Screens that vanish while we
+    look at them (hot-plug) are skipped.
+    """
+    name = placement.get('screen_name')
+    serial = placement.get('screen_serial')
+    geom = placement.get('screen_geometry')
+
+    def _having(cands, wanted, getter):
+        hits = []
+        for s in cands:
+            try:
+                if getter(s) == wanted:
+                    hits.append(s)
+            except Exception:
+                continue
+        return hits
+
+    def _prefer(cands, *criteria):
+        for wanted, getter in criteria:
+            if wanted:
+                narrower = _having(cands, wanted, getter)
+                if narrower:
+                    cands = narrower
+        return cands[0]
+
+    by_name = (name, lambda s: s.name())
+    by_geom = (geom, lambda s: list(s.geometry().getRect()))
+    if serial:
+        hits = _having(screens, serial, lambda s: s.serialNumber())
+        if hits:
+            return _prefer(hits, by_name, by_geom)
+    if name:
+        hits = _having(screens, name, by_name[1])
+        if hits:
+            return _prefer(hits, by_geom)
+    if geom:
+        hits = _having(screens, geom, by_geom[1])
+        if hits:
+            return hits[0]
+    return None
+
+
+def _fallback_screen(screens, placement):
+    """Best screen to use while the saved monitor is absent: the one showing
+    the saved rectangle's centre if any, else the primary screen."""
+    geom = placement.get('geometry')
+    if geom:
+        try:
+            centre = QRect(*geom).center()
+            for s in screens:
+                if s.geometry().contains(centre):
+                    return s
+        except Exception:
+            pass
+    return QApplication.primaryScreen() or (screens[0] if screens else None)
+
+
+def _rect_is_reachable(rect, areas):
+    """True if at least half of `rect` is visible across the given screen areas
+    and its top edge (where the title bar sits) lies on one of them."""
+    if rect.isEmpty():
+        return False
+    visible = 0
+    for area in areas:
+        if rect.intersects(area):
+            part = rect.intersected(area)
+            visible += part.width() * part.height()
+    if visible * 2 < rect.width() * rect.height():
+        return False
+    top_probe = QPoint(rect.center().x(), rect.top())
+    return any(area.contains(top_probe) for area in areas)
+
+
+def _fit_rect_to_area(rect, area):
+    """Relocate `rect` into `area` (shrinking it if needed), keeping room for
+    the title bar below the top edge."""
+    top = area.top() + _WINDOW_TITLE_BAR_ALLOWANCE
+    width = max(1, min(rect.width(), area.width()))
+    height = max(1, min(rect.height(), area.bottom() - top + 1))
+    x = min(max(rect.x(), area.left()), area.right() - width + 1)
+    y = min(max(rect.y(), top), area.bottom() - height + 1)
+    return QRect(x, y, width, height)
+
+
 def main():
     # QtWebEngine (Chromium) refuses to run as root without --no-sandbox.
     # Must be set via the environment variable before QApplication is created;
@@ -10721,20 +11045,59 @@ def main():
             )
     if hasattr(os, "getuid") and os.getuid() == 0 and "--no-sandbox" not in sys.argv:
         sys.argv.append("--no-sandbox")
+    # Chromium's own console output is noise unless we are debugging: below
+    # loggingLevel DEBUG raise its threshold to FATAL (3) so lines such as the
+    # harmless multi-monitor "PlacementList must be sorted by first 8 bits of
+    # display_id" ERROR (Chromium <= 136, i.e. QtWebEngine <= 6.10, on Windows)
+    # no longer flood the console.  An explicit --log-level already present in
+    # QTWEBENGINE_CHROMIUM_FLAGS is left alone.
+    if logging_level != "DEBUG":
+        _chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+        if "--log-level" not in _chromium_flags:
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (_chromium_flags + " --log-level=3").strip()
     app = QApplication(sys.argv)
     _app_font = QFont("Consolas")
     _app_font.setStyleHint(QFont.StyleHint.Monospace)
     app.setFont(_app_font)
     viewer = TCPConnectionViewer()
 
-    # Allow Ctrl-C in the console to close the application.
-    # Qt's event loop holds the GIL and never returns control to Python's
-    # signal machinery unless we periodically interrupt it with a no-op timer.
-    def _handle_sigint(*_):
-        logging.info("Received SIGINT — shutting down.")
+    # Run the shutdown cleanup on every quit path.  closeEvent() covers the
+    # window's close button; aboutToQuit covers app.quit() from the signal
+    # handler below and the headless --no_ui agent, whose window is never
+    # shown and therefore never receives closeEvent.  _shutdown() is
+    # idempotent, so both may fire.  The lightweight placement flush stays as
+    # a last resort in case save_settings() fails part-way.
+    app.aboutToQuit.connect(viewer._shutdown)
+    app.aboutToQuit.connect(viewer._save_window_placement)
+
+    # Allow Ctrl-C (and kill/SIGTERM, a closed terminal/SIGHUP, Ctrl-Break on
+    # Windows) to close the application cleanly.  Qt's event loop holds the GIL
+    # and never returns control to Python's signal machinery unless we
+    # periodically interrupt it with a no-op timer.
+    _quit_requested = [False]
+
+    def _handle_signal(signum, _frame=None):
+        if _quit_requested[0]:
+            # Second signal while the cleanup is still running: force exit so a
+            # blocked shutdown step can never trap the user.
+            logging.warning(f"Received signal {signum} again during shutdown — forcing exit.")
+            os._exit(128 + int(signum))
+        _quit_requested[0] = True
+        logging.info(f"Received signal {signum} — shutting down.")
         app.quit()
 
-    signal.signal(signal.SIGINT, _handle_sigint)
+    for _sig_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is None:
+            continue
+        try:
+            # Respect an inherited "ignore" disposition (nohup, systemd, setsid):
+            # a nohup'd headless agent must keep running when its terminal closes.
+            if signal.getsignal(_sig) == signal.SIG_IGN:
+                continue
+            signal.signal(_sig, _handle_signal)
+        except (ValueError, OSError):
+            pass
     _sigint_timer = QTimer()
     _sigint_timer.setInterval(200)   # ms — yields the GIL so Python can check signals
     _sigint_timer.timeout.connect(lambda: None)

@@ -229,6 +229,10 @@ Usage: python tcp_geo_map.py [OPTIONS]
   --no_ui
       Run as a headless background agent -- no window is shown and no
       taskbar button is created. Only meaningful with --enable_agent_mode.
+      Stop it with Ctrl-C or Ctrl-Break (Windows) or kill <pid> / SIGTERM /
+      SIGHUP (Linux, unless started with nohup): the agent stops its
+      collector, closes the database provider and saves settings.json before
+      exiting. A second signal during the shutdown forces an immediate exit.
 
   --no_ui_off
       Explicitly disable headless mode and persist that choice to
@@ -253,7 +257,7 @@ Usage: python tcp_geo_map.py [OPTIONS]
 - **Map tiles** -- `tile.openstreetmap.org` is required to render the map. To run fully offline, point `TILE_OPENSTREETMAP_SERVER` in `tcp_geo_map.py` to a self-hosted tile server.
 - **Leaflet resources** -- on first launch the app downloads Leaflet JS/CSS and marker icons from `unpkg.com` and `raw.githubusercontent.com` and caches them in `resources/leaflet/`. Use `resources/leaflet/download_resources.ps1` to pre-populate this cache offline.
 - **ipify.com** -- queried only when **Resolve public internet IP using ipify.com** is enabled. Uncheck to disable entirely.
-- **GeoLite2 database** -- downloaded once (with EULA acceptance) and refreshed automatically after 7 days. Stored in the `database/` subfolder.
+- **GeoLite2 database** -- downloaded once (with EULA acceptance) and refreshed automatically after 7 days. Stored in the `databases/` subfolder.
 
 ---
 
@@ -322,6 +326,8 @@ scapy >= 2.5.0
 
 All settings are persisted in `settings.json` (same directory as the script) and saved automatically on every change and on application close. To reset all settings to defaults, delete `settings.json` -- it is recreated on the next launch.
 
+The same rule applies to every other file the application reads or writes -- `databases/`, `connection_databases/`, `screen_captures/`, `resources/`, `ipanalyze.json`, the CSV exports in `output/`, the generated Process Monitor configurations in `procmon/` and the process dumps written by procdump/gcore are always located next to `tcp_geo_map.py`, whatever the current working directory is when it is launched (IDE run configurations, `run_as_root.sh`, scheduled tasks).
+
 ---
 
 ### Connection capture
@@ -364,6 +370,7 @@ All settings are persisted in `settings.json` (same directory as the script) and
 | `summary_table_column_order` | integer[] | `[]` | Persisted visual column order for the Summary table (logical indices). |
 | `conn_table_column_widths` | integer[] | `[]` | Persisted per-column pixel widths for the main connection table. |
 | `summary_table_column_widths` | integer[] | `[]` | Persisted per-column pixel widths for the Summary table. |
+| `window_placement` | object | *(none)* | Last window placement, restored on the next start: `state` (`"normal"`, `"maximized"` or `"fullscreen"`), `geometry` (`[x, y, width, height]` of the un-maximized window) and the monitor it was on (`screen_name`, `screen_serial`, `screen_geometry`). Written whenever the window is moved, resized or changes state, and on close, so it survives Ctrl-C or a crash. The monitor is matched by serial number, then name, then geometry; if it is not connected at start-up the window opens on the nearest available screen and moves over if the monitor appears within 30 s. Delete the key to start on the primary monitor again. The older `is_fullscreen`, `is_maximized` and `fullscreen_screen_name` keys are still written for compatibility. |
 
 ---
 
@@ -407,7 +414,7 @@ All settings are persisted in `settings.json` (same directory as the script) and
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `loggingLevel` | string | `"WARNING"` | Python logging level written to the console. Valid values: `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`. |
+| `loggingLevel` | string | `"WARNING"` | Python logging level written to the console. Valid values: `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`. Below `"DEBUG"` the embedded Chromium's own console output is silenced as well (`--log-level=3` is added to `QTWEBENGINE_CHROMIUM_FLAGS` unless that variable already sets a `--log-level`), which removes noise such as the harmless multi-monitor `PlacementList must be sorted by first 8 bits of display_id` error printed by QtWebEngine 6.10 and older on Windows. Set `"DEBUG"` to see Chromium's messages. |
 
 ---
 
