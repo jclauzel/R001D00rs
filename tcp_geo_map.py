@@ -1235,7 +1235,10 @@ class TCPConnectionViewer(QMainWindow):
         self._window_placement_save_timer = None
         self._pending_placement = None  # placement waiting for its monitor to be connected
 
-        # Initialize saved map state (will be loaded from settings if available)
+        # Last known map position (centre / zoom).  Seeded from settings.json
+        # by _load_settings_early(), refreshed by _capture_map_state() whenever
+        # the live Leaflet map answers, injected into the map HTML by update_map()
+        # and always written back by save_settings().
         self.saved_map_center_lat = None
         self.saved_map_center_lng = None
         self.saved_map_zoom = None
@@ -1913,6 +1916,45 @@ class TCPConnectionViewer(QMainWindow):
             logging.warning("get_map_state: No valid center in result")
             return None
 
+    def _capture_map_state(self):
+        """Refresh the cached map position (self.saved_map_center_lat / _lng /
+        saved_map_zoom) from the live Leaflet map and return the new state.
+
+        Returns None (leaving the cached values untouched) while the map is
+        not initialised yet, when the synchronous JavaScript round-trip times
+        out or when the answer is incomplete: save_settings() runs many times
+        during start-up and must not drop the position loaded from
+        settings.json.
+        """
+        map_state = self.get_map_state()
+        if not map_state:
+            return None
+        center = map_state.get('center')
+        if not isinstance(center, dict):
+            return None
+        lat, lng, zoom = center.get('lat'), center.get('lng'), map_state.get('zoom')
+        if lat is None or lng is None or zoom is None:
+            logging.debug(f"Ignoring incomplete map state: {map_state}")
+            return None
+        self.saved_map_center_lat = lat
+        self.saved_map_center_lng = lng
+        self.saved_map_zoom = zoom
+        return map_state
+
+    def _map_state_settings(self):
+        """settings.json entries describing the map position, taken from the
+        cached values so that a save before the map is ready (or after a
+        JavaScript timeout) keeps the previously stored position.  Empty when
+        no position is known yet."""
+        if (self.saved_map_center_lat is None or self.saved_map_center_lng is None
+                or self.saved_map_zoom is None):
+            return {}
+        return {
+            'map_center_lat': self.saved_map_center_lat,
+            'map_center_lng': self.saved_map_center_lng,
+            'map_zoom': self.saved_map_zoom,
+        }
+
     def changeEvent(self, event):
         """Handle window state changes (fullscreen, maximize, minimize, etc.)"""
         try:
@@ -2103,14 +2145,21 @@ class TCPConnectionViewer(QMainWindow):
             'loggingLevel': logging_level,
         }
 
-        # Save current map position and zoom
+        # Save current map position and zoom.  The cached position only
+        # refreshes when the live map answers; before the map is initialised
+        # (or after a JavaScript timeout) the position loaded from
+        # settings.json is written back unchanged.
+        map_state = None
         try:
-            map_state = self.get_map_state()
-            if map_state and map_state['center']:
-                settings['map_center_lat'] = map_state['center']['lat']
-                settings['map_center_lng'] = map_state['center']['lng']
-                settings['map_zoom'] = map_state['zoom']
+            map_state = self._capture_map_state()
+        except Exception as e:
+            logging.warning(f"Failed to read map state: {e}")
+        try:
+            settings.update(self._map_state_settings())
+            if map_state:
                 logging.info(f"Saved map state: center=({settings['map_center_lat']}, {settings['map_center_lng']}), zoom={settings['map_zoom']}")
+            elif 'map_zoom' in settings:
+                logging.debug(f"Map state not available; keeping saved map state: center=({settings['map_center_lat']}, {settings['map_center_lng']}), zoom={settings['map_zoom']}")
             else:
                 logging.debug("No map state to save (map not initialized or no valid state)")
         except Exception as e:
