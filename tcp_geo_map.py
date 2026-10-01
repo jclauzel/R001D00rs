@@ -39,8 +39,13 @@ from plugins.os_conn_table import get_os_connections as _get_os_connections
 from plugins.os_conn_table import flush_all_caches as _flush_os_caches
 
 # --- Constants that must be defined early ---
-DB_DIR = "databases"
-CONNECTION_DATABASES_DIR = "connection_databases"  # Subfolder for connection-history database files
+# Everything the application reads or writes (settings.json, databases/,
+# connection_databases/, screen_captures/, resources/) lives next to this
+# script, whatever working directory it was launched from.  Anchor every
+# data path on APP_DIR rather than on the process cwd.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.join(APP_DIR, "databases")
+CONNECTION_DATABASES_DIR = os.path.join(APP_DIR, "connection_databases")  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
 VERSION = "3.9.0" # Current script version
 
@@ -162,11 +167,11 @@ class AsyncDNSWorker:
                 self.queue.task_done()
             except Exception:
                 pass
-SCREENSHOTS_DIR = "screen_captures"  # Screenshot directory for captured map images
+SCREENSHOTS_DIR = os.path.join(APP_DIR, "screen_captures")  # Screenshot directory for captured map images
 
 IPV4_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv4.mmdb")
 IPV6_DB_PATH = os.path.join(DB_DIR, "geolite2-city-ipv6.mmdb")
-SETTINGS_FILE_NAME = "settings.json"
+SETTINGS_FILE_NAME = os.path.join(APP_DIR, "settings.json")
 
 
 def _write_settings_file(settings):
@@ -304,7 +309,7 @@ GEOLITE2_IPV4_DOWNLOAD_IPV4_ABOUT_TEXT = GEOLITE2_IPV6_DOWNLOAD_IPV4_ABOUT_TEXT=
 TILE_OPENSTREETMAP_SERVER = "tile.openstreetmap.org"
 
 # Leaflet resources configuration
-RESOURCES_DIR = "resources"
+RESOURCES_DIR = os.path.join(APP_DIR, "resources")
 LEAFLET_DIR = os.path.join(RESOURCES_DIR, "leaflet")
 LEAFLET_CSS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
 LEAFLET_JS_URL = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -438,7 +443,7 @@ if "--no_ui" in sys.argv:
 _no_ui_off_requested = "--no_ui_off" in sys.argv
 if _no_ui_off_requested:
     agent_no_ui = False
-    _settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
+    _settings_path = SETTINGS_FILE_NAME
     try:
         _s = {}
         if os.path.exists(_settings_path):
@@ -1234,6 +1239,7 @@ class TCPConnectionViewer(QMainWindow):
         self._window_placement = None
         self._window_placement_save_timer = None
         self._pending_placement = None  # placement waiting for its monitor to be connected
+        self._shutdown_done = False     # _shutdown() runs once, from closeEvent or aboutToQuit
 
         # Last known map position (centre / zoom).  Seeded from settings.json
         # by _load_settings_early(), refreshed by _capture_map_state() whenever
@@ -3406,7 +3412,23 @@ class TCPConnectionViewer(QMainWindow):
                 self._agent_server_unreachable = True
 
     def closeEvent(self, event):
-        """Save settings when closing the application"""
+        """Run the shutdown cleanup when the window is closed"""
+        self._shutdown()
+        event.accept()
+
+    def _shutdown(self):
+        """Stop background work and persist state, exactly once.
+
+        Called from closeEvent() and from QApplication.aboutToQuit (see
+        main()): a quit that bypasses the window - Ctrl-C / SIGTERM via
+        app.quit(), or the headless --no_ui agent whose window is never shown
+        and therefore never receives closeEvent - must still stop the
+        collector, close the database provider and save settings / IP cache.
+        """
+        if getattr(self, '_shutdown_done', False):
+            return
+        self._shutdown_done = True
+
         try:
             if getattr(self, "dns_worker", None) is not None:
                 self.dns_worker.stop()
@@ -3437,7 +3459,7 @@ class TCPConnectionViewer(QMainWindow):
         if self.reader_ipv6 is not None:
             self.reader_ipv6.close()
         self.save_ip_cache()
-        event.accept()
+        logging.info("Shutdown cleanup done")
 
     def load_ip_cache(self):
         """
@@ -9541,14 +9563,15 @@ class TCPConnectionViewer(QMainWindow):
             </body>
             </html>
             """
-            # Inject the script directory path into the HTML so JS can build absolute file:// URLs
+            # Inject the absolute Leaflet resources path into the HTML so JS can build file:// URLs
             # Use "about:blank" as base URL to allow external HTTPS resources (OSM tiles, CDN)
             import pathlib
             from PySide6.QtCore import QUrl
 
-            script_dir = pathlib.Path(__file__).parent.resolve()
+            # Same LEAFLET_DIR the downloader writes to (anchored on APP_DIR, not the cwd)
+            leaflet_dir = pathlib.Path(LEAFLET_DIR).resolve()
             # Convert Windows backslashes to forward slashes and build file:// URL
-            local_resources_path = str(script_dir / "resources" / "leaflet").replace("\\", "/")
+            local_resources_path = str(leaflet_dir).replace("\\", "/")
 
             # Debug: log the path being injected
             logging.debug(f"Injecting local resources path: file:///{local_resources_path}/")
@@ -9611,7 +9634,7 @@ class TCPConnectionViewer(QMainWindow):
 
             try:
                 # Read local Leaflet JavaScript
-                leaflet_js_path = script_dir / "resources" / "leaflet" / "leaflet.js"
+                leaflet_js_path = leaflet_dir / "leaflet.js"
                 if leaflet_js_path.exists():
                     with open(leaflet_js_path, 'r', encoding='utf-8') as f:
                         leaflet_js_content = f.read()
@@ -9623,7 +9646,7 @@ class TCPConnectionViewer(QMainWindow):
 
             try:
                 # Read local Leaflet CSS
-                leaflet_css_path = script_dir / "resources" / "leaflet" / "leaflet.css"
+                leaflet_css_path = leaflet_dir / "leaflet.css"
                 if leaflet_css_path.exists():
                     with open(leaflet_css_path, 'r', encoding='utf-8') as f:
                         leaflet_css_content = f.read()
@@ -11024,18 +11047,30 @@ def main():
     app.setFont(_app_font)
     viewer = TCPConnectionViewer()
 
-    # Flush the window placement on quit paths that bypass closeEvent
-    # (e.g. Ctrl-C below -> app.quit()).
+    # Run the shutdown cleanup on every quit path.  closeEvent() covers the
+    # window's close button; aboutToQuit covers app.quit() from the signal
+    # handler below and the headless --no_ui agent, whose window is never
+    # shown and therefore never receives closeEvent.  _shutdown() is
+    # idempotent, so both may fire.  The lightweight placement flush stays as
+    # a last resort in case save_settings() fails part-way.
+    app.aboutToQuit.connect(viewer._shutdown)
     app.aboutToQuit.connect(viewer._save_window_placement)
 
-    # Allow Ctrl-C in the console to close the application.
-    # Qt's event loop holds the GIL and never returns control to Python's
-    # signal machinery unless we periodically interrupt it with a no-op timer.
-    def _handle_sigint(*_):
-        logging.info("Received SIGINT — shutting down.")
+    # Allow Ctrl-C (and kill/SIGTERM, a closed terminal/SIGHUP, Ctrl-Break on
+    # Windows) to close the application cleanly.  Qt's event loop holds the GIL
+    # and never returns control to Python's signal machinery unless we
+    # periodically interrupt it with a no-op timer.
+    def _handle_signal(signum, _frame=None):
+        logging.info(f"Received signal {signum} — shutting down.")
         app.quit()
 
-    signal.signal(signal.SIGINT, _handle_sigint)
+    for _sig_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _handle_signal)
+            except (ValueError, OSError):
+                pass
     _sigint_timer = QTimer()
     _sigint_timer.setInterval(200)   # ms — yields the GIL so Python can check signals
     _sigint_timer.timeout.connect(lambda: None)
