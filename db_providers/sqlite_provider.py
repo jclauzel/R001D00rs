@@ -14,6 +14,11 @@ from typing import Dict, List, Optional
 from . import ConnectionDatabaseProvider
 
 DB_FILENAME = "connection_history.db"
+# Default location when no db_path is given: next to tcp_geo_map.py (the
+# application anchors every data file on its own directory, not the cwd).
+_DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "connection_databases", DB_FILENAME)
 
 
 class SqliteProvider(ConnectionDatabaseProvider):
@@ -26,7 +31,7 @@ class SqliteProvider(ConnectionDatabaseProvider):
     # Lifecycle
     # ------------------------------------------------------------------ #
     def connect(self, **kwargs) -> None:
-        db_path = kwargs.get("db_path", DB_FILENAME)
+        db_path = kwargs.get("db_path", _DEFAULT_DB_PATH)
         # Ensure directory exists
         db_dir = os.path.dirname(db_path)
         if db_dir:

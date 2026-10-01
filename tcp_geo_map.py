@@ -47,7 +47,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(APP_DIR, "databases")
 CONNECTION_DATABASES_DIR = os.path.join(APP_DIR, "connection_databases")  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.9.0" # Current script version
+VERSION = "3.10.0" # Current script version
 
 # --- Standard library imports ---
 import os
@@ -270,6 +270,9 @@ Options:
   --no_ui
       Run as a headless background agent — no window is shown and no taskbar
       button is created. Only meaningful when combined with --enable_agent_mode.
+      Stop it with Ctrl-C or Ctrl-Break (Windows) or kill <pid> / SIGTERM /
+      SIGHUP (Linux, unless started with nohup): the agent stops its collector,
+      closes the database provider and saves settings.json before exiting.
 
   --no_ui_off
       Explicitly disable agent headless mode and persist that choice to settings.json
@@ -2195,7 +2198,12 @@ class TCPConnectionViewer(QMainWindow):
         try:
             _write_settings_file(settings)
         except Exception as e:
-            QMessageBox.critical(self, "Error saving settings", f"Error: {e}")
+            if (agent_no_ui and enable_agent_mode) or not self.isVisible():
+                # Headless agent or window already gone (quit via signal): a modal
+                # dialog would stall the shutdown with nobody to dismiss it.
+                logging.error(f"Error saving settings: {e}")
+            else:
+                QMessageBox.critical(self, "Error saving settings", f"Error: {e}")
             
 
     def _load_settings_early(self):
@@ -3423,7 +3431,8 @@ class TCPConnectionViewer(QMainWindow):
         main()): a quit that bypasses the window - Ctrl-C / SIGTERM via
         app.quit(), or the headless --no_ui agent whose window is never shown
         and therefore never receives closeEvent - must still stop the
-        collector, close the database provider and save settings / IP cache.
+        collector, close the database provider and save settings (and the IP
+        cache when PERSIST_LOCAL_DNS_CACHE_NAME_RESOLUTION_TO_DISK is on).
         """
         if getattr(self, '_shutdown_done', False):
             return
@@ -3782,6 +3791,7 @@ class TCPConnectionViewer(QMainWindow):
                     CREATE_NEW_CONSOLE = 0x00000010
                     subprocess.Popen(
                         ["procdump", "-ma", pid],
+                        cwd=APP_DIR,  # dump file lands next to the script, whatever our cwd is
                         creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
                         close_fds=True,
                     )
@@ -3804,7 +3814,7 @@ class TCPConnectionViewer(QMainWindow):
                                                 "See: https://github.com/eronnen/procmon-parser")
                             return
 
-                        procmon_dir = "procmon"
+                        procmon_dir = os.path.join(APP_DIR, "procmon")
                         os.makedirs(procmon_dir, exist_ok=True)
 
                         timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -3864,7 +3874,7 @@ class TCPConnectionViewer(QMainWindow):
             elif chosen == action_memory:
                 try:
                     # gcore dumps the full process memory to core.<pid>
-                    subprocess.Popen(["gcore", pid])
+                    subprocess.Popen(["gcore", pid], cwd=APP_DIR)  # core.<pid> lands next to the script
                 except FileNotFoundError:
                     QMessageBox.warning(self, "gcore not found",
                                         "gcore was not found on PATH.\n"
@@ -3986,6 +3996,7 @@ class TCPConnectionViewer(QMainWindow):
                     CREATE_NEW_CONSOLE = 0x00000010
                     subprocess.Popen(
                         ["procdump", "-ma", pid],
+                        cwd=APP_DIR,  # dump file lands next to the script, whatever our cwd is
                         creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
                         close_fds=True,
                     )
@@ -4006,7 +4017,7 @@ class TCPConnectionViewer(QMainWindow):
                                             "See: https://github.com/eronnen/procmon-parser")
                         return
 
-                    procmon_dir = "procmon"
+                    procmon_dir = os.path.join(APP_DIR, "procmon")
                     os.makedirs(procmon_dir, exist_ok=True)
 
                     timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -4064,7 +4075,7 @@ class TCPConnectionViewer(QMainWindow):
                     QMessageBox.critical(self, "Error", str(e))
             elif chosen == action_memory:
                 try:
-                    subprocess.Popen(["gcore", pid])
+                    subprocess.Popen(["gcore", pid], cwd=APP_DIR)  # core.<pid> lands next to the script
                 except FileNotFoundError:
                     QMessageBox.warning(self, "gcore not found",
                                         "gcore was not found on PATH.\n"
@@ -5544,13 +5555,14 @@ class TCPConnectionViewer(QMainWindow):
             self._start_capture_button_flash()
 
     @Slot()
-    def save_connection_list_to_csv(self):
+    def save_connection_list_to_csv(self, timeline_index=0, filename=None):
         """
         Saves the connection list for a specific timeline index into a CSV file.
-        
+
         Parameters:
             self: The instance containing the connection data.
-            timeline_index (int): The index of the timeline to save.
+            timeline_index (int): The index of the timeline to save (default: the
+                                  first snapshot, as when triggered from the button).
             filename (str, optional): Name of the output CSV file. If not provided,
                                     a default name is generated based on the timeline index.
         """
@@ -5559,8 +5571,8 @@ class TCPConnectionViewer(QMainWindow):
                 return
 
             # Access the connection list for the specified timeline index
-            connection_data = self.connection_list[0]['connection_list']
-            timeline_time = self.connection_list[0]['datetime'].strftime('%Y-%m-%d-%H-%M-%S') 
+            connection_data = self.connection_list[timeline_index]['connection_list']
+            timeline_time = self.connection_list[timeline_index]['datetime'].strftime('%Y-%m-%d-%H-%M-%S')
             
             
             # Determine headers from the keys of the first item in the connection list
@@ -5571,7 +5583,7 @@ class TCPConnectionViewer(QMainWindow):
                 filename = f"connection_list_at_{timeline_time}.csv"
             
             # Ensure the output directory exists
-            output_dir = "output"
+            output_dir = os.path.join(APP_DIR, "output")
             os.makedirs(output_dir, exist_ok=True)
             full_path = os.path.join(output_dir, filename)
             
@@ -5618,7 +5630,7 @@ class TCPConnectionViewer(QMainWindow):
                 return
 
             # Ensure output directory exists
-            output_dir = "output"
+            output_dir = os.path.join(APP_DIR, "output")
             os.makedirs(output_dir, exist_ok=True)
 
             if not filename:
@@ -5759,9 +5771,9 @@ class TCPConnectionViewer(QMainWindow):
         # Save Button
         self.save_connections_btn = QPushButton("Save connection list to CSV file")
         self.save_connections_btn.setToolTip(
-            "Export all currently captured connections to a CSV file on disk.\n"
-            "Opens a save dialog to choose the output path and filename.\n"
-            "The CSV includes all visible columns from the connection table."
+            "Export all captured connection snapshots to a CSV file on disk.\n"
+            "The file is written as output/connection_timelines_<timestamp>.csv\n"
+            "next to the script; one row per connection, first column is the snapshot time."
         )
         self.save_connections_btn.clicked.connect(self.save_all_connection_list_to_csv)
 
@@ -6570,7 +6582,9 @@ class TCPConnectionViewer(QMainWindow):
         self.reset_connections_btn.clicked.connect(self.reset_connections)
         actions_tab_layout.addWidget(self.reset_connections_btn)
 
-        self.save_connections_btn.clicked.connect(self.save_connection_list_to_csv)
+        # (clicked is already connected to save_all_connection_list_to_csv where
+        # the button is created; a second connection here used to fire the
+        # single-snapshot exporter as well, producing two files per click.)
         actions_tab_layout.addWidget(self.save_connections_btn)
 
         actions_tab_layout.addWidget(self.generate_video_btn)
@@ -11060,17 +11074,30 @@ def main():
     # Windows) to close the application cleanly.  Qt's event loop holds the GIL
     # and never returns control to Python's signal machinery unless we
     # periodically interrupt it with a no-op timer.
+    _quit_requested = [False]
+
     def _handle_signal(signum, _frame=None):
+        if _quit_requested[0]:
+            # Second signal while the cleanup is still running: force exit so a
+            # blocked shutdown step can never trap the user.
+            logging.warning(f"Received signal {signum} again during shutdown — forcing exit.")
+            os._exit(128 + int(signum))
+        _quit_requested[0] = True
         logging.info(f"Received signal {signum} — shutting down.")
         app.quit()
 
     for _sig_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
         _sig = getattr(signal, _sig_name, None)
-        if _sig is not None:
-            try:
-                signal.signal(_sig, _handle_signal)
-            except (ValueError, OSError):
-                pass
+        if _sig is None:
+            continue
+        try:
+            # Respect an inherited "ignore" disposition (nohup, systemd, setsid):
+            # a nohup'd headless agent must keep running when its terminal closes.
+            if signal.getsignal(_sig) == signal.SIG_IGN:
+                continue
+            signal.signal(_sig, _handle_signal)
+        except (ValueError, OSError):
+            pass
     _sigint_timer = QTimer()
     _sigint_timer.setInterval(200)   # ms — yields the GIL so Python can check signals
     _sigint_timer.timeout.connect(lambda: None)
