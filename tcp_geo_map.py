@@ -47,7 +47,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(APP_DIR, "databases")
 CONNECTION_DATABASES_DIR = os.path.join(APP_DIR, "connection_databases")  # Subfolder for connection-history database files
 MAX_TRAFFIC_HISTOGRAM_BARS = 20  # Maximum number of bars in the traffic histogram overlay
-VERSION = "3.10.0" # Current script version
+VERSION = "3.10.1" # Current script version
 
 # --- Standard library imports ---
 import os
