@@ -26,7 +26,7 @@ from collections import deque
 from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QRect, QSize, Qt, QThreadPool
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
-from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics
+from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics, QDesktopServices
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
@@ -61,7 +61,7 @@ import logging
 from PySide6.QtCore import QObject, Slot, Signal, QRunnable, QTimer, QByteArray, QUrl, QPoint, QRect, QSize
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QComboBox, QGroupBox, QFrame, QMessageBox, QCheckBox, QSlider, QToolButton, QSplitter, QHeaderView, QTextEdit, QTabWidget, QMenu, QScrollArea, QLineEdit, QDialog, QDialogButtonBox, QFileDialog, QStyle)
-from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics
+from PySide6.QtGui import QIcon, QAction, QPixmap, QColor, QFont, QFontMetrics, QDesktopServices
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebChannel import QWebChannel
@@ -881,12 +881,18 @@ class DNSWorker:
 
 
 class TileRequestInterceptor(QWebEngineUrlRequestInterceptor):
-    """Injects required User-Agent and Referer headers into OpenStreetMap tile requests."""
+    """Identifies this app to the OpenStreetMap tile servers with its own User-Agent.
+
+    The OSM tile usage policy (https://operations.osmfoundation.org/policies/tiles/)
+    requires a User-Agent that names the app; QtWebEngine's default is a generic
+    browser string. Do NOT add a Referer here: a native app has none, which the
+    policy accepts, while a made-up one (e.g. https://www.openstreetmap.org/) is
+    treated as a spoofed identity and answered with "418 Access blocked" tiles.
+    """
     def interceptRequest(self, info):
         if b'openstreetmap.org' in info.requestUrl().host().encode():
             info.setHttpHeader(b'User-Agent',
                 f'TCPGeoMap/{VERSION} (+https://github.com/jclauzel/R001D00rs)'.encode())
-            info.setHttpHeader(b'Referer', b'https://www.openstreetmap.org/')
 
 
 # ---------------------------------------------------------------------------
@@ -1382,7 +1388,7 @@ class TCPConnectionViewer(QMainWindow):
         self.channel = QWebChannel()
         self.channel.registerObject('mapBridge', self.map_bridge)
 
-        # Inject required OSM tile headers (User-Agent + Referer) to satisfy OSM tile usage policy
+        # Send an app-identifying User-Agent on OSM tile requests to satisfy the OSM tile usage policy
         self._tile_interceptor = TileRequestInterceptor()
         QWebEngineProfile.defaultProfile().setUrlRequestInterceptor(self._tile_interceptor)
 
@@ -5896,6 +5902,16 @@ class TCPConnectionViewer(QMainWindow):
                 def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
                     logging.debug(f"[JS Console] {message} (line {lineNumber} in {sourceID})")
 
+                def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+                    # A clicked web link on the map (the "© OpenStreetMap" and
+                    # "Leaflet" attribution links) must not replace the map page:
+                    # open it in the system browser and leave the map where it is.
+                    if (nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked
+                            and url.scheme() in ("http", "https")):
+                        QDesktopServices.openUrl(url)
+                        return False
+                    return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
             # Create debug page FIRST
             debug_page = DebugPage(self.map_view)
 
@@ -8662,8 +8678,9 @@ class TCPConnectionViewer(QMainWindow):
                                     window._tileHadError = false;
                                     window._tileHadSuccess = false;
 
-                                    L.tileLayer('https://{s}.""" + TILE_OPENSTREETMAP_SERVER + """/{z}/{x}/{y}.png', {
-                                        attribution: '&copy; OpenStreetMap contributors'
+                                    // OSM policy: use exactly https://tile.openstreetmap.org/{z}/{x}/{y}.png (no a/b/c subdomains)
+                                    L.tileLayer('https://""" + TILE_OPENSTREETMAP_SERVER + """/{z}/{x}/{y}.png', {
+                                        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                                     }).addTo(map)
                                       .on('tileload', function() {
                                           // At least one tile loaded successfully
